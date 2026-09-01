@@ -226,26 +226,44 @@ bool TextDoc::LocalInsert(std::size_t index, const std::string& utf8,
   if (!Utf8Decode(utf8, &chars)) return false;
   if (chars.empty()) return true;
 
-  // Find the visible nodes on either side of `index`. Both may be absent: a
-  // left origin of the root means the very start, a right origin of nothing
-  // means the very end.
-  std::vector<OpId> visible;
-  visible.reserve(index + 1);
-  std::size_t seen = 0;
-  bool have_right = false;
-  OpId left = RootId();
-  OpId right;
+  // THE ORIGINS ARE FOUND IN THE FULL ORDER, TOMBSTONES INCLUDED, and that is
+  // not a detail. A deleted character is invisible to the user but still holds
+  // a position in the tree, and the insert rule below asks about TREE
+  // structure. Using the visible order instead produces a left origin whose
+  // right children are all tombstones -- the rule then wants a right origin,
+  // and there is none, because the tombstones that would have provided one were
+  // skipped. The convergence harness aborted on exactly that.
+  //
+  // In the full order the situation cannot arise: a node's right subtree is
+  // what immediately follows it in an in-order walk, so if the left origin has
+  // right children then the next element exists by construction.
+  std::vector<OpId> full;
+  std::vector<bool> live;
   Walk(RootId(), false, [&](const Node& n) {
-    if (n.deleted) return;
-    if (seen < index) {
-      left = n.id;
-    } else if (seen == index && !have_right) {
-      right = n.id;
-      have_right = true;
-    }
-    ++seen;
+    full.push_back(n.id);
+    live.push_back(!n.deleted);
   });
-  if (index > seen) return false;
+
+  // The insertion point is immediately after the `index`-th visible character:
+  // the smallest cut with exactly `index` live nodes before it.
+  std::size_t cut = full.size();
+  std::size_t seen = 0;
+  if (index == 0) {
+    cut = 0;
+  } else {
+    for (std::size_t k = 0; k < full.size(); ++k) {
+      if (live[k]) ++seen;
+      if (seen == index) {
+        cut = k + 1;
+        break;
+      }
+    }
+    if (seen < index) return false;  // asked for a position past the end
+  }
+
+  const OpId left = cut == 0 ? RootId() : full[cut - 1];
+  const bool have_right = cut < full.size();
+  const OpId right = have_right ? full[cut] : OpId();
 
   // THE INSERT RULE. Two lines, and the whole non-interleaving argument rests
   // on them; see text_doc.h.

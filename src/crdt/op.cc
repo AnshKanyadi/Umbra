@@ -92,6 +92,18 @@ std::string Op::ToString() const {
   return s;
 }
 
+OpId LastId(const Op& op) {
+  switch (op.kind) {
+    case OpKind::kInsert:
+      UMBRA_CHECK(!op.text.empty(), "an insert with no text has no last id");
+      return op.id.Plus(op.text.size() - 1);
+    case OpKind::kDelete:
+      // A delete creates nothing, so it occupies only its own id.
+      return op.id;
+  }
+  return op.id;
+}
+
 OpPayload EncodeOp(const Op& op) {
   OpPayload p;
   std::string& out = p.bytes;

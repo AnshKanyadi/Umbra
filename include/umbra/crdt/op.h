@@ -79,6 +79,19 @@ struct Op {
   std::string ToString() const;
 };
 
+// The LAST id this operation occupies.
+//
+// A RUN OCCUPIES MORE THAN ITS OWN id, and forgetting that is a real bug rather
+// than a nicety: an insert of "hello" starting at counter 5 owns 5 through 9,
+// so a clock told only about 5 will hand out 6 next and reissue an id the run
+// already holds. The two operations then share an identity, the second is
+// silently swallowed as a duplicate, and the replicas that saw them in
+// different orders keep different text.
+//
+// The convergence harness found exactly that, on its first run, through a
+// replica whose clock was rebuilt from its log after a crash.
+OpId LastId(const Op& op);
+
 // Opaque bytes. Everything outside the CRDT handles operations as these.
 struct OpPayload {
   std::string bytes;

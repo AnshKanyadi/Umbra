@@ -1,0 +1,201 @@
+// The convergence harness.
+//
+// WHAT IT IS FOR. A CRDT's whole claim is that replicas which have seen the
+// same set of operations, in any order, with any duplication, agree. That claim
+// is not testable by reading the code and it is not testable by a handful of
+// hand-written merges. It is testable by running a great many schedules and
+// checking the claim after each one.
+//
+// DETERMINISM IS THE FEATURE. Every choice -- which replica edits, where, what
+// gets delivered when, who partitions from whom, who crashes -- comes from one
+// seeded generator. A failing seed replays exactly, on any machine, so a
+// failure is a bug report rather than a rumour.
+//
+// AND CONVERGENCE ALONE IS NOT ENOUGH. Replicas that all lose the same
+// character agree perfectly. So every schedule is also checked against a
+// reference model (Oracle below) that knows, independently of the CRDT, which
+// characters must be present and in what relative order.
+#ifndef UMBRA_SIM_SIM_H_
+#define UMBRA_SIM_SIM_H_
+
+#include <cstdint>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "umbra/crdt/op.h"
+#include "umbra/crdt/op_id.h"
+#include "umbra/crdt/text_doc.h"
+
+namespace umbra {
+namespace sim {
+
+// SplitMix64. Chosen because it is four lines, has no hidden state, and
+// produces the same stream on every platform and compiler -- which
+// std::mt19937_64 also would, but std::uniform_int_distribution would not:
+// its mapping from raw bits to a range is implementation-defined, so the same
+// seed gives different schedules under libc++ and libstdc++. A harness whose
+// seeds do not mean the same thing on two machines cannot be used to report a
+// failure.
+class Rng {
+ public:
+  explicit Rng(uint64_t seed) : state_(seed) {}
+
+  uint64_t Next() {
+    uint64_t z = (state_ += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+  }
+
+  // Uniform on [0, n). Rejection-sampled rather than modulo, so the
+  // distribution does not skew, and written out rather than delegated for the
+  // portability reason above.
+  uint64_t Below(uint64_t n) {
+    if (n <= 1) return 0;
+    const uint64_t limit = UINT64_MAX - (UINT64_MAX % n) - 1;
+    uint64_t x;
+    do {
+      x = Next();
+    } while (x > limit);
+    return x % n;
+  }
+
+  bool Chance(uint64_t percent) { return Below(100) < percent; }
+
+ private:
+  uint64_t state_;
+};
+
+// What the reference model knows, built from the operations the simulation
+// generated rather than from anything the CRDT reports.
+//
+// IT DOES NOT PREDICT THE EXACT STRING, and it could not: the merge order of
+// two concurrent inserts is the CRDT's to decide and any answer is correct. It
+// knows the things that are NOT the CRDT's to decide, and those are enough to
+// fail a wrong answer that every replica agrees on:
+//
+//   - which characters exist (inserted and not deleted)
+//   - what each of them is
+//   - the relative order of characters within one insert run
+//   - that a run's surviving characters are CONTIGUOUS, which is the
+//     non-interleaving property Fugue is chosen for
+class Oracle {
+ public:
+  // contiguity_exempt marks a run that the schedule DELIBERATELY has replicas
+  // type into -- a shared seed, say. Splitting such a run is the point of the
+  // schedule, not an anomaly, and holding it to the contiguity standard would
+  // fail a correct document. Membership, values and order still apply to it.
+  void RecordInsert(const Op& op, bool contiguity_exempt = false);
+  void RecordDelete(const Op& op);
+
+  // Returns an empty string if the document satisfies the model, or a
+  // description of the first violation.
+  //
+  // require_contiguous_runs IS NOT ALWAYS TRUE AND MUST NOT BE ASSERTED WHERE
+  // IT IS NOT. Non-interleaving says that two runs typed CONCURRENTLY at the
+  // same position do not alternate. It does NOT say a run is contiguous
+  // forever: a user who later puts the cursor in the middle of a sentence and
+  // types has split that run, legitimately, and if the characters between the
+  // halves are then deleted the original run ends up separated by the new text.
+  //
+  // So contiguity is asserted only for schedules in which no replica ever
+  // inserts into text it received from another -- where the only way two runs
+  // could interleave is the anomaly itself. Membership, values and within-run
+  // ORDER are checked always, because those hold under every schedule.
+  std::string Check(const TextDoc& doc, bool require_contiguous_runs) const;
+
+  std::size_t inserted_chars() const { return values_.size(); }
+  std::size_t deleted_chars() const { return deleted_.size(); }
+
+ private:
+  std::map<OpId, char32_t> values_;
+  std::set<OpId> deleted_;
+  // (first id, count) per insert operation, in generation order.
+  std::vector<std::pair<OpId, uint32_t>> runs_;
+  std::set<OpId> contiguity_exempt_;
+};
+
+// One simulated device.
+struct Replica {
+  ReplicaId id;
+  LamportClock clock{ReplicaId{}};
+  TextDoc doc;
+
+  // Operations this replica has accepted and persisted, in the order it
+  // persisted them. A crash rebuilds the document from exactly this.
+  std::vector<Op> durable;
+  // Accepted into memory but not yet persisted. A crash loses these.
+  std::vector<Op> uncommitted;
+  // Arrived but not yet applicable, because something they name is missing.
+  std::vector<Op> pending;
+
+  bool crashed_this_run = false;
+};
+
+// A message in flight.
+struct Message {
+  std::size_t to = 0;
+  Op op;
+};
+
+struct Config {
+  std::size_t replicas = 4;
+  std::size_t steps = 200;
+  // Percent chances, per step.
+  uint64_t p_edit = 45;
+  uint64_t p_deliver = 40;
+  uint64_t p_partition = 5;
+  uint64_t p_crash = 3;
+  uint64_t p_duplicate = 20;    // of a delivery, also deliver it again later
+  uint64_t p_delete_edit = 30;  // of an edit, make it a deletion
+  bool verbose = false;
+};
+
+struct Result {
+  uint64_t seed = 0;
+  bool ok = false;
+  std::string failure;     // empty when ok
+  std::string final_text;  // the agreed document, when they agreed
+  std::size_t ops = 0;
+  std::size_t deliveries = 0;
+  std::size_t crashes = 0;
+  std::size_t max_partition_steps = 0;
+};
+
+// Named, hand-built schedules that exercise shapes a uniform random walk
+// reaches rarely or never. Run alongside the random ones, never instead of
+// them.
+enum class Adversarial : uint8_t {
+  kNone = 0,
+  // Every replica inserts at the same position with no knowledge of the others.
+  kSamePositionPileup,
+  // One replica deletes a range while another inserts into the middle of it.
+  kDeleteRangeUnderInsert,
+  // One replica is offline for the whole edit phase and rejoins at the end.
+  kLongOfflineRejoin,
+  // Every message is delivered twice, and in reverse order.
+  kDuplicateAndReverse,
+  // Concurrent backward typing at one anchor: the RGA interleaving shape.
+  kBackwardTypingRace,
+  // A replica crashes after every single apply.
+  kCrashAfterEveryApply,
+};
+
+const char* AdversarialName(Adversarial a);
+constexpr std::size_t kAdversarialCount = 7;
+
+// True when a schedule never has a replica insert into text it received from
+// another, which is the condition under which every run must still be
+// contiguous. See Oracle::Check.
+bool ScheduleRequiresContiguousRuns(Adversarial a);
+
+// Runs one schedule to completion and checks it. Never aborts on a divergence:
+// it reports, so that a sweep can keep going and name every failing seed.
+Result RunSchedule(uint64_t seed, const Config& cfg, Adversarial adversarial);
+
+}  // namespace sim
+}  // namespace umbra
+
+#endif  // UMBRA_SIM_SIM_H_

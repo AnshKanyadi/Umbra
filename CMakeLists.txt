@@ -266,9 +266,24 @@ add_executable(umbra_test
   test/sanitizer_lane_test.cc
   test/watcher_test.cc
   test/crdt_test.cc
+  test/converge_test.cc
 )
-target_link_libraries(umbra_test PRIVATE umbra_testing gtest_main)
+target_link_libraries(umbra_test PRIVATE umbra_testing umbra_sim gtest_main)
 target_include_directories(umbra_test PRIVATE src src/watcher src/crdt)
 target_compile_options(umbra_test PRIVATE ${UMBRA_CXX_FLAGS})
 target_compile_definitions(umbra_test PRIVATE ${UMBRA_SANITIZER_DEFINE})
 add_test(NAME umbra_test COMMAND umbra_test)
+
+# ------------------------------------------------------ convergence harness
+#
+# A separate archive and a separate binary, so the sweep can run as its own CI
+# lane over a wide seed range without the unit suite paying for it, and so the
+# unit suite can run a narrow range of the SAME code on every push.
+add_library(umbra_sim STATIC sim/sim.cc)
+target_include_directories(umbra_sim PUBLIC sim PRIVATE src src/crdt)
+target_link_libraries(umbra_sim PUBLIC umbra)
+target_compile_options(umbra_sim PRIVATE ${UMBRA_CXX_FLAGS})
+
+add_executable(umbra_converge cmd/converge_main.cc)
+target_link_libraries(umbra_converge PRIVATE umbra_sim)
+target_compile_options(umbra_converge PRIVATE ${UMBRA_CXX_FLAGS})
