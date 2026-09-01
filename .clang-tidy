@@ -1,0 +1,75 @@
+# The checks that would have caught something here, and nothing that fights the
+# style the tree has.
+#
+# RUN OVER A DIFF, NOT OVER THE TREE. There is a CI job for it
+# (.github/workflows/ci.yml, `tidy`) and it feeds clang-tidy-diff.py the same
+# merge-base range the format job uses. A tidy pass over a whole tree produces a
+# wall of findings nobody reads, and a wall nobody reads is indistinguishable
+# from a clean run -- which is the failure mode this project cares about
+# everywhere else, so it is not accepted here either.
+#
+# WarningsAsErrors is empty ON PURPOSE and the CI job does not honour it: the
+# job decides pass/fail from whether clang-tidy-diff produced findings, so that
+# a local `clang-tidy` run for exploration is not fatal while the lane still is.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  # Fires on `64 * 1024` assigned to a size_t. Real where the operands are
+  # runtime values and noise where they are literals, and in this tree they are
+  # literals in test fixtures.
+  -bugprone-implicit-widening-of-multiplication-result,
+  cert-*,
+  -cert-err58-cpp,
+  clang-analyzer-*,
+  concurrency-*,
+  # Flags getenv() and strerror() in the test fixture. Both are genuinely
+  # unsafe to call concurrently, and both are called before any thread in this
+  # suite exists; the alternative is strerror_r, whose signature differs between
+  # glibc and POSIX and would need its own #ifdef in test scaffolding.
+  -concurrency-mt-unsafe,
+  misc-*,
+  -misc-non-private-member-variables-in-classes,
+  -misc-no-recursion,
+  # IWYU by another name. It objects to headers reached transitively -- which is
+  # every standard header this tree gets through another -- and the resulting
+  # wall is the thing this file exists to avoid.
+  -misc-include-cleaner,
+  # Wants `const` on most locals. It is not wrong, it is just voluminous, and a
+  # rule that adds a keyword to half the lines in a diff makes the diff harder
+  # to read than the thing it is correcting.
+  -misc-const-correctness,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-use-emplace,
+  performance-*,
+  readability-*,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -readability-function-cognitive-complexity,
+  -readability-braces-around-statements,
+  -readability-else-after-return,
+  # `1u` versus `1U`. Google style writes it lowercase and so does every
+  # EXPECT_EQ in the suite.
+  -readability-uppercase-literal-suffix
+
+WarningsAsErrors: ''
+
+# Umbra's own headers and sources only. third_party/ is vendored and its
+# findings are upstream's business; a HeaderFilterRegex that reached into
+# googletest or basalt would bury ours.
+HeaderFilterRegex: '^(src|include/umbra|test)/'
+FormatStyle: file
+
+CheckOptions:
+  - key:   readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key:   readability-identifier-naming.StructCase
+    value: CamelCase
+  - key:   readability-identifier-naming.FunctionCase
+    value: CamelCase
+  - key:   readability-identifier-naming.PrivateMemberSuffix
+    value: _
+  - key:   readability-identifier-naming.NamespaceCase
+    value: lower_case

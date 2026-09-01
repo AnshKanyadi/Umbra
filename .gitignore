@@ -1,0 +1,72 @@
+# BUILD OUTPUT IS NEVER TRACKED, AND THIS FILE IS WRITTEN TO MAKE THAT TRUE
+# RATHER THAN INTENDED.
+#
+# Basalt ignores `build/` and `build-*/` and has eight build directories in its
+# history named `bl-clang-address`, `v-gcc-16-thread` and so on -- committed
+# binaries included, because the directories a human types under time pressure
+# are never the ones the ignore file anticipated. The lesson taken here is not
+# "add those eight names": it is that an ignore list which enumerates blessed
+# prefixes fails open. So this file ignores the ARTIFACTS wherever they land, in
+# addition to the directory names, and .github/workflows/ci.yml carries a job
+# that fails if a tracked path looks like build output. The ignore file is the
+# convenience; the CI job is the guarantee.
+
+# ------------------------------------------------------------ by directory
+# The names this project uses. `b-` is the prefix every documented command in
+# this repo passes to `cmake -B`.
+build/
+build-*/
+b-*/
+out/
+cmake-build-*/
+
+# ---------------------------------------------------------------- by artifact
+# Named wherever they appear, because the directory list above is a courtesy and
+# these are the things that must never be committed.
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+compile_commands.json
+Makefile
+Testing/
+*.a
+*.o
+*.so
+*.so.*
+*.dylib
+*.dSYM/
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# `Makefile` above is a glob over the whole tree and there is no hand-written
+# Makefile in this project. If one is ever added, negate it HERE and say so,
+# rather than deleting the line: the line exists because CMake's Makefile
+# generator writes one into every build directory, including directories whose
+# names nobody predicted.
+
+# --------------------------------------------------------------- vendored
+# third_party/googletest is a vendored tree and IS tracked, whole. Its own
+# .gitignore is upstream's file and is part of what we vendored; it is not
+# consulted for paths under it because git only reads .gitignore files it finds
+# while walking, and it will find that one. The exclusions it carries are for
+# googletest's own build layout, which we never produce inside that tree.
+
+# Logs. The lane scripts in this project write build and run logs beside the
+# build directory they belong to, and a log is build output like any other.
+*.log
+
+# --------------------------------------------------------------- editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# --------------------------------------------------------------------- test
+# The watcher suite builds its trees under a per-run temp directory obtained
+# from TMPDIR and removes them; this catches the case where a test aborts under
+# a sanitizer before its cleanup runs AND was pointed at the source tree.
+/umbra-watch-test-*/

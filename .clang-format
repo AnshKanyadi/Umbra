@@ -1,0 +1,30 @@
+# THIS TREE IS NEW, AND THE CONFIG STILL APPLIES TO CHANGED LINES ONLY.
+#
+# basalt checks changed lines because it acquired its config after 26,000 lines
+# were already written and a whole-tree reformat would have produced a diff
+# nobody could audit. Umbra has no such history: every line here was written
+# under this file, so a whole-file check would pass today.
+#
+# It is still a changed-lines check, for a reason that outlives the migration
+# argument. clang-format's output is not stable across major versions -- the
+# CI lane pins one, contributors have whatever their distribution ships -- and
+# under a whole-file check a version skew reformats files the change never
+# touched, so the diff under review stops being the change. Restricting the
+# check to the lines a commit actually edits bounds that damage to the lines
+# their author was already looking at. The lane prints its clang-format version
+# for the same reason; see .github/workflows/ci.yml.
+#
+# ReflowComments is OFF. With it on, editing one line inside a comment block
+# rewraps the block around it, and a one-line change arrives as a twelve-line
+# diff through paragraphs the author never read. The comments in this repo carry
+# the reasoning and are the part most worth reviewing; they must not churn.
+BasedOnStyle: Google
+Language: Cpp
+Standard: c++17
+ColumnLimit: 80
+IndentWidth: 2
+AccessModifierOffset: -1
+DerivePointerAlignment: false
+PointerAlignment: Left
+IncludeBlocks: Preserve
+ReflowComments: false
