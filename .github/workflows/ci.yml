@@ -1,0 +1,311 @@
+# Four lanes across three toolchains: twelve jobs, plus four that are not
+# per-toolchain.
+#
+# THE LANES ARE NOT VARIATIONS ON A THEME. `umbra-test` is the UNINSTRUMENTED
+# CONTROL that makes the other three mean something: without it, a red under
+# ASan is not attributable, because "the code is broken" and "the code has a
+# memory error" look identical in an exit code.
+#
+# Each lane asserts AT COMPILE TIME that it has the sanitizer it claims -- and
+# the control asserts it has none. See test/sanitizer_lane_test.cc. A lane that
+# lost its -fsanitize flag to a CMake edit fails to BUILD rather than passing
+# quietly, which is the failure mode a sanitizer lane is most exposed to: it
+# keeps building, keeps running, keeps passing, and checks nothing at all.
+#
+# THREE TOOLCHAINS, BECAUSE THE STANDARD LIBRARY IS THE VARIABLE. libstdc++ and
+# libc++ do not agree about which headers include which others, so a missing
+# <algorithm> compiles on one and not the other.
+#
+# macOS + gcc IS DELIBERATELY ABSENT and could not be added. The FSEvents
+# backend includes <CoreServices/CoreServices.h>, which pulls in Apple's
+# MDItem.h, which declares a block-typed parameter (`void(^)(CFArrayRef)`).
+# Blocks are a Clang extension; gcc cannot parse that header at all. This is not
+# something our code can work around -- verified locally with gcc 16.1 against
+# the macOS 15 SDK.
+#
+# NO NETWORK IS NEEDED TO BUILD. GoogleTest is vendored at
+# third_party/googletest and basalt is a submodule pinned to a commit; the
+# checkout is the only fetch.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lanes:
+    name: ${{ matrix.lane.name }} (${{ matrix.platform.os }}, ${{ matrix.platform.cc }})
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: ubuntu-latest, cc: clang, cxx: clang++ }
+          - { os: ubuntu-latest, cc: gcc,   cxx: g++ }
+          - { os: macos-latest,  cc: clang, cxx: clang++ }
+        lane:
+          - name: umbra-test
+            sanitizer: none
+            opts: ''
+          - name: umbra-asan
+            sanitizer: address
+            opts: 'ASAN_OPTIONS=abort_on_error=0:detect_leaks=0'
+          - name: umbra-ubsan
+            sanitizer: undefined
+            opts: 'UBSAN_OPTIONS=print_stacktrace=1'
+          # THE THREAD LANE RUNS THE SAME BINARY AS THE OTHERS, and that is a
+          # difference from basalt worth stating. basalt needs a separate TSan
+          # harness because its unit suite is single-threaded, so a green TSan
+          # run over it would report the absence of threads as the absence of
+          # races. Umbra's suite has the opposite property: the watcher owns a
+          # backend thread and a debounce timer, the live-backend tests drive
+          # real filesystem events across that boundary, and two tests run a
+          # writer thread against the reconciler on purpose. There is nothing
+          # to build separately.
+          - name: umbra-tsan
+            sanitizer: thread
+            opts: 'TSAN_OPTIONS=halt_on_error=1'
+    env:
+      CC: ${{ matrix.platform.cc }}
+      CXX: ${{ matrix.platform.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: compiler version
+        run: $CXX --version
+
+      # A failure here is legible; the same failure inside add_subdirectory is
+      # not. CMakeLists.txt also checks, for the case of a local clone.
+      - name: the basalt submodule is present
+        run: test -f third_party/basalt/CMakeLists.txt
+
+      - name: configure
+        run: cmake -S . -B build -DUMBRA_SANITIZER=${{ matrix.lane.sanitizer }}
+
+      # getconf rather than nproc: nproc is coreutils and is not on the macOS
+      # runner.
+      - name: build
+        run: cmake --build build --target umbra_test -j "$(getconf _NPROCESSORS_ONLN)"
+
+      - name: run
+        run: env ${{ matrix.lane.opts }} ./build/umbra_test
+
+  # The library alone, with UMBRA_BUILD_TESTS off: the configuration an embedder
+  # gets from add_subdirectory. It must not need GoogleTest and must not need
+  # anything under test/.
+  library-only:
+    name: library only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: cmake -S . -B build-lib -DUMBRA_BUILD_TESTS=OFF
+      - run: cmake --build build-lib -j "$(nproc)"
+      - run: test -f build-lib/libumbra.a
+
+  # FORMAT IS CHECKED ON THE LINES A CHANGE TOUCHES, NEVER ON THE FILE.
+  #
+  # See .clang-format for why this stays a changed-lines check even though the
+  # tree is new enough that a whole-file check would pass today.
+  format:
+    name: clang-format (changed lines)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      # The merge base, not the base tip: comparing against the tip would
+      # attribute every line the base moved on since the branch started to this
+      # change.
+      - name: resolve the merge base
+        id: base
+        run: |
+          if [ -n "${{ github.base_ref }}" ]; then
+            git fetch --no-tags origin "${{ github.base_ref }}"
+            base=$(git merge-base HEAD FETCH_HEAD)
+          elif git rev-parse HEAD~1 >/dev/null 2>&1; then
+            base=$(git rev-parse HEAD~1)
+          else
+            base=$(git rev-parse HEAD)
+          fi
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+          echo "comparing against $base"
+
+      # Printed because it is a real variable: clang-format output differs
+      # between major releases, so a contributor whose local version is not this
+      # one can be told to reformat by a lane they cannot reproduce.
+      - name: clang-format version
+        run: clang-format --version
+
+      - name: changed lines satisfy .clang-format
+        run: |
+          # THE STATUS IS TAKEN EXPLICITLY, and this is not defensive style.
+          # `git clang-format --diff` exits 1 when it HAS a diff to report. This
+          # step runs under `bash -e`, so assigning its output kills the step AT
+          # THE ASSIGNMENT, before a single echo runs -- the lane goes red having
+          # printed nothing about what it wanted changed. A check that cannot
+          # say what it objects to is one people disable.
+          set +e
+          out=$(git clang-format --diff --extensions cc,h \
+                  "${{ steps.base.outputs.sha }}" \
+                  -- src include test 2>&1)
+          rc=$?
+          set -e
+
+          # 0 = nothing to change, 1 = a diff to report, anything else = the
+          # tool itself failed and must not be read as a formatting verdict.
+          if [ "$rc" -gt 1 ]; then
+            echo "git clang-format failed with exit $rc:"
+            echo "$out"
+            exit "$rc"
+          fi
+          if [ "$rc" -eq 0 ]; then
+            echo "changed lines are clean"
+            echo "$out"
+            exit 0
+          fi
+          echo "$out"
+          echo
+          echo "The lines this change touches do not match .clang-format."
+          echo "Run: git clang-format ${{ steps.base.outputs.sha }}"
+          exit 1
+
+  # TIDY IS ALSO CHANGED-LINES ONLY, for the reason in .clang-tidy: a pass over
+  # a whole tree produces a wall of findings nobody reads, and a wall nobody
+  # reads is indistinguishable from a clean run.
+  tidy:
+    name: clang-tidy (changed lines)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - run: sudo apt-get update && sudo apt-get install -y clang-tidy cmake
+
+      - name: resolve the merge base
+        id: base
+        run: |
+          if [ -n "${{ github.base_ref }}" ]; then
+            git fetch --no-tags origin "${{ github.base_ref }}"
+            base=$(git merge-base HEAD FETCH_HEAD)
+          elif git rev-parse HEAD~1 >/dev/null 2>&1; then
+            base=$(git rev-parse HEAD~1)
+          else
+            base=$(git rev-parse HEAD)
+          fi
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+
+      - name: clang-tidy version
+        run: clang-tidy --version
+
+      # clang-tidy needs to know how each file is compiled. Configuring is the
+      # cheapest way to get a compilation database; nothing is built.
+      - name: compilation database
+        run: cmake -S . -B build-tidy -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: changed lines satisfy .clang-tidy
+        run: |
+          # clang-tidy-diff.py is shipped inside the llvm package rather than on
+          # PATH, and its location moves with the version. Found rather than
+          # hardcoded, and a failure to find it is reported AS THAT -- not as a
+          # clean run, which is what a `|| true` here would produce.
+          script=$(find /usr/lib/llvm-* /usr/share/clang -name 'clang-tidy-diff*.py' 2>/dev/null | head -1)
+          if [ -z "$script" ]; then
+            echo "clang-tidy-diff.py not found; refusing to report a pass"
+            exit 1
+          fi
+          echo "using $script"
+
+          # THE STATUS IS TAKEN EXPLICITLY, for the same reason as the format
+          # job: the pipeline's exit code must not kill the step before the
+          # findings are printed.
+          set +e
+          diff=$(git diff -U0 "${{ steps.base.outputs.sha }}" -- 'src/*.cc' 'src/*.h' 'include/*.h' 'test/*.cc')
+          drc=$?
+          set -e
+          if [ "$drc" -ne 0 ]; then
+            echo "git diff failed with exit $drc"
+            exit "$drc"
+          fi
+          if [ -z "$diff" ]; then
+            echo "no C++ lines changed"
+            exit 0
+          fi
+
+          set +e
+          out=$(printf '%s\n' "$diff" | python3 "$script" -p1 -path build-tidy -quiet 2>&1)
+          rc=$?
+          set -e
+
+          echo "$out"
+          # clang-tidy-diff exits non-zero when it has findings AND when it
+          # fails to run. The two are distinguished by looking for the shape of
+          # a finding, because a tool that could not run must never be read as
+          # a clean tree.
+          if printf '%s\n' "$out" | grep -qE '\[(readability|bugprone|cert|misc|performance|modernize|concurrency|clang-analyzer)-'; then
+            echo
+            echo "clang-tidy objects to lines this change touches."
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "clang-tidy-diff exited $rc without reporting findings; treating as a tool failure"
+            exit "$rc"
+          fi
+          echo "changed lines are clean"
+
+  # BUILD OUTPUT IS NEVER TRACKED, AND THIS IS THE JOB THAT ENFORCES IT.
+  #
+  # .gitignore is a convenience: it only covers the directory names somebody
+  # thought of. basalt ignores `build/` and `build-*/` and has eight tracked
+  # build directories named things like `bl-clang-address` and `v-gcc-16-thread`
+  # -- compiled binaries included. An ignore list that enumerates blessed
+  # prefixes fails open, so the guarantee is here instead, over what is actually
+  # in the index.
+  no-build-output:
+    name: no build output is tracked
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: the index contains no build artifacts
+        run: |
+          # third_party/ is vendored upstream source and is exempt from the
+          # name-shape rules below; upstream ships files we do not control.
+          bad=$(git ls-files | grep -v '^third_party/' | grep -E \
+            '(^|/)(CMakeCache\.txt|CMakeFiles/|cmake_install\.cmake|CTestTestfile\.cmake|compile_commands\.json|Makefile)$|\.(a|o|so|dylib|gcda|gcno|profraw|profdata)$' || true)
+          if [ -n "$bad" ]; then
+            echo "These look like build output and are tracked:"
+            echo "$bad"
+            exit 1
+          fi
+
+      - name: no tracked file is an executable binary
+        run: |
+          # A compiled test binary has no extension and would slip past the name
+          # check above. Executable-bit plus "not a text file" is what catches
+          # it; shell scripts are text and are unaffected.
+          bad=""
+          while IFS= read -r f; do
+            [ -x "$f" ] || continue
+            case "$f" in third_party/*) continue;; esac
+            if ! file --mime-encoding "$f" | grep -qE 'us-ascii|utf-8'; then
+              bad="$bad$f"$'\n'
+            fi
+          done < <(git ls-files)
+          if [ -n "$bad" ]; then
+            echo "These are tracked, executable and not text:"
+            echo "$bad"
+            exit 1
+          fi
