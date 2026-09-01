@@ -166,6 +166,10 @@ set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
 add_library(umbra STATIC
+  src/crdt/op_id.cc
+  src/crdt/op.cc
+  src/crdt/utf8.cc
+  src/crdt/text_doc.cc
   src/watcher/content_hash.cc
   src/watcher/object_id.cc
   src/watcher/scan.cc
@@ -183,7 +187,7 @@ add_library(umbra::umbra ALIAS umbra)
 target_include_directories(umbra
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
          $<INSTALL_INTERFACE:include>
-  PRIVATE src src/watcher)
+  PRIVATE src src/watcher src/crdt)
 target_compile_options(umbra PRIVATE ${UMBRA_CXX_FLAGS})
 # sodium is PRIVATE: BLAKE2b is how ContentHash is computed, which is an
 # implementation detail of this library. A consumer of <umbra/change_event.h>
@@ -223,7 +227,7 @@ endif()
 # SEPARATE ARCHIVE and never links into `umbra`. A shipped library must not
 # contain a backend whose events come from whoever calls Emit.
 add_library(umbra_testing STATIC src/watcher/backend_manual.cc)
-target_include_directories(umbra_testing PUBLIC src src/watcher)
+target_include_directories(umbra_testing PUBLIC src src/watcher src/crdt)
 target_link_libraries(umbra_testing PUBLIC umbra)
 target_compile_options(umbra_testing PRIVATE ${UMBRA_CXX_FLAGS})
 
@@ -261,9 +265,10 @@ enable_testing()
 add_executable(umbra_test
   test/sanitizer_lane_test.cc
   test/watcher_test.cc
+  test/crdt_test.cc
 )
 target_link_libraries(umbra_test PRIVATE umbra_testing gtest_main)
-target_include_directories(umbra_test PRIVATE src src/watcher)
+target_include_directories(umbra_test PRIVATE src src/watcher src/crdt)
 target_compile_options(umbra_test PRIVATE ${UMBRA_CXX_FLAGS})
 target_compile_definitions(umbra_test PRIVATE ${UMBRA_SANITIZER_DEFINE})
 add_test(NAME umbra_test COMMAND umbra_test)
