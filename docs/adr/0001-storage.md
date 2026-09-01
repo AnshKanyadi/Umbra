@@ -3,6 +3,7 @@
 - Status: accepted
 - Date: 2026-09-01
 - Depends on: [docs/threat-model.md](../threat-model.md)
+- Amended 2026-09-01: the content-addressing hash, left open below, is BLAKE2b-256
 
 ## Context
 
@@ -105,13 +106,13 @@ sweep that lists `segments/` and deletes what the manifest does not name is
 required, and it must be safe against a concurrent indexing pass that has
 written a segment but not yet committed its manifest entry.
 
-**Content addressing needs a hash that is not yet chosen.** The segment file name
-is a hash of its contents, so a collision is an integrity failure: two distinct
-segments claiming the same name means one silently replaces the other. This
-requires a cryptographic hash, and the choice belongs with the crypto design.
-The watcher's `ContentHash` is a placeholder and is documented in
-`include/umbra/change_event.h` as unsuitable for this use; the same function
-must not be reached for here on the grounds that it is already available.
+**Content addressing needs a cryptographic hash, and it is now chosen.** The
+segment file name is a hash of its contents, so a collision is an integrity
+failure: two distinct segments claiming the same name means one silently
+replaces the other. That is BLAKE2b-256 via libsodium's `crypto_generichash`,
+which is also what `ContentHash` is (`include/umbra/change_event.h`). The two
+uses share a function deliberately — a segment named by one hash and a file
+detected by another would be two things to keep collision-free instead of one.
 
 **The segments are encrypted before they are hashed.** Content addressing over
 plaintext would make the filename a fingerprint of the contents, so anyone who

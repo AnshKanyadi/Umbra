@@ -18,6 +18,11 @@
 #                           See its VERSION file for the pin and for why it is a
 #                           separate copy from basalt's rather than a reach
 #                           through the submodule.
+#   third_party/libsodium   a VENDORED TREE, upstream's 1.0.22 unmodified.
+#                           It ships autotools and no CMake, so its build
+#                           description is third_party/libsodium.cmake -- OUTSIDE
+#                           the tree, so that `configure` never runs and the tree
+#                           never changes. See both files.
 cmake_minimum_required(VERSION 3.16)
 project(umbra CXX)
 
@@ -137,6 +142,14 @@ set(UMBRA_CXX_FLAGS -Wall -Wextra -Werror -Werror=switch -fno-exceptions -fno-rt
 # readability; neither order matters between them.
 set(BASALT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/basalt EXCLUDE_FROM_ALL)
+
+# ------------------------------------------------------------------ libsodium
+#
+# Included AFTER the sanitizer block for the same reason basalt and googletest
+# are: a lane that does not instrument its crypto library is a lane that would
+# stay quiet about a defect there. include() rather than add_subdirectory()
+# because the file describes a tree it does not live in.
+include(third_party/libsodium.cmake)
 if(TARGET gtest)
   message(FATAL_ERROR
           "basalt defined a `gtest` target, so BASALT_BUILD_TESTS did not take. "
@@ -172,7 +185,11 @@ target_include_directories(umbra
          $<INSTALL_INTERFACE:include>
   PRIVATE src src/watcher)
 target_compile_options(umbra PRIVATE ${UMBRA_CXX_FLAGS})
+# sodium is PRIVATE: BLAKE2b is how ContentHash is computed, which is an
+# implementation detail of this library. A consumer of <umbra/change_event.h>
+# gets a 32-byte digest and no libsodium headers.
 target_link_libraries(umbra PUBLIC basalt::basalt Threads::Threads)
+target_link_libraries(umbra PRIVATE umbra::sodium)
 
 # THE BACKEND IS CHOSEN HERE AND NOT WITH #ifdef INSIDE ONE FILE. Both backend
 # sources are compiled on both platforms; each is a no-op translation unit off

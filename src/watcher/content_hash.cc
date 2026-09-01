@@ -1,28 +1,33 @@
-#include <algorithm>
+#include <sodium.h>
 
+#include <mutex>
+
+#include "check.h"
 #include "umbra/change_event.h"
 
 namespace umbra {
 namespace {
 
-// FNV-1a-64. See the warning on ContentHash in the public header: this is a
-// change detector, not a cryptographic hash, and it is deliberately simple so
-// that nobody mistakes it for one.
-constexpr uint64_t kFnvPrime = 0x100000001b3ULL;
-
-uint64_t Fnv1a(const unsigned char* p, std::size_t n, uint64_t basis) {
-  uint64_t h = basis;
-  for (std::size_t i = 0; i < n; ++i) {
-    h ^= static_cast<uint64_t>(p[i]);
-    h *= kFnvPrime;
-  }
-  return h;
-}
-
-void PutBe64(uint64_t v, uint8_t* out) {
-  for (int i = 0; i < 8; ++i) {
-    out[i] = static_cast<uint8_t>((v >> (56 - (8 * i))) & 0xff);
-  }
+// sodium_init IS CALLED ONCE, AND ITS FAILURE IS FATAL.
+//
+// libsodium requires it before any other call. It is idempotent and documented
+// as thread-safe from 1.0.11 onward, but call_once costs nothing and makes the
+// ordering a property of the code rather than of libsodium's version.
+//
+// A failure here means the library could not initialise its runtime state --
+// on the platforms this builds for, that is the entropy source being
+// unavailable. Continuing would mean hashing with an uninitialised library, so
+// the process aborts. This is the one place in the watcher that can abort, and
+// it is deliberate: there is no Status a caller could usefully act on.
+void EnsureSodium() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    if (::sodium_init() < 0) {
+      UMBRA_DIE(
+          "sodium_init failed; refusing to hash with an uninitialised "
+          "libsodium");
+    }
+  });
 }
 
 std::string ToHexBytes(const uint8_t* p, std::size_t n) {
@@ -39,23 +44,33 @@ std::string ToHexBytes(const uint8_t* p, std::size_t n) {
 }  // namespace
 
 ContentHash HashBytes(const void* data, std::size_t len) {
-  const unsigned char* p = static_cast<const unsigned char*>(data);
-  // Four different offset bases. The lanes are correlated -- they walk the same
-  // bytes with the same prime -- so this fills 32 bytes without claiming 256
-  // bits of strength. The length is folded into each basis so that appending
-  // zero bytes cannot be a no-op.
-  const uint64_t l = static_cast<uint64_t>(len);
+  EnsureSodium();
   ContentHash h;
-  PutBe64(Fnv1a(p, len, 0xcbf29ce484222325ULL ^ l), h.bytes.data());
-  PutBe64(Fnv1a(p, len, 0x9e3779b97f4a7c15ULL ^ l), &h.bytes[8]);
-  PutBe64(Fnv1a(p, len, 0xff51afd7ed558ccdULL ^ l), &h.bytes[16]);
-  PutBe64(Fnv1a(p, len, 0xc4ceb9fe1a85ec53ULL ^ l), &h.bytes[24]);
+  // Unkeyed BLAKE2b-256. crypto_generichash is libsodium's name for BLAKE2b;
+  // 32 bytes is crypto_generichash_BYTES, which the header asserts against
+  // ContentHash's size.
+  static_assert(sizeof(h.bytes) == crypto_generichash_BYTES,
+                "ContentHash is not the size crypto_generichash produces");
+  //
+  // NO KEY. A keyed hash would make the digest unreproducible by anything that
+  // does not hold the key, and the digest has to be reproducible: ADR 0001 makes
+  // the segment store content-addressed, so the same bytes must name the same
+  // blob on every device. Confidentiality of the content comes from encrypting
+  // it, not from keying its name.
+  const int rc = ::crypto_generichash(
+      h.bytes.data(), h.bytes.size(), static_cast<const unsigned char*>(data),
+      static_cast<unsigned long long>(len), nullptr, 0);
+  UMBRA_CHECK(rc == 0, "crypto_generichash failed on a valid-sized request");
   return h;
 }
 
 bool ContentHash::IsZero() const {
-  return std::all_of(bytes.begin(), bytes.end(),
-                     [](uint8_t b) { return b == 0; });
+  // sodium_is_zero rather than a loop: it is constant-time. Nothing here is
+  // secret today, but the sentinel comparison lives next to real digests and a
+  // timing-variable comparison on a digest is the kind of thing that becomes
+  // wrong later without anybody editing it.
+  EnsureSodium();
+  return ::sodium_is_zero(bytes.data(), bytes.size()) == 1;
 }
 
 std::string ContentHash::ToHex() const {

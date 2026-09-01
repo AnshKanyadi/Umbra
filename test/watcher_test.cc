@@ -1120,6 +1120,20 @@ TEST(PathHelpers, VaultFileRecognition) {
   EXPECT_FALSE(IsVaultFile("a.md.swp"));
 }
 
+// KNOWN-ANSWER TESTS, because "it is a hash" and "it is the hash we said it is"
+// are different claims. These digests were not produced by the code under test:
+// they are BLAKE2b-256 of the empty string and of "abc", which any independent
+// implementation agrees on. A build that silently linked a different hash, or
+// libsodium configured for a different digest length, fails here rather than
+// producing self-consistent garbage that every replica agrees on.
+TEST(ContentHashing, MatchesPublishedBlake2b256Vectors) {
+  EXPECT_EQ(HashBytes("", 0).ToHex(),
+            "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8");
+  const std::string abc = "abc";
+  EXPECT_EQ(HashBytes(abc.data(), abc.size()).ToHex(),
+            "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319");
+}
+
 TEST(ContentHashing, DistinguishesLengthAndBytes) {
   const std::string a = "hello";
   const std::string b = "hello ";

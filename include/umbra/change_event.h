@@ -44,32 +44,25 @@ struct ObjectId {
   std::string ToHex() const;
 };
 
-// A digest of a file's contents, used to decide whether anything actually
-// changed.
+// A digest of a file's contents: unkeyed BLAKE2b-256, via libsodium's
+// crypto_generichash.
 //
-// THE FUNCTION BEHIND THIS TYPE IS NOT CHOSEN YET, AND THIS PHASE IS THE WRONG
-// PLACE TO CHOOSE IT. Picking the digest is a cryptographic decision -- ADR
-// 0001 makes the encrypted vector-index segment store CONTENT-ADDRESSED, so the
-// same function ends up naming immutable blobs on disk, where a collision is an
-// integrity failure rather than a missed sync. That decision belongs with the
-// rest of the crypto design.
+// THE SAME FUNCTION NAMES BLOBS. ADR 0001 makes the encrypted vector-index
+// segment store content-addressed, so this digest is not only a change detector
+// -- a collision there means one segment silently standing in for another,
+// which is an integrity failure rather than a missed sync. That is why it is a
+// cryptographic hash and why the choice is not a local one.
 //
-// So the TYPE is 32 bytes, fixed now, and the FUNCTION is a placeholder. What
-// the placeholder is, stated plainly rather than dressed up:
+// BLAKE2b rather than SHA-256: libsodium is already the dependency the rest of
+// the crypto design needs, crypto_generichash is its recommended general hash,
+// and it is faster than SHA-256 on the platforms this targets without needing
+// hardware support to be so.
 //
-//   Umbra::HashBytes is four FNV-1a-64 lanes over the same input with different
-//   offset bases. It is NOT a cryptographic hash. Its lanes are correlated, so
-//   its real collision resistance is nearer a 64-bit hash than a 256-bit one,
-//   and it offers NO resistance to an adversary choosing inputs. It is adequate
-//   for exactly one job -- noticing that a local file the user edited is
-//   different from the one we last saw -- and it must be replaced before
-//   anything content-addresses a blob by it.
-//
-// Deliberately not reached for: basalt vendors a SHA-256 at src/wal/sha256.cc.
-// It is PRIVATE to that library -- basalt's own CMakeLists.txt keeps
-// src/wal off its public include path -- so using it would mean adding a
-// dependency's internal directory to our include path, which breaks silently on
-// a submodule bump. The placeholder is the smaller debt.
+// The digest is computed over the bytes AS THEY ARE ON DISK -- plaintext, at
+// this layer. Where content addressing is applied to a segment it is applied to
+// the CIPHERTEXT, for the reason ADR 0001 gives: hashing plaintext would make
+// the name a fingerprint of the content, which is the leak the threat model
+// rules out for paths.
 struct ContentHash {
   std::array<uint8_t, 32> bytes{};
 
