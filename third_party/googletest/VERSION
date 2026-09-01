@@ -1,0 +1,40 @@
+# Vendored dependency provenance -- GoogleTest.
+
+# FetchContent was declined, for the reason basalt declines it: a build step
+# that reaches the network fails in exactly the situation where "the tests build
+# and run from a clean clone" matters most, which is a stranger checking our
+# work. So the tree is vendored, whole and unmodified.
+
+upstream:   https://github.com/google/googletest
+tag:        v1.17.0
+commit:     52eb8108c5bdec04579160ae17225d66034bd723
+tree:       ad23b2ceac4a6eef2278c48545b62ffc1f0c134a
+authored:   2025-04-30 (upstream commit date; "Prepare for v1.17.0 (#4757)")
+
+# WHY THIS IS A COPY AND NOT basalt's COPY.
+#
+# basalt is a submodule of this repo and vendors googletest itself, at this
+# exact commit. Reaching through the submodule for the framework would save 250
+# files and would make Umbra's test framework a property of the basalt pin:
+# bumping basalt for a storage fix would silently move the framework our own
+# suite is compiled against, and a test-framework change arriving inside a
+# storage-engine bump is a change nobody reviews as one. So the trees are
+# separate and the PIN IS DELIBERATELY THE SAME, which costs nothing today and
+# keeps the two bumps independent when it stops being the same.
+#
+# CMake never sees both. basalt returns before its add_subdirectory of
+# googletest unless BASALT_BUILD_TESTS is on, and the top-level CMakeLists.txt
+# forces it OFF before adding the submodule; two `gtest` targets in one build
+# would be a configure error, so this is asserted there rather than assumed.
+
+# THE ONE FILE THAT IS NOT UPSTREAM'S
+#
+# This file, and only this file. To confirm the rest is upstream's, recompute
+# the tree hash with this file excluded and compare against `tree:` above:
+#
+#   git rev-parse HEAD:third_party/googletest      # with VERSION removed
+#
+# The equality is the whole check; excluding one hard-coded name costs nothing
+# because the equality itself guards the exclusion.
+
+exclude-from-hash: VERSION
