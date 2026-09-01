@@ -738,6 +738,33 @@ void RunCompactThenEdit(Sim* s) {
   }
   s->Quiesce();
   s->CompactRound(/*everyone=*/true);
+
+  // RE-DELIVER OLD OPERATIONS PAST THE CURSOR, on purpose.
+  //
+  // A cursor stops a replica ASKING for an operation twice. It does not stop
+  // one ARRIVING twice: the relay may resend, two peers may both forward the
+  // same thing, and a device restored from a backup replays a log everyone
+  // already has. Every one of those hands a compacted replica an operation for
+  // a character it has dropped.
+  //
+  // Without this the compaction watermark could be deleted from Apply and the
+  // sweep stayed green, because nothing ever re-offered a compacted operation.
+  // That is condition 5 in docs/adr/0002-crdt.md, and this is what holds it to
+  // account.
+  {
+    std::vector<Message> replays;
+    for (std::size_t i = 0; i < s->replicas.size(); ++i) {
+      for (const Op& op : s->replicas[i].durable) {
+        if (!s->rng.Chance(25)) continue;
+        const std::size_t to = static_cast<std::size_t>(
+            s->rng.Below(static_cast<uint64_t>(s->replicas.size())));
+        if (to == i) continue;
+        replays.push_back(Message{to, op});
+      }
+    }
+    for (const Message& m : replays) s->Deliver(m.to, m.op);
+  }
+
   for (s->step = 0; s->step < half; ++s->step) {
     s->LocalEdit(static_cast<std::size_t>(
         s->rng.Below(static_cast<uint64_t>(s->replicas.size()))));
