@@ -1479,10 +1479,20 @@ TEST_F(LiveBackend, ReportsAMovedDirectorysChildren) {
   const std::vector<ChangeEvent> evs = sink_.Events();
   w_->Stop();
 
-  std::set<std::string> paths;
-  for (const ChangeEvent& e : evs) paths.insert(e.path);
-  EXPECT_EQ(paths.count("new/a.md"), 1u) << Describe(evs);
-  EXPECT_EQ(paths.count("new/b.md"), 1u) << Describe(evs);
+  // THE KIND IS ASSERTED, NOT ONLY THE PATH. An earlier version of this test
+  // checked the reported paths alone and stayed green when the FSEvents rename
+  // flag was forced off -- the children were reported as CREATES at the new
+  // paths, which satisfies a path-only assertion while losing every object's
+  // identity. Asserting the kind is what makes this test cover the thing it is
+  // named for.
+  std::map<std::string, const ChangeEvent*> by_path;
+  for (const ChangeEvent& e : evs) by_path[e.path] = &e;
+  ASSERT_EQ(by_path.count("new/a.md"), 1u) << Describe(evs);
+  ASSERT_EQ(by_path.count("new/b.md"), 1u) << Describe(evs);
+  EXPECT_EQ(by_path["new/a.md"]->kind, ChangeKind::kMoved) << Describe(evs);
+  EXPECT_EQ(by_path["new/b.md"]->kind, ChangeKind::kMoved) << Describe(evs);
+  EXPECT_EQ(by_path["new/a.md"]->old_path, "old/a.md") << Describe(evs);
+  EXPECT_EQ(by_path["new/b.md"]->old_path, "old/b.md") << Describe(evs);
 }
 
 }  // namespace
