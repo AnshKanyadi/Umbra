@@ -263,6 +263,7 @@ struct Sim {
         oracle.RecordDelete(op);
       }
       replicas[i].durable.push_back(op);
+      replicas[i].received.insert(op.id);
       ++result.ops;
       for (std::size_t j = 0; j < replicas.size(); ++j) {
         if (j == i) continue;
@@ -280,6 +281,7 @@ struct Sim {
   // Deliver one operation into a replica, buffering it if it is early.
   void Deliver(std::size_t to, const Op& op) {
     Replica& r = replicas[to];
+    r.received.insert(op.id);
     const ApplyResult res = r.doc.Apply(op);
     ++result.deliveries;
     switch (res) {
@@ -348,6 +350,10 @@ struct Sim {
     r.pending.clear();
     r.doc = TextDoc();
     r.clock = LamportClock(r.id);
+    // The cursor comes back from the log, so anything received but not
+    // persisted will legitimately be asked for again.
+    r.received.clear();
+    for (const Op& op : r.durable) r.received.insert(op.id);
     for (const Op& op : r.durable) {
       const ApplyResult res = r.doc.Apply(op);
       r.clock.Observe(LastId(op));
@@ -451,11 +457,16 @@ struct Sim {
     for (std::size_t i = 0; i < replicas.size(); ++i) {
       for (std::size_t j = 0; j < replicas.size(); ++j) {
         if (i == j) continue;
+        // ONLY WHAT THE PEER HAS NOT BEEN SENT. See Replica::received.
         for (const Op& op : replicas[i].durable) {
-          in_flight.push_back(Message{j, op});
+          if (replicas[j].received.count(op.id) == 0) {
+            in_flight.push_back(Message{j, op});
+          }
         }
         for (const Op& op : replicas[i].uncommitted) {
-          in_flight.push_back(Message{j, op});
+          if (replicas[j].received.count(op.id) == 0) {
+            in_flight.push_back(Message{j, op});
+          }
         }
       }
     }

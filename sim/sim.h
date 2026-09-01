@@ -144,6 +144,17 @@ struct Replica {
   // Arrived but not yet applicable, because something they name is missing.
   std::vector<Op> pending;
 
+  // WHAT THIS REPLICA HAS ALREADY BEEN SENT, which is what a sync cursor
+  // remembers. The final flush re-offers only what is NOT here.
+  //
+  // Without this the harness was far more forgiving than reality: it re-sent
+  // every operation to everybody at the end, so an operation a replica had
+  // silently DROPPED came back and was applied, and a defect that loses
+  // operations converged anyway. A real replica advances a cursor and never
+  // asks for that operation again. Reset from the durable log on a crash,
+  // because that is exactly what a recovered cursor knows.
+  std::set<OpId> received;
+
   bool crashed_this_run = false;
 };
 
