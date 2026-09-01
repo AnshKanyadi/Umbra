@@ -48,6 +48,18 @@ Testing/
 # names nobody predicted.
 
 # --------------------------------------------------------------- vendored
+#
+# NOTHING UNDER third_party/ IS EVER IGNORED BY OUR RULES, and this is not
+# belt-and-braces. `build-*/` above matched libsodium's `build-aux/` directory,
+# which is upstream source, and twenty-four files went missing from the first
+# vendoring attempt without a word. The tree-hash check in each VERSION file is
+# what caught it.
+#
+# Two negations, because git cannot re-include a file whose parent DIRECTORY is
+# excluded: the first un-excludes the directories, the second the files.
+!/third_party/**/
+!/third_party/**
+
 # third_party/googletest is a vendored tree and IS tracked, whole. Its own
 # .gitignore is upstream's file and is part of what we vendored; it is not
 # consulted for paths under it because git only reads .gitignore files it finds

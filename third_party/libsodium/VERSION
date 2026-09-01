@@ -1,0 +1,46 @@
+# Vendored dependency provenance -- libsodium.
+
+# FetchContent was declined for the reason it is declined everywhere in this
+# repo: a build step that reaches the network fails in exactly the situation
+# where "it builds from a clean clone" matters most, which is a stranger
+# checking our work. So the tree is vendored, whole and unmodified.
+
+upstream:   https://github.com/jedisct1/libsodium
+tag:        1.0.22-RELEASE
+commit:     77e1ce5d6dee871c49ef211222ba18ef0c486bda
+tree:       07cdf5776966946afb03d09e6f1ca8f9d5ecbf1d
+authored:   2026-04-08 (upstream commit date)
+
+# WHY THE BUILD DESCRIPTION IS NOT IN HERE.
+#
+# GoogleTest ships a CMakeLists.txt, so vendoring it is a copy and an
+# add_subdirectory. libsodium ships autotools and nothing else. Running
+# `configure` would be a build step that runs a shell, probes the compiler and
+# WRITES INTO THIS TREE -- after which this directory would no longer match the
+# hash below, and the check that makes vendoring auditable would be gone.
+#
+# So the CMake for it lives at third_party/libsodium.cmake, one level up. This
+# tree is never written to, including by a build. See that file for what is
+# compiled and for why the portable (non-SIMD) paths are the ones selected.
+
+# WHAT IS USED, AND WHAT THE REST IS DOING HERE.
+#
+# Umbra calls crypto_generichash (BLAKE2b) and sodium_init, and nothing else
+# yet. The whole tree is vendored anyway rather than the subset those need,
+# because sodium_init initializes several primitives and the "minimal" cut would
+# be a hand-maintained list that drifts on every pin bump. More importantly, a
+# subset cannot be checked against the hash below, and that check is the point:
+# a partial copy has to be audited by reading it, a whole one by comparing one
+# number. Later phases need the AEAD and the KDF regardless.
+
+# THE ONE FILE THAT IS NOT UPSTREAM'S
+#
+# This file, and only this file. To confirm the rest is upstream's, recompute
+# the tree hash with this file excluded and compare against `tree:` above:
+#
+#   git rev-parse HEAD:third_party/libsodium      # with VERSION removed
+#
+# The equality is the whole check; excluding one hard-coded name costs nothing
+# because the equality itself guards the exclusion.
+
+exclude-from-hash: VERSION
