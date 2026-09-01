@@ -148,7 +148,8 @@ class TextDoc {
   // text is not valid UTF-8.
   bool LocalInsert(std::size_t index, const std::string& utf8,
                    LamportClock* clock, std::vector<Op>* out);
-  bool LocalDelete(std::size_t index, std::size_t count, std::vector<Op>* out);
+  bool LocalDelete(std::size_t index, std::size_t count, LamportClock* clock,
+                   std::vector<Op>* out);
 
   // --------------------------------------------------------------- reading
   std::string Text() const;              // UTF-8

@@ -70,7 +70,7 @@ void Oracle::RecordInsert(const Op& op, bool contiguity_exempt) {
 }
 
 void Oracle::RecordDelete(const Op& op) {
-  for (uint32_t i = 0; i < op.count; ++i) deleted_.insert(op.id.Plus(i));
+  for (uint32_t i = 0; i < op.count; ++i) deleted_.insert(op.target.Plus(i));
 }
 
 bool ScheduleRequiresContiguousRuns(Adversarial a) {
@@ -338,7 +338,7 @@ struct Sim {
       const std::size_t at = static_cast<std::size_t>(rng.Below(len));
       const std::size_t n = 1 + static_cast<std::size_t>(
                                     rng.Below(std::min<uint64_t>(4, len - at)));
-      if (!r.doc.LocalDelete(at, n, &ops)) return;
+      if (!r.doc.LocalDelete(at, n, &r.clock, &ops)) return;
     } else {
       const std::size_t at = static_cast<std::size_t>(rng.Below(len + 1));
       if (!r.doc.LocalInsert(at, TextFor(i, &rng), &r.clock, &ops)) return;
@@ -518,7 +518,9 @@ void RunDeleteRangeUnderInsert(Sim* s) {
   s->in_flight.clear();  // everyone is caught up; what follows is concurrent
 
   std::vector<Op> del;
-  if (s->replicas[0].doc.LocalDelete(2, 6, &del)) s->Originate(0, del);
+  if (s->replicas[0].doc.LocalDelete(2, 6, &s->replicas[0].clock, &del)) {
+    s->Originate(0, del);
+  }
   if (s->replicas.size() > 1) {
     std::vector<Op> ins;
     if (s->replicas[1].doc.LocalInsert(5, "INSIDE", &s->replicas[1].clock,

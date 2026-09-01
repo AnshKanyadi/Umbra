@@ -87,7 +87,7 @@ std::string Op::ToString() const {
     s += " under " + parent.ToString() + (side == Side::kLeft ? " L" : " R") +
          " x" + std::to_string(text.size());
   } else {
-    s += " x" + std::to_string(count);
+    s += " of " + target.ToString() + " x" + std::to_string(count);
   }
   return s;
 }
@@ -98,7 +98,7 @@ OpId LastId(const Op& op) {
       UMBRA_CHECK(!op.text.empty(), "an insert with no text has no last id");
       return op.id.Plus(op.text.size() - 1);
     case OpKind::kDelete:
-      // A delete creates nothing, so it occupies only its own id.
+      // A delete occupies exactly its own id.
       return op.id;
   }
   return op.id;
@@ -118,6 +118,7 @@ OpPayload EncodeOp(const Op& op) {
       for (char32_t c : op.text) PutU32(static_cast<uint32_t>(c), &out);
       break;
     case OpKind::kDelete:
+      PutOpId(op.target, &out);
       PutU32(op.count, &out);
       break;
   }
@@ -164,6 +165,8 @@ bool DecodeOp(const OpPayload& payload, Op* out) {
       break;
     }
     case OpKind::kDelete:
+      if (!r.Id(&out->target)) return false;
+      if (out->target.counter == 0) return false;
       if (!r.U32(&out->count)) return false;
       if (out->count == 0) return false;
       break;

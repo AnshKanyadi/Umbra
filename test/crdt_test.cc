@@ -89,10 +89,13 @@ TEST(OpCodec, RoundTripsInsertAndDelete) {
   Op del;
   del.kind = OpKind::kDelete;
   del.id = OpId{9, ReplicaIdFromSeed(3)};
+  del.target = OpId{2, ReplicaIdFromSeed(4)};
   del.count = 4;
   ASSERT_TRUE(DecodeOp(EncodeOp(del), &back));
   EXPECT_EQ(back.kind, del.kind);
   EXPECT_EQ(back.id, del.id);
+  EXPECT_EQ(back.target, del.target)
+      << "a delete's own identity and its target are different things";
   EXPECT_EQ(back.count, del.count);
 }
 
@@ -119,6 +122,7 @@ TEST(OpCodec, RefusesMalformedPayloads) {
   Op good;
   good.kind = OpKind::kDelete;
   good.id = OpId{1, ReplicaIdFromSeed(1)};
+  good.target = OpId{1, ReplicaIdFromSeed(2)};
   good.count = 1;
   const OpPayload p = EncodeOp(good);
   EXPECT_TRUE(DecodeOp(p, &op));
@@ -157,7 +161,7 @@ TEST(TextDoc, DeletesLeaveTombstonesAndAreIdempotent) {
   std::vector<Op> ops;
   ASSERT_TRUE(d.LocalInsert(0, "abcdef", &c, &ops));
   ops.clear();
-  ASSERT_TRUE(d.LocalDelete(1, 3, &ops));
+  ASSERT_TRUE(d.LocalDelete(1, 3, &c, &ops));
   EXPECT_EQ(d.Text(), "aef");
   EXPECT_EQ(d.TombstoneCount(), 3u);
   // Re-delivery changes nothing.
@@ -186,7 +190,7 @@ TEST(TextDoc, DeleteWithinOneReplicasIdsIsOneOperation) {
   ASSERT_TRUE(d.LocalInsert(0, "abc", &c, &ops));
   ASSERT_TRUE(d.LocalInsert(3, "xyz", &c, &ops));
   ops.clear();
-  ASSERT_TRUE(d.LocalDelete(2, 2, &ops));  // 'c' then 'x': ids 3 and 4
+  ASSERT_TRUE(d.LocalDelete(2, 2, &c, &ops));  // 'c' then 'x': ids 3 and 4
   EXPECT_EQ(d.Text(), "abyz");
   EXPECT_EQ(ops.size(), 1u);
   EXPECT_EQ(ops[0].count, 2u);
@@ -204,7 +208,7 @@ TEST(TextDoc, DeleteAcrossTwoReplicasIdsBecomesTwoOperations) {
   ASSERT_TRUE(d.LocalInsert(3, "xyz", &cb, &ops));
   ASSERT_EQ(d.Text(), "abcxyz");
   ops.clear();
-  ASSERT_TRUE(d.LocalDelete(2, 2, &ops));  // 'c' from A, 'x' from B
+  ASSERT_TRUE(d.LocalDelete(2, 2, &ca, &ops));  // 'c' from A, 'x' from B
   EXPECT_EQ(d.Text(), "abyz");
   EXPECT_EQ(ops.size(), 2u)
       << "a delete across two replicas' ids is two operations";
@@ -224,7 +228,7 @@ TEST(TextDoc, OutOfRangePositionsAreRefused) {
   std::vector<Op> ops;
   ASSERT_TRUE(d.LocalInsert(0, "abc", &c, &ops));
   EXPECT_FALSE(d.LocalInsert(9, "x", &c, &ops));
-  EXPECT_FALSE(d.LocalDelete(2, 5, &ops));
+  EXPECT_FALSE(d.LocalDelete(2, 5, &c, &ops));
   EXPECT_EQ(d.Text(), "abc");
 }
 
@@ -252,7 +256,7 @@ TEST(TextDoc, DeleteOfUnseenTargetIsNotReady) {
   std::vector<Op> ins;
   ASSERT_TRUE(src.LocalInsert(0, "abc", &c, &ins));
   std::vector<Op> del;
-  ASSERT_TRUE(src.LocalDelete(0, 1, &del));
+  ASSERT_TRUE(src.LocalDelete(0, 1, &c, &del));
 
   TextDoc dst;
   EXPECT_EQ(dst.Apply(del[0]), ApplyResult::kNotReady);
@@ -364,7 +368,7 @@ TEST(Compaction, DropsStableLeafTombstonesOnly) {
   std::vector<Op> ops;
   ASSERT_TRUE(d.LocalInsert(0, "abcdef", &c, &ops));
   std::vector<Op> del;
-  ASSERT_TRUE(d.LocalDelete(5, 1, &del));  // the last character: a leaf
+  ASSERT_TRUE(d.LocalDelete(5, 1, &c, &del));  // the last character: a leaf
   ASSERT_EQ(d.Text(), "abcde");
   ASSERT_EQ(d.NodeCount(), 6u);
 
@@ -389,7 +393,7 @@ TEST(Compaction, WillNotDropATombstoneThatStillAnchorsSomething) {
   std::vector<Op> ops;
   ASSERT_TRUE(d.LocalInsert(0, "abc", &c, &ops));
   std::vector<Op> del;
-  ASSERT_TRUE(d.LocalDelete(1, 1, &del));
+  ASSERT_TRUE(d.LocalDelete(1, 1, &c, &del));
   ASSERT_EQ(d.Text(), "ac");
 
   std::map<ReplicaId, uint64_t> high;
@@ -405,7 +409,8 @@ TEST(Compaction, ChainsCollapseFromTheOutsideIn) {
   std::vector<Op> ops;
   ASSERT_TRUE(d.LocalInsert(0, "abcd", &c, &ops));
   std::vector<Op> del;
-  ASSERT_TRUE(d.LocalDelete(1, 3, &del));  // b, c and d: a chain of tombstones
+  ASSERT_TRUE(
+      d.LocalDelete(1, 3, &c, &del));  // b, c and d: a chain of tombstones
   ASSERT_EQ(d.Text(), "a");
 
   std::map<ReplicaId, uint64_t> high;
@@ -423,7 +428,7 @@ TEST(Compaction, DoesNotChangeTheVisibleDocument) {
   std::vector<Op> ops;
   ASSERT_TRUE(a.LocalInsert(0, "hello world", &c, &ops));
   std::vector<Op> del;
-  ASSERT_TRUE(a.LocalDelete(5, 6, &del));
+  ASSERT_TRUE(a.LocalDelete(5, 6, &c, &del));
   const std::string before = a.Text();
   const std::string hash_before = a.StateHash();
 

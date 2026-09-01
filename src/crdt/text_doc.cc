@@ -202,11 +202,11 @@ ApplyResult TextDoc::Apply(const Op& op) {
       // Every target must be present. A delete that names a node we have not
       // seen is early, not wrong.
       for (uint32_t i = 0; i < op.count; ++i) {
-        if (Find(op.id.Plus(i)) == nullptr) return ApplyResult::kNotReady;
+        if (Find(op.target.Plus(i)) == nullptr) return ApplyResult::kNotReady;
       }
       bool changed = false;
       for (uint32_t i = 0; i < op.count; ++i) {
-        Node* n = Mutable(op.id.Plus(i));
+        Node* n = Mutable(op.target.Plus(i));
         if (!n->deleted) {
           n->deleted = true;
           changed = true;
@@ -294,7 +294,7 @@ bool TextDoc::LocalInsert(std::size_t index, const std::string& utf8,
 }
 
 bool TextDoc::LocalDelete(std::size_t index, std::size_t count,
-                          std::vector<Op>* out) {
+                          LamportClock* clock, std::vector<Op>* out) {
   if (count == 0) return true;
   std::vector<OpId> targets;
   targets.reserve(count);
@@ -318,7 +318,10 @@ bool TextDoc::LocalDelete(std::size_t index, std::size_t count,
     }
     Op op;
     op.kind = OpKind::kDelete;
-    op.id = targets[i];
+    // Its own tick, so the operation has an identity distinct from the
+    // characters it removes; see op.h.
+    op.id = clock->Tick(1);
+    op.target = targets[i];
     op.count = static_cast<uint32_t>(j - i);
     const ApplyResult r = Apply(op);
     UMBRA_CHECK(r == ApplyResult::kApplied || r == ApplyResult::kDuplicate,

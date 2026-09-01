@@ -53,8 +53,18 @@ const char* OpKindName(OpKind k);
 struct Op {
   OpKind kind = OpKind::kInsert;
 
-  // Insert: the id of the run's FIRST character.
-  // Delete: the id of the first character to remove.
+  // THIS OPERATION'S OWN IDENTITY, and every operation has one, including
+  // deletes.
+  //
+  // For an insert it is also the id of the run's first character, which costs
+  // nothing because the run allocates its ids from the same clock tick.
+  //
+  // A DELETE TAKES A TICK OF ITS OWN rather than borrowing the id of what it
+  // removes, and that is not tidiness. The oplog is keyed by (object, replica,
+  // counter): a delete keyed by its target's id lands on the very key the
+  // insert that created that character wrote, and silently replaces it. Replay
+  // then finds a delete whose target was never inserted and cannot rebuild the
+  // document. The oplog test caught exactly that.
   OpId id;
 
   // Insert only. The node this run's first character attaches to, and which
@@ -67,13 +77,16 @@ struct Op {
   // See text_doc.h.
   std::vector<char32_t> text;
 
-  // Delete: how many consecutive ids to remove. Always >= 1.
+  // Delete only. The first character to remove; `count` consecutive ids from
+  // `target` are removed. A deletion spanning several replicas' ids becomes
+  // several operations, one per maximal group.
+  OpId target;
   uint32_t count = 0;
 
-  // How many ids this operation consumes. An insert consumes one per
-  // character; a delete consumes none, because it creates nothing.
+  // How many ids this operation consumes from its replica's clock. An insert
+  // takes one per character; a delete takes exactly one, for itself.
   uint64_t IdSpan() const {
-    return kind == OpKind::kInsert ? static_cast<uint64_t>(text.size()) : 0;
+    return kind == OpKind::kInsert ? static_cast<uint64_t>(text.size()) : 1;
   }
 
   std::string ToString() const;
