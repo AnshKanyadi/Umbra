@@ -21,8 +21,13 @@ namespace internal {
 // Not inline-able away and not returning: the compiler is told this ends the
 // program so the call sites need no unreachable-path handling.
 [[noreturn]] inline void Die(const char* file, int line, const char* what) {
-  std::fprintf(stderr, "umbra: fatal at %s:%d: %s\n", file, line, what);
-  std::fflush(stderr);
+  // The (void) casts are the deliberate, greppable form of ignoring a return
+  // value, and cert-err33-c is right to want them here even though nothing
+  // could be done with either result: the process is about to abort, and a
+  // failed write to stderr does not change that. Silencing the check by
+  // disabling it would also silence it everywhere it matters.
+  (void)std::fprintf(stderr, "umbra: fatal at %s:%d: %s\n", file, line, what);
+  (void)std::fflush(stderr);
   std::abort();
 }
 
