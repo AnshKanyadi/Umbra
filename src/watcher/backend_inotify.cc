@@ -42,9 +42,15 @@ const uint32_t kMask = IN_CREATE | IN_DELETE | IN_MODIFY | IN_CLOSE_WRITE |
                        IN_MOVED_FROM | IN_MOVED_TO | IN_ATTRIB | IN_MOVE_SELF |
                        IN_DELETE_SELF | IN_EXCL_UNLINK;
 
-class InotifyBackend : public WatchBackend {
+// `final` and a non-virtual teardown. A destructor that calls a VIRTUAL Stop()
+// is dispatching on a partially destroyed object: by the time ~InotifyBackend
+// runs, any override in a derived class is already gone, so the call silently
+// resolves to this class's version. It happens to be the one we want, which is
+// exactly what makes the shape worth removing -- it is correct by accident and
+// stops being correct the moment somebody derives from this.
+class InotifyBackend final : public WatchBackend {
  public:
-  ~InotifyBackend() override { Stop(); }
+  ~InotifyBackend() override { StopImpl(); }
 
   bool Start(const std::string& abs_root, HintSink sink) override {
     if (fd_ >= 0) return false;
@@ -73,7 +79,12 @@ class InotifyBackend : public WatchBackend {
     return true;
   }
 
-  void Stop() override {
+  void Stop() override { StopImpl(); }
+
+  const char* Name() const override { return "inotify"; }
+
+ private:
+  void StopImpl() {
     if (fd_ < 0) return;
     // One byte on the pipe wakes poll(). Writing rather than closing: closing
     // the read end from here would race the thread's own use of it.
@@ -91,9 +102,6 @@ class InotifyBackend : public WatchBackend {
     sink_ = nullptr;
   }
 
-  const char* Name() const override { return "inotify"; }
-
- private:
   // Registers `rel` and every directory beneath it, and hints each one so the
   // gap described above is covered by a scan.
   void AddWatchTree(const std::string& rel) {

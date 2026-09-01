@@ -19,10 +19,12 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-class VaultWatcherImpl : public VaultWatcher {
+// `final` and a non-virtual teardown; see the note on InotifyBackend in
+// backend_inotify.cc for why a destructor must not call a virtual Stop().
+class VaultWatcherImpl final : public VaultWatcher {
  public:
   explicit VaultWatcherImpl(const WatcherOptions& opts) : opts_(opts) {}
-  ~VaultWatcherImpl() override { Stop(); }
+  ~VaultWatcherImpl() override { StopImpl(); }
 
   WatchStatus Init(const std::string& abs_root) {
     if (opts_.ids == nullptr) {
@@ -65,16 +67,7 @@ class VaultWatcherImpl : public VaultWatcher {
     return WatchStatus::kOk;
   }
 
-  void Stop() override {
-    if (backend_ != nullptr) {
-      // Backend first, and it does not return until its thread is joined and
-      // no callback is in flight. Only then is it safe to tear down the state
-      // OnHint writes into.
-      backend_->Stop();
-      backend_ = nullptr;
-    }
-    StopWorker();
-  }
+  void Stop() override { StopImpl(); }
 
   bool WaitForIdle(std::chrono::milliseconds timeout) override {
     std::unique_lock<std::mutex> lock(mu_);
@@ -97,6 +90,19 @@ class VaultWatcherImpl : public VaultWatcher {
   }
 
  private:
+  // Non-virtual, so the destructor can call it without dispatching on a
+  // partially destroyed object.
+  void StopImpl() {
+    if (backend_ != nullptr) {
+      // Backend first, and it does not return until its thread is joined and
+      // no callback is in flight. Only then is it safe to tear down the state
+      // OnHint writes into.
+      backend_->Stop();
+      backend_ = nullptr;
+    }
+    StopWorker();
+  }
+
   void OnHint(const Hint& h) {
     {
       std::lock_guard<std::mutex> lock(mu_);
@@ -144,7 +150,7 @@ class VaultWatcherImpl : public VaultWatcher {
       std::vector<Hint> hints;
       hints.reserve(batch.size());
       for (const std::map<std::string, bool>::value_type& kv : batch) {
-        hints.push_back(Hint(kv.first, kv.second));
+        hints.emplace_back(kv.first, kv.second);
       }
       std::vector<std::string> retry;
       const std::vector<ChangeEvent> events =
@@ -169,9 +175,10 @@ class VaultWatcherImpl : public VaultWatcher {
           if (!running_) break;
           if (pending_.empty()) oldest_ = Clock::now();
           newest_ = Clock::now();
-          // A retried path keeps whatever rename evidence it already had and
-          // gains none; the flag rides on the hint that first named it.
-          pending_[r] = pending_[r] || false;
+          // emplace, not assignment: a retried path keeps whatever rename
+          // evidence it already had and gains none, so an existing entry must
+          // be left alone rather than overwritten with false.
+          pending_.emplace(r, false);
         }
         flushing_ = false;
       }

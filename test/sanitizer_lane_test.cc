@@ -141,6 +141,12 @@ static_assert(UMBRA_TSAN_ON,
 // make umbra-test and umbra-asan the same lane, and the control that makes the
 // other three attributable would be one of them counted twice.
 #if defined(UMBRA_EXPECT_NO_SANITIZER)
+// The three macros are independent probes that all expand to 0 in precisely the
+// build this assertion guards, so it reads as `!0 && !0 && !0` and
+// misc-redundant-expression cannot tell that from a copy-paste error. Collapsing
+// it to one term would be the actual bug: the lane must assert the absence of
+// all three, not of whichever one was left.
+// NOLINTNEXTLINE(misc-redundant-expression)
 static_assert(!UMBRA_ASAN_ON && !UMBRA_TSAN_ON && !UMBRA_UBSAN_ON,
               "umbra-test lane was built WITH a sanitizer; it is meant to be "
               "the uninstrumented control for the other three");

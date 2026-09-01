@@ -1,4 +1,4 @@
-#include <cstdio>
+#include <algorithm>
 
 #include "umbra/change_event.h"
 
@@ -46,7 +46,7 @@ ContentHash HashBytes(const void* data, std::size_t len) {
   // zero bytes cannot be a no-op.
   const uint64_t l = static_cast<uint64_t>(len);
   ContentHash h;
-  PutBe64(Fnv1a(p, len, 0xcbf29ce484222325ULL ^ l), &h.bytes[0]);
+  PutBe64(Fnv1a(p, len, 0xcbf29ce484222325ULL ^ l), h.bytes.data());
   PutBe64(Fnv1a(p, len, 0x9e3779b97f4a7c15ULL ^ l), &h.bytes[8]);
   PutBe64(Fnv1a(p, len, 0xff51afd7ed558ccdULL ^ l), &h.bytes[16]);
   PutBe64(Fnv1a(p, len, 0xc4ceb9fe1a85ec53ULL ^ l), &h.bytes[24]);
@@ -54,10 +54,8 @@ ContentHash HashBytes(const void* data, std::size_t len) {
 }
 
 bool ContentHash::IsZero() const {
-  for (uint8_t b : bytes) {
-    if (b != 0) return false;
-  }
-  return true;
+  return std::all_of(bytes.begin(), bytes.end(),
+                     [](uint8_t b) { return b == 0; });
 }
 
 std::string ContentHash::ToHex() const {

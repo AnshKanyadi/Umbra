@@ -111,7 +111,12 @@ void WalkSubtree(
 
 // Vault path handling. Vault-relative paths are '/'-separated with no leading
 // slash and no "." component; the empty string is the vault root itself.
-std::string JoinPath(const std::string& base, const std::string& rel);
+//
+// The second parameter is `suffix` and not `rel` on purpose: callers pass a
+// bare directory entry name as often as they pass a relative path, and naming
+// it `rel` made clang-tidy's swapped-argument heuristic match every
+// `JoinPath(dir_rel, name)` call in the inotify backend.
+std::string JoinPath(const std::string& base, const std::string& suffix);
 
 // True when `path` is `prefix` itself or lies underneath it. Used to find the
 // snapshot entries a directory-level hint covers -- including the entries of a

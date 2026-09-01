@@ -21,9 +21,11 @@
 namespace umbra {
 namespace {
 
-class FseventsBackend : public WatchBackend {
+// `final` and a non-virtual teardown; see the note on InotifyBackend in
+// backend_inotify.cc for why a destructor must not call a virtual Stop().
+class FseventsBackend final : public WatchBackend {
  public:
-  ~FseventsBackend() override { Stop(); }
+  ~FseventsBackend() override { StopImpl(); }
 
   bool Start(const std::string& abs_root, HintSink sink) override {
     std::lock_guard<std::mutex> lock(mu_);
@@ -86,7 +88,12 @@ class FseventsBackend : public WatchBackend {
     return true;
   }
 
-  void Stop() override {
+  void Stop() override { StopImpl(); }
+
+  const char* Name() const override { return "fsevents"; }
+
+ private:
+  void StopImpl() {
     FSEventStreamRef stream = nullptr;
     dispatch_queue_t queue = nullptr;
     {
@@ -120,9 +127,6 @@ class FseventsBackend : public WatchBackend {
     }
   }
 
-  const char* Name() const override { return "fsevents"; }
-
- private:
   // Does nothing. Its only purpose is to be the last thing on the queue.
   static void DrainBarrier(void*) {}
 

@@ -81,11 +81,11 @@ const char* ReadOutcomeName(ReadOutcome o) {
   return "unknown";
 }
 
-std::string JoinPath(const std::string& base, const std::string& rel) {
-  if (rel.empty()) return base;
-  if (base.empty()) return rel;
-  if (base.back() == '/') return base + rel;
-  return base + "/" + rel;
+std::string JoinPath(const std::string& base, const std::string& suffix) {
+  if (suffix.empty()) return base;
+  if (base.empty()) return suffix;
+  if (base.back() == '/') return base + suffix;
+  return base + "/" + suffix;
 }
 
 bool IsPathAtOrUnder(const std::string& path, const std::string& prefix) {
@@ -123,8 +123,7 @@ bool IsVaultFile(const std::string& rel_path) {
   const std::string::size_type slash = rel_path.rfind('/');
   const std::string name =
       slash == std::string::npos ? rel_path : rel_path.substr(slash + 1);
-  if (!name.empty() && (name[0] == '.' || name[0] == '#')) return false;
-  return true;
+  return name.empty() || (name[0] != '.' && name[0] != '#');
 }
 
 ReadOutcome StatPath(const std::string& abs_path, FileState* out) {

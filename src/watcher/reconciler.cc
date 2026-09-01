@@ -132,13 +132,13 @@ std::vector<ChangeEvent> Reconciler::Reconcile(
         d.has = !after.is_dir && IsVaultFile(rel);
         d.after = after;
         break;
+      // ONE ARM FOR TWO OUTCOMES, and they mean the same thing here. kAbsent
+      // is a file that was deleted or never existed. kNotRegular is a path that
+      // is now a symlink or a device node, which is NOT followed -- following
+      // one would let a link out of the vault be read, hashed and eventually
+      // synced. From the vault's point of view both are "no object here".
       case ReadOutcome::kAbsent:
-        d.has = false;
-        break;
       case ReadOutcome::kNotRegular:
-        // Replaced by a symlink or a device node. Not a vault object any more,
-        // and deliberately not followed. From the vault's point of view it is
-        // gone.
         d.has = false;
         break;
       case ReadOutcome::kUnstable:
@@ -268,8 +268,8 @@ std::vector<ChangeEvent> Reconciler::Reconcile(
     const Delta& d = kv.second;
     const bool arrived_raw = ArrivedIdentity(d);
     const bool vacated_raw = VacatedIdentity(d);
-    const bool arrived = arrived_raw && !consumed_arrival.count(rel);
-    const bool vacated = vacated_raw && !consumed_vacancy.count(rel);
+    const bool arrived = arrived_raw && consumed_arrival.count(rel) == 0;
+    const bool vacated = vacated_raw && consumed_vacancy.count(rel) == 0;
 
     if (arrived && vacated) {
       // Both, at one path: the inode under this name was replaced. An atomic
