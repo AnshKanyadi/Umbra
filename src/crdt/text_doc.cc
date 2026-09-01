@@ -158,7 +158,18 @@ std::string TextDoc::StateHash() const {
   return h.ToHex();
 }
 
+bool TextDoc::AlreadyCompacted(const OpId& id) const {
+  const std::map<ReplicaId, uint64_t>::const_iterator it =
+      compacted_.find(id.replica);
+  return it != compacted_.end() && id.counter <= it->second;
+}
+
 ApplyResult TextDoc::Apply(const Op& op) {
+  // AT OR BELOW THE COMPACTION MARK IS ALREADY SEEN. See Compact in the header:
+  // the nodes this operation created may have been dropped, and the mark is
+  // only ever set to a point every replica had already received, so there is
+  // nothing here that has not already been accounted for.
+  if (AlreadyCompacted(op.id)) return ApplyResult::kDuplicate;
   switch (op.kind) {
     case OpKind::kInsert: {
       if (op.text.empty()) return ApplyResult::kMalformed;
@@ -334,6 +345,11 @@ bool TextDoc::LocalDelete(std::size_t index, std::size_t count,
 
 std::size_t TextDoc::Compact(const std::map<ReplicaId, uint64_t>& watermark) {
   std::size_t removed = 0;
+  // Remembered before anything is dropped, and only ever moved forward.
+  for (const std::map<ReplicaId, uint64_t>::value_type& kv : watermark) {
+    uint64_t& mark = compacted_[kv.first];
+    if (kv.second > mark) mark = kv.second;
+  }
   // Repeated passes, because removing a leaf tombstone can make its parent a
   // leaf. A chain of tombstones therefore collapses from the outside in, and
   // one call does as much as it can rather than leaving work for the next.

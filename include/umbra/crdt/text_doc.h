@@ -178,7 +178,23 @@ class TextDoc {
   // therefore collapse from the outside in, over successive compactions.
   //
   // Returns how many nodes were removed.
+  //
+  // THE WATERMARK IS REMEMBERED, and that is half of what makes compaction
+  // safe. Dropping a node does not drop the OPERATION that created it: the
+  // oplog still holds it, a peer still holds it, and either may hand it back.
+  // Re-applying it would resurrect a character the vault agreed to forget, and
+  // refusing it as not-ready would wedge the replica forever -- which is what
+  // the harness produced, as "still holds 21 operations it could never apply".
+  //
+  // So a document remembers how far it has compacted, and Apply treats any
+  // operation at or below that mark as already seen. That is sound precisely
+  // because the watermark means every replica had already received it.
   std::size_t Compact(const std::map<ReplicaId, uint64_t>& watermark);
+
+  // How far this document has compacted, per replica. Empty until Compact runs.
+  const std::map<ReplicaId, uint64_t>& compacted_through() const {
+    return compacted_;
+  }
 
   // Test and diagnostic surface.
   const Node* Find(const OpId& id) const;
@@ -193,7 +209,10 @@ class TextDoc {
   void Walk(const OpId& id, bool emit_self,
             const std::function<void(const Node&)>& fn) const;
 
+  bool AlreadyCompacted(const OpId& id) const;
+
   std::map<OpId, Node> nodes_;
+  std::map<ReplicaId, uint64_t> compacted_;
   // The root's children. The root has no left children by construction: it is
   // never a right origin, so nothing is ever inserted to its left.
   std::vector<OpId> root_right_;

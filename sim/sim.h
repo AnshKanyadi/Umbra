@@ -90,6 +90,18 @@ class Oracle {
   void RecordInsert(const Op& op, bool contiguity_exempt = false);
   void RecordDelete(const Op& op);
 
+  // Declare that these characters must end up contiguous and in this order.
+  //
+  // WHY THIS EXISTS SEPARATELY FROM THE PER-RUN CHECK. The run check can only
+  // speak about runs of two characters or more, so a schedule that types ONE
+  // character at a time -- which is exactly the backward-typing shape that
+  // interleaves under RGA -- produces nothing for it to check. A defect that
+  // scattered those characters among another replica's went unnoticed until a
+  // deliberately broken insert rule was run past it. The schedule knows which
+  // characters were typed together; this is how it says so.
+  void RequireContiguousGroup(const std::vector<OpId>& ids,
+                              const std::string& label);
+
   // Returns an empty string if the document satisfies the model, or a
   // description of the first violation.
   //
@@ -115,6 +127,7 @@ class Oracle {
   // (first id, count) per insert operation, in generation order.
   std::vector<std::pair<OpId, uint32_t>> runs_;
   std::set<OpId> contiguity_exempt_;
+  std::vector<std::pair<std::string, std::vector<OpId>>> groups_;
 };
 
 // One simulated device.
@@ -150,6 +163,10 @@ struct Config {
   uint64_t p_crash = 3;
   uint64_t p_duplicate = 20;    // of a delivery, also deliver it again later
   uint64_t p_delete_edit = 30;  // of an edit, make it a deletion
+  // Compaction is NOT a per-step action. See the note on Sim::CompactRound in
+  // sim.cc: dropping a tombstone while any replica may still anchor an insert
+  // to it diverges, and the harness proved it. It runs at quiescence, as a
+  // coordinated round.
   bool verbose = false;
 };
 
@@ -162,6 +179,7 @@ struct Result {
   std::size_t deliveries = 0;
   std::size_t crashes = 0;
   std::size_t max_partition_steps = 0;
+  std::size_t tombstones_dropped = 0;
 };
 
 // Named, hand-built schedules that exercise shapes a uniform random walk
@@ -181,10 +199,13 @@ enum class Adversarial : uint8_t {
   kBackwardTypingRace,
   // A replica crashes after every single apply.
   kCrashAfterEveryApply,
+  // Edit, settle, run a coordinated compaction round, then keep editing. The
+  // schedule that asks whether compaction breaks anything that comes after it.
+  kCompactThenEdit,
 };
 
 const char* AdversarialName(Adversarial a);
-constexpr std::size_t kAdversarialCount = 7;
+constexpr std::size_t kAdversarialCount = 8;
 
 // True when a schedule never has a replica insert into text it received from
 // another, which is the condition under which every run must still be

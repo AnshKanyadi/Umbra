@@ -4,15 +4,56 @@
 // non-zero if any seed fails, and names it, because a failing seed is the whole
 // output that matters: it replays exactly.
 #include <chrono>
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
+#include <csignal>
+
 #include "sim.h"
 
 namespace {
+
+// WHAT IS RUNNING RIGHT NOW, so that a crash says so.
+//
+// A defect that trips an internal invariant aborts inside the schedule, and
+// without this the sweep dies having printed nothing -- the operator gets a
+// stack trace and no seed, which is the one thing they needed. Found while
+// deliberately breaking the causal readiness check: the harness detected the
+// defect and then could not say where.
+struct Current {
+  volatile std::sig_atomic_t active = 0;
+  unsigned long long seed = 0;
+  const char* schedule = "";
+  std::size_t replicas = 0;
+  std::size_t steps = 0;
+};
+Current g_current;
+
+extern "C" void OnFatalSignal(int sig) {
+  if (g_current.active != 0) {
+    // Only async-signal-safe calls here: write(2) on a preformatted buffer.
+    char buf[256];
+    const int n = std::snprintf(
+        buf, sizeof(buf),
+        "\nCRASH seed=%llu schedule=%s replicas=%zu steps=%zu\n"
+        "  replay: umbra_converge --from %llu --to %llu --only %s "
+        "--replicas %zu --steps %zu\n",
+        g_current.seed, g_current.schedule, g_current.replicas,
+        g_current.steps, g_current.seed, g_current.seed + 1,
+        g_current.schedule, g_current.replicas, g_current.steps);
+    if (n > 0) {
+      const ssize_t w = ::write(2, buf, static_cast<std::size_t>(n));
+      (void)w;
+    }
+  }
+  std::signal(sig, SIG_DFL);
+  std::raise(sig);
+}
 
 uint64_t ParseU64(const char* s, uint64_t fallback) {
   if (s == nullptr || *s == '\0') return fallback;
@@ -72,6 +113,9 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  std::signal(SIGABRT, OnFatalSignal);
+  std::signal(SIGSEGV, OnFatalSignal);
+
   const auto started = std::chrono::steady_clock::now();
   std::size_t run = 0;
   std::size_t failed = 0;
@@ -85,7 +129,13 @@ int main(int argc, char** argv) {
           static_cast<umbra::sim::Adversarial>(k);
       const char* name = umbra::sim::AdversarialName(adv);
       if (only != nullptr && std::strcmp(only, name) != 0) continue;
+      g_current.seed = static_cast<unsigned long long>(seed);
+      g_current.schedule = name;
+      g_current.replicas = cfg.replicas;
+      g_current.steps = cfg.steps;
+      g_current.active = 1;
       const umbra::sim::Result r = umbra::sim::RunSchedule(seed, cfg, adv);
+      g_current.active = 0;
       ++run;
       total_ops += r.ops;
       total_deliveries += r.deliveries;

@@ -57,6 +57,8 @@ const char* AdversarialName(Adversarial a) {
       return "backward-typing-race";
     case Adversarial::kCrashAfterEveryApply:
       return "crash-after-every-apply";
+    case Adversarial::kCompactThenEdit:
+      return "compact-then-edit";
   }
   return "unknown";
 }
@@ -88,9 +90,16 @@ bool ScheduleRequiresContiguousRuns(Adversarial a) {
     case Adversarial::kLongOfflineRejoin:
     case Adversarial::kDuplicateAndReverse:
     case Adversarial::kCrashAfterEveryApply:
+    case Adversarial::kCompactThenEdit:
       return false;
   }
   return false;
+}
+
+void Oracle::RequireContiguousGroup(const std::vector<OpId>& ids,
+                                    const std::string& label) {
+  if (ids.size() < 2) return;
+  groups_.emplace_back(label, ids);
 }
 
 std::string Oracle::Check(const TextDoc& doc,
@@ -154,6 +163,30 @@ std::string Oracle::Check(const TextDoc& doc,
       if (require_contiguous_runs && contiguity_exempt_.count(run.first) == 0 &&
           pos[i] != pos[i - 1] + 1) {
         return "run " + run.first.ToString() +
+               " is interleaved: another replica's character sits inside it";
+      }
+    }
+  }
+  // 3. DECLARED GROUPS. Characters a schedule says were typed together must
+  // still be together. This is the interleaving check for one-character
+  // inserts, which the per-run check above cannot see: a run of one has
+  // nothing to be contiguous with.
+  for (const std::pair<std::string, std::vector<OpId>>& g : groups_) {
+    std::vector<std::size_t> pos;
+    for (const OpId& id : g.second) {
+      const std::map<OpId, std::size_t>::const_iterator p = position.find(id);
+      if (p != position.end()) pos.push_back(p->second);
+    }
+    if (pos.size() < 2) continue;
+    // CONTIGUITY AS A SET, NOT AN ORDER. Which of a replica's own runs ends up
+    // first is the CRDT's choice and any answer is correct; that they all end
+    // up TOGETHER is not its choice, and is the interleaving property. Order
+    // within a single run is already held to account by the per-run check
+    // above.
+    std::sort(pos.begin(), pos.end());
+    for (std::size_t i = 1; i < pos.size(); ++i) {
+      if (pos[i] != pos[i - 1] + 1) {
+        return "group " + g.first +
                " is interleaved: another replica's character sits inside it";
       }
     }
@@ -330,6 +363,67 @@ struct Sim {
     ++result.crashes;
   }
 
+  // THE SAFETY CONDITION, COMPUTED. A tombstone may be dropped once every
+  // replica has seen the operation that created the character, so the watermark
+  // is the MINIMUM across replicas of what each has seen from each origin. A
+  // replica that is behind holds the whole vault's compaction back, which is
+  // the honest consequence of the condition rather than a flaw in it -- see
+  // docs/adr/0002-crdt.md.
+  std::map<ReplicaId, uint64_t> GlobalWatermark() const {
+    std::map<ReplicaId, uint64_t> low;
+    bool first = true;
+    for (const Replica& r : replicas) {
+      std::map<ReplicaId, uint64_t> mine;
+      for (const Op& op : r.durable) {
+        const OpId last = LastId(op);
+        uint64_t& hw = mine[last.replica];
+        if (last.counter > hw) hw = last.counter;
+      }
+      if (first) {
+        low = mine;
+        first = false;
+        continue;
+      }
+      std::map<ReplicaId, uint64_t> merged;
+      for (const std::map<ReplicaId, uint64_t>::value_type& kv : low) {
+        const std::map<ReplicaId, uint64_t>::const_iterator m =
+            mine.find(kv.first);
+        // A replica that has seen NOTHING from an origin pins that origin's
+        // watermark to zero, which is what "every replica has seen it" means.
+        merged[kv.first] = m == mine.end() ? 0 : std::min(kv.second, m->second);
+      }
+      low.swap(merged);
+    }
+    return low;
+  }
+
+  // A COORDINATED COMPACTION ROUND, AND IT HAS TO BE COORDINATED.
+  //
+  // The first version ran on a random replica at a random step, at the
+  // watermark every replica had provably received. THAT IS NOT SUFFICIENT AND
+  // THE HARNESS PROVED IT WITHIN THIRTY SEEDS: having SEEN a node is not the
+  // same as being finished with it. A replica that still holds a tombstone can
+  // anchor a new insert to it at any moment -- insert origins are taken from
+  // the full tree order, tombstones included -- and that operation names a
+  // parent the compacting replica has already dropped. It can never be applied
+  // there, and the two documents part company for good.
+  //
+  // So compaction is a ROUND, run where every replica has the same durable set
+  // and nothing is in flight. Afterwards no replica can anchor to a dropped
+  // node, because no replica still has one.
+  //
+  // The consequence, stated rather than hidden: compaction needs agreement, so
+  // it needs the sync protocol to provide one, and a device that never
+  // participates holds the whole vault's tombstones. docs/adr/0002-crdt.md
+  // carries the condition.
+  void CompactRound(bool everyone) {
+    const std::map<ReplicaId, uint64_t> w = GlobalWatermark();
+    for (std::size_t i = 0; i < replicas.size(); ++i) {
+      if (!everyone && (i % 2) != 0) continue;
+      result.tombstones_dropped += replicas[i].doc.Compact(w);
+    }
+  }
+
   void LocalEdit(std::size_t i) {
     Replica& r = replicas[i];
     std::vector<Op> ops;
@@ -374,6 +468,10 @@ struct Sim {
       for (std::size_t i = 0; i < replicas.size(); ++i) DrainPending(i);
     }
     for (std::size_t i = 0; i < replicas.size(); ++i) Commit(i);
+    // Only SOME replicas, so the final comparison is between documents in
+    // different compaction states. Safe here because nothing follows: if
+    // compaction ever changed the visible text, this is where it would show.
+    CompactRound(/*everyone=*/false);
   }
 
   std::string CheckConverged() {
@@ -466,14 +564,25 @@ void RunRandom(Sim* s) {
 void RunSamePositionPileup(Sim* s) {
   // Every replica inserts at position 0, knowing nothing of the others, several
   // times over. The merge must contain every run whole.
+  std::vector<std::vector<OpId>> typed(s->replicas.size());
   for (int round = 0; round < 5; ++round) {
     for (std::size_t i = 0; i < s->replicas.size(); ++i) {
       std::vector<Op> ops;
       if (s->replicas[i].doc.LocalInsert(0, TextFor(i, &s->rng),
                                          &s->replicas[i].clock, &ops)) {
+        for (const Op& op : ops) {
+          for (std::size_t k = 0; k < op.text.size(); ++k) {
+            typed[i].push_back(op.id.Plus(k));
+          }
+        }
         s->Originate(i, ops);
       }
     }
+  }
+  // Every replica typed only into its own text, so its characters must come out
+  // as one block. Which order its own runs land in is the CRDT's business.
+  for (std::size_t i = 0; i < typed.size(); ++i) {
+    s->oracle.RequireContiguousGroup(typed[i], "replica " + std::to_string(i));
   }
 }
 
@@ -492,14 +601,24 @@ void RunBackwardTypingRace(Sim* s) {
   for (std::size_t i = 1; i < s->replicas.size(); ++i) {
     for (const Op& op : seed) s->Deliver(i, op);
   }
+  // Each replica types ONE character at a time at the same anchor. The ids it
+  // produces are declared as a group, because a run of one character gives the
+  // per-run contiguity check nothing to hold on to -- and this is precisely the
+  // shape that interleaves under RGA, so it is the shape that most needs
+  // checking.
+  std::vector<std::vector<OpId>> typed(s->replicas.size());
   for (int round = 0; round < 6; ++round) {
     for (std::size_t i = 0; i < s->replicas.size(); ++i) {
       std::vector<Op> ops;
       const std::string one(1, "abcdef"[i % 6]);
       if (s->replicas[i].doc.LocalInsert(1, one, &s->replicas[i].clock, &ops)) {
+        for (const Op& op : ops) typed[i].push_back(op.id);
         s->Originate(i, ops);
       }
     }
+  }
+  for (std::size_t i = 0; i < typed.size(); ++i) {
+    s->oracle.RequireContiguousGroup(typed[i], "replica " + std::to_string(i));
   }
 }
 
@@ -576,6 +695,37 @@ void RunDuplicateAndReverse(Sim* s) {
   for (const Message& m : all) s->Deliver(m.to, m.op);
 }
 
+// Edit, settle, compact EVERYWHERE at once, then edit again. The second half is
+// the point: it asks whether operations produced after a compaction round still
+// apply, on replicas that compacted and on the tree that is left.
+void RunCompactThenEdit(Sim* s) {
+  const std::size_t half = s->cfg.steps / 2;
+  for (s->step = 0; s->step < half; ++s->step) {
+    s->LocalEdit(static_cast<std::size_t>(
+        s->rng.Below(static_cast<uint64_t>(s->replicas.size()))));
+    if (!s->in_flight.empty()) {
+      const std::size_t k =
+          static_cast<std::size_t>(s->rng.Below(s->in_flight.size()));
+      const Message m = s->in_flight[k];
+      s->in_flight.erase(s->in_flight.begin() + static_cast<long>(k));
+      s->Deliver(m.to, m.op);
+    }
+  }
+  s->Quiesce();
+  s->CompactRound(/*everyone=*/true);
+  for (s->step = 0; s->step < half; ++s->step) {
+    s->LocalEdit(static_cast<std::size_t>(
+        s->rng.Below(static_cast<uint64_t>(s->replicas.size()))));
+    if (!s->in_flight.empty()) {
+      const std::size_t k =
+          static_cast<std::size_t>(s->rng.Below(s->in_flight.size()));
+      const Message m = s->in_flight[k];
+      s->in_flight.erase(s->in_flight.begin() + static_cast<long>(k));
+      s->Deliver(m.to, m.op);
+    }
+  }
+}
+
 void RunCrashAfterEveryApply(Sim* s) {
   for (s->step = 0; s->step < s->cfg.steps; ++s->step) {
     const std::size_t who = static_cast<std::size_t>(
@@ -620,6 +770,9 @@ Result RunSchedule(uint64_t seed, const Config& cfg, Adversarial adversarial) {
       break;
     case Adversarial::kCrashAfterEveryApply:
       RunCrashAfterEveryApply(&s);
+      break;
+    case Adversarial::kCompactThenEdit:
+      RunCompactThenEdit(&s);
       break;
   }
   if (!s.result.failure.empty()) {
