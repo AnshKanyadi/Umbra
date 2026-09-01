@@ -8,37 +8,62 @@
 # from a clean run -- which is the failure mode this project cares about
 # everywhere else, so it is not accepted here either.
 #
+# NOTHING BELOW `Checks:` MAY CARRY A COMMENT. It is a YAML folded scalar, so a
+# `#` inside it is TEXT, not a comment: clang-tidy receives the prose as part of
+# the comma-separated check list and the negations stop taking effect. This was
+# not theoretical -- an earlier version of this file annotated each disabled
+# check inline and silently applied none of them, which showed up as a tidy run
+# whose finding count did not move. Rationale goes here instead.
+#
+# WHY EACH DISABLED CHECK IS DISABLED
+#
+#   bugprone-easily-swappable-parameters   Adjacent same-typed parameters are
+#       unavoidable in POSIX-shaped code.
+#   bugprone-narrowing-conversions         Duplicates -Wconversion territory and
+#       fires on every deliberate static_cast-adjacent width change.
+#   bugprone-implicit-widening-of-multiplication-result
+#       Fires on `64 * 1024` assigned to a size_t. Real where the operands are
+#       runtime values and noise where they are literals; in this tree they are
+#       literals in test fixtures.
+#   cert-err58-cpp                         Static initializers in the test suite.
+#   concurrency-mt-unsafe                  Flags getenv() and strerror() in the
+#       test fixture. Both are genuinely unsafe to call concurrently and both are
+#       called before any thread in this suite exists; the alternative is
+#       strerror_r, whose signature differs between glibc and POSIX and would
+#       need its own ifdef in test scaffolding.
+#   misc-non-private-member-variables-in-classes, misc-no-recursion
+#       Inherited from basalt's config for the same reasons.
+#   misc-include-cleaner                   IWYU by another name. It objects to
+#       every standard header reached through another, and the resulting wall is
+#       what this file exists to avoid.
+#   misc-const-correctness                 Wants const on most locals. Not wrong,
+#       just voluminous: a rule that adds a keyword to half the lines of a diff
+#       makes the diff harder to read than the thing it corrects.
+#   readability-identifier-length, readability-magic-numbers,
+#   readability-function-cognitive-complexity, readability-braces-around-statements,
+#   readability-else-after-return          Style preferences this tree does not
+#       share.
+#   readability-uppercase-literal-suffix   `1u` versus `1U`. Google style writes
+#       it lowercase and so does every EXPECT_EQ in the suite.
+#
 # WarningsAsErrors is empty ON PURPOSE and the CI job does not honour it: the
-# job decides pass/fail from whether clang-tidy-diff produced findings, so that
-# a local `clang-tidy` run for exploration is not fatal while the lane still is.
+# job decides pass/fail from whether clang-tidy-diff produced findings, so a
+# local `clang-tidy` run for exploration is not fatal while the lane still is.
 Checks: >
   -*,
   bugprone-*,
   -bugprone-easily-swappable-parameters,
   -bugprone-narrowing-conversions,
-  # Fires on `64 * 1024` assigned to a size_t. Real where the operands are
-  # runtime values and noise where they are literals, and in this tree they are
-  # literals in test fixtures.
   -bugprone-implicit-widening-of-multiplication-result,
   cert-*,
   -cert-err58-cpp,
   clang-analyzer-*,
   concurrency-*,
-  # Flags getenv() and strerror() in the test fixture. Both are genuinely
-  # unsafe to call concurrently, and both are called before any thread in this
-  # suite exists; the alternative is strerror_r, whose signature differs between
-  # glibc and POSIX and would need its own #ifdef in test scaffolding.
   -concurrency-mt-unsafe,
   misc-*,
   -misc-non-private-member-variables-in-classes,
   -misc-no-recursion,
-  # IWYU by another name. It objects to headers reached transitively -- which is
-  # every standard header this tree gets through another -- and the resulting
-  # wall is the thing this file exists to avoid.
   -misc-include-cleaner,
-  # Wants `const` on most locals. It is not wrong, it is just voluminous, and a
-  # rule that adds a keyword to half the lines in a diff makes the diff harder
-  # to read than the thing it is correcting.
   -misc-const-correctness,
   modernize-use-nullptr,
   modernize-use-override,
@@ -50,8 +75,6 @@ Checks: >
   -readability-function-cognitive-complexity,
   -readability-braces-around-statements,
   -readability-else-after-return,
-  # `1u` versus `1U`. Google style writes it lowercase and so does every
-  # EXPECT_EQ in the suite.
   -readability-uppercase-literal-suffix
 
 WarningsAsErrors: ''
