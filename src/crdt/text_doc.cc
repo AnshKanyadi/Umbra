@@ -210,14 +210,31 @@ ApplyResult TextDoc::Apply(const Op& op) {
     }
     case OpKind::kDelete: {
       if (op.count == 0) return ApplyResult::kMalformed;
-      // Every target must be present. A delete that names a node we have not
-      // seen is early, not wrong.
+      // Every target must be present, or already compacted away.
+      //
+      // A DELETE'S OWN ID IS NOT ENOUGH TO DECIDE THIS, and that is the whole
+      // reason for the second clause. A delete takes its own clock tick, so its
+      // id can sit far above the compaction watermark while its TARGET sits
+      // below it. That happens for real: two replicas delete the same character
+      // concurrently, one delete becomes everyone's and the character is
+      // compacted, the other arrives afterwards from a replica whose clock had
+      // run ahead -- naming a node that no longer exists anywhere.
+      //
+      // Skipping such a target is sound rather than convenient: the watermark
+      // means every replica already had the character, so the only way it is
+      // gone is that it was deleted and compacted. Deleting it again is a
+      // no-op. Found at seed 39 of compact-then-edit, once the sweep was
+      // widened past thirty seeds.
       for (uint32_t i = 0; i < op.count; ++i) {
-        if (Find(op.target.Plus(i)) == nullptr) return ApplyResult::kNotReady;
+        const OpId t = op.target.Plus(i);
+        if (Find(t) == nullptr && !AlreadyCompacted(t)) {
+          return ApplyResult::kNotReady;
+        }
       }
       bool changed = false;
       for (uint32_t i = 0; i < op.count; ++i) {
         Node* n = Mutable(op.target.Plus(i));
+        if (n == nullptr) continue;  // compacted; already accounted for
         if (!n->deleted) {
           n->deleted = true;
           changed = true;

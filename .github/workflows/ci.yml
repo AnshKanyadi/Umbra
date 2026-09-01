@@ -96,6 +96,35 @@ jobs:
       - name: run
         run: env ${{ matrix.lane.opts }} ./build/umbra_test
 
+  # THE CONVERGENCE SWEEP, ITS OWN LANE.
+  #
+  # It gets a lane rather than living in the unit suite because the two want
+  # different amounts of it. `umbra_test` runs a narrow slice of the same code
+  # on every push and under every sanitizer, which is what finds the harness's
+  # own memory bugs. This lane runs a wide seed range, once, where the width is
+  # what finds the CRDT's.
+  #
+  # A FAILING SEED IS THE ENTIRE OUTPUT THAT MATTERS. It replays exactly:
+  # umbra_converge prints the command. That is why the range is fixed rather
+  # than randomized per run -- a lane that ran different seeds every time would
+  # be a lane whose failures nobody could reproduce from the log.
+  #
+  # 150 seeds x 8 schedule shapes = 1200 schedules, about 45s locally. The
+  # ubuntu runner is slower; if this ever stops being comfortable for every
+  # push, the split is to keep a narrow range here and move a wide one to a
+  # scheduled job, NOT to drop the lane.
+  converge:
+    name: convergence sweep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: cmake -S . -B build-converge -DUMBRA_SANITIZER=none
+      - run: cmake --build build-converge --target umbra_converge -j "$(nproc)"
+      - name: sweep
+        run: ./build-converge/umbra_converge --from 0 --to 150
+
   # The library alone, with UMBRA_BUILD_TESTS off: the configuration an embedder
   # gets from add_subdirectory. It must not need GoogleTest and must not need
   # anything under test/.

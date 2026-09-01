@@ -491,9 +491,23 @@ struct Sim {
     // would not notice because every replica can be equally stuck.
     for (std::size_t i = 0; i < replicas.size(); ++i) {
       if (!replicas[i].pending.empty()) {
+        // Naming the operation and what it wanted matters more than the count:
+        // "one operation stuck" is a mystery, "a delete of a node nobody has"
+        // is a diagnosis.
+        std::string detail;
+        for (const Op& op : replicas[i].pending) {
+          detail += "\n    " + op.ToString();
+          if (op.kind == OpKind::kDelete) {
+            detail += replicas[i].doc.HasNode(op.target) ? " [target present]"
+                                                         : " [TARGET MISSING]";
+          } else {
+            detail += replicas[i].doc.HasNode(op.parent) ? " [parent present]"
+                                                         : " [PARENT MISSING]";
+          }
+        }
         return "replica " + std::to_string(i) + " still holds " +
                std::to_string(replicas[i].pending.size()) +
-               " operations it could never apply";
+               " operations it could never apply:" + detail;
       }
     }
     // 3. And the agreed answer is the right one.

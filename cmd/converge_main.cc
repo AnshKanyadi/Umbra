@@ -3,8 +3,8 @@
 // Runs a range of seeds against every schedule shape and reports. Exits
 // non-zero if any seed fails, and names it, because a failing seed is the whole
 // output that matters: it replays exactly.
-#include <chrono>
 #include <unistd.h>
+#include <chrono>
 
 #include <cstdio>
 #include <cstdlib>
@@ -43,9 +43,9 @@ extern "C" void OnFatalSignal(int sig) {
         "\nCRASH seed=%llu schedule=%s replicas=%zu steps=%zu\n"
         "  replay: umbra_converge --from %llu --to %llu --only %s "
         "--replicas %zu --steps %zu\n",
-        g_current.seed, g_current.schedule, g_current.replicas,
-        g_current.steps, g_current.seed, g_current.seed + 1,
-        g_current.schedule, g_current.replicas, g_current.steps);
+        g_current.seed, g_current.schedule, g_current.replicas, g_current.steps,
+        g_current.seed, g_current.seed + 1, g_current.schedule,
+        g_current.replicas, g_current.steps);
     if (n > 0) {
       const ssize_t w = ::write(2, buf, static_cast<std::size_t>(n));
       (void)w;
