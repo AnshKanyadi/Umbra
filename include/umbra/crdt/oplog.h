@@ -57,6 +57,7 @@
 #include "umbra/crdt/op.h"
 #include "umbra/crdt/op_id.h"
 #include "umbra/crdt/text_doc.h"
+#include "umbra/crdt/tree.h"
 
 namespace umbra {
 
@@ -86,14 +87,40 @@ std::string MakeOpLogKey(const ObjectId& object, const ReplicaId& replica,
 bool ParseOpLogKey(const std::string& key, ObjectId* object, ReplicaId* replica,
                    uint64_t* counter);
 
+// An operation as the log stores it: an identity for the key, and bytes.
+//
+// THE LOG DOES NOT KNOW WHAT KIND OF OPERATION IT IS HOLDING, and that is the
+// point. Text operations and tree operations both reduce to this, so both get
+// the same key layout, the same atomic batching and -- when it lands -- the
+// same encryption, without the log growing a switch over kinds.
+struct LoggedOp {
+  OpId id;
+  OpPayload payload;
+};
+
 class OpLog {
  public:
   static LogStatus Open(const std::string& dir, std::unique_ptr<OpLog>* out);
   ~OpLog();
 
+  // The one write path. Everything below encodes to this.
+  LogStatus AppendRaw(const ObjectId& object, const std::vector<LoggedOp>& ops);
+  // The one read path.
+  LogStatus ReadRaw(const ObjectId& object, std::vector<LoggedOp>* out) const;
+
   // One atomic batch. Callers put an operation and everything it depends on in
   // the same call; see above.
   LogStatus Append(const ObjectId& object, const std::vector<Op>& ops);
+
+  // Tree operations are filed under the reserved TreeObject(), so the vault's
+  // shape is one more object in the same log with the same key layout.
+  LogStatus AppendTree(const std::vector<TreeOp>& ops);
+  LogStatus ReadTree(std::vector<TreeOp>* out) const;
+  // Rebuild the tree. There is no causally-closed requirement here: tree
+  // operations are never not-ready, so any order works and a missing parent
+  // leaves a node detached rather than stuck. See ADR 0003.
+  LogStatus ReplayTree(TreeDoc* tree,
+                       std::map<ReplicaId, uint64_t>* high_water) const;
 
   // Everything stored for one object, in (replica, counter) order -- which is
   // NOT apply order, and does not need to be.

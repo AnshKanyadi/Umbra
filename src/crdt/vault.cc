@@ -9,6 +9,11 @@
 namespace umbra {
 namespace {
 
+std::string BaseName(const std::string& path) {
+  const std::string::size_type slash = path.rfind('/');
+  return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
 ObjectId NewObjectId() {
   ObjectId id;
   std::random_device rd;
@@ -46,24 +51,73 @@ std::string Vault::FoldCase(const std::string& path) {
   return out;
 }
 
+std::size_t Vault::ObjectCount() const { return tree_.Listing().size(); }
+
 bool Vault::ObjectAt(const std::string& path, ObjectId* out) const {
-  const std::map<std::string, ObjectId>::const_iterator it =
-      by_path_.find(path);
-  if (it == by_path_.end()) return false;
-  *out = it->second;
+  ObjectId id;
+  if (!tree_.Resolve(path, &id)) return false;
+  if (IsTreeRoot(id)) return false;
+  *out = id;
   return true;
 }
 
 bool Vault::PathOf(const ObjectId& id, std::string* out) const {
-  const std::map<ObjectId, std::string>::const_iterator it = path_of_.find(id);
-  if (it == path_of_.end()) return false;
-  *out = it->second;
-  return true;
+  return tree_.PathOf(id, out);
 }
 
 const TextDoc* Vault::Doc(const ObjectId& id) const {
   const std::map<ObjectId, TextDoc>::const_iterator it = docs_.find(id);
   return it == docs_.end() ? nullptr : &it->second;
+}
+
+TreeApply Vault::ApplyTreeOp(const TreeOp& op) { return tree_.Apply(op); }
+
+bool Vault::FoldedClash(const std::string& path, std::string* existing) const {
+  const std::string folded = FoldCase(path);
+  for (const std::pair<std::string, ObjectId>& kv : tree_.Listing()) {
+    if (kv.first == path) continue;
+    if (FoldCase(kv.first) == folded) {
+      *existing = kv.first;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Make sure every directory above `path` exists, creating the ones that do not.
+//
+// The watcher reports a file, not the directories above it: a `mkdir -p` and a
+// write arrive as one create for the file, because the intermediate directories
+// were never separately interesting. The tree needs them, so they are made here
+// and each one is a tree operation like any other -- which is what lets another
+// device merge a concurrent creation of the same folder.
+bool Vault::EnsureParents(const std::string& path, ObjectId* parent,
+                          std::vector<TreeOp>* ops) {
+  ObjectId cur = TreeRoot();
+  std::string prefix;
+  std::size_t start = 0;
+  while (true) {
+    const std::size_t slash = path.find('/', start);
+    if (slash == std::string::npos) break;
+    const std::string component = path.substr(start, slash - start);
+    if (component.empty()) return false;
+    if (!prefix.empty()) prefix.push_back('/');
+    prefix += component;
+
+    ObjectId existing;
+    if (tree_.Resolve(prefix, &existing) && !IsTreeRoot(existing)) {
+      cur = existing;
+    } else {
+      const ObjectId dir = NewObjectId();
+      const TreeOp op = tree_.MakeMove(dir, cur, component, true, &clock_);
+      if (tree_.Apply(op) != TreeApply::kApplied) return false;
+      ops->push_back(op);
+      cur = dir;
+    }
+    start = slash + 1;
+  }
+  *parent = cur;
+  return true;
 }
 
 // Replace a document's text with `content`, as the smallest edit that gets
@@ -122,24 +176,40 @@ ChangeOutcome Vault::ApplyChange(const ChangeEvent& event,
   ChangeOutcome out;
   switch (event.kind) {
     case ChangeKind::kCreated: {
-      const std::string folded = FoldCase(event.path);
-      const std::map<std::string, std::string>::const_iterator clash =
-          by_folded_.find(folded);
-      if (clash != by_folded_.end() && clash->second != event.path) {
+      std::string clash;
+      if (FoldedClash(event.path, &clash)) {
         // SURFACED, NOT MERGED. See the note in vault.h.
         out.status = VaultOutcome::kCaseCollision;
-        out.colliding_path = clash->second;
+        out.colliding_path = clash;
         return out;
       }
       ObjectId id;
-      if (!ObjectAt(event.path, &id)) {
-        id = NewObjectId();
-        by_path_[event.path] = id;
-        by_folded_[folded] = event.path;
-        path_of_[id] = event.path;
-        docs_[id];
+      if (tree_.Resolve(event.path, &id) && !IsTreeRoot(id)) {
+        // Already there; treat it as a modify of the same object.
+        ChangeOutcome r = SetContent(id, content);
+        return r;
       }
-      return SetContent(id, content);
+      ObjectId parent;
+      if (!EnsureParents(event.path, &parent, &out.tree_ops)) {
+        out.status = VaultOutcome::kUnknownPath;
+        return out;
+      }
+      const std::string name = BaseName(event.path);
+      if (name.empty()) {
+        out.status = VaultOutcome::kUnknownPath;
+        return out;
+      }
+      const ObjectId fresh = NewObjectId();
+      const TreeOp op = tree_.MakeMove(fresh, parent, name, false, &clock_);
+      if (tree_.Apply(op) != TreeApply::kApplied) {
+        out.status = VaultOutcome::kUnknownPath;
+        return out;
+      }
+      out.tree_ops.push_back(op);
+      docs_[fresh];
+      ChangeOutcome r = SetContent(fresh, content);
+      r.tree_ops = out.tree_ops;
+      return r;
     }
     case ChangeKind::kModified: {
       ObjectId id;
@@ -156,21 +226,26 @@ ChangeOutcome Vault::ApplyChange(const ChangeEvent& event,
         return out;
       }
       out.object = id;
-      TextDoc& doc = docs_[id];
-      const std::size_t n = doc.Length();
-      if (n > 0) {
-        if (!doc.LocalDelete(0, n, &clock_, &out.ops)) {
-          out.status = VaultOutcome::kUnknownPath;
-          return out;
-        }
+      // A DELETE IS A MOVE TO THE TRASH, and that is the whole of it -- no
+      // separate operation kind, so a delete concurrent with a move into the
+      // deleted directory is two moves ordered by timestamp rather than a
+      // special case. See ADR 0003.
+      std::string name;
+      if (!tree_.NameOf(id, &name)) {
+        out.status = VaultOutcome::kUnknownPath;
+        return out;
       }
-      // The path stops resolving. The OBJECT is not forgotten: its document
-      // and its id stay, because a delete has to be a fact other devices can
-      // learn rather than an absence they have to infer. Removing the object
-      // itself is a file-tree operation and belongs to the phase that owns the
-      // tree.
-      by_path_.erase(event.path);
-      by_folded_.erase(FoldCase(event.path));
+      const TreeOp op =
+          tree_.MakeMove(id, TreeTrash(), name, tree_.IsDir(id), &clock_);
+      if (tree_.Apply(op) != TreeApply::kApplied) {
+        out.status = VaultOutcome::kUnknownPath;
+        return out;
+      }
+      out.tree_ops.push_back(op);
+      // THE TEXT IS LEFT ALONE. Phase 1 emptied the document on delete, which
+      // was the only way a flat path map could express "gone". The tree says it
+      // now, and saying it twice would mean a restore-from-trash produced an
+      // empty file.
       return out;
     }
     case ChangeKind::kMoved: {
@@ -179,22 +254,41 @@ ChangeOutcome Vault::ApplyChange(const ChangeEvent& event,
         out.status = VaultOutcome::kUnknownPath;
         return out;
       }
-      const std::string folded = FoldCase(event.path);
-      const std::map<std::string, std::string>::const_iterator clash =
-          by_folded_.find(folded);
-      if (clash != by_folded_.end() && clash->second != event.old_path &&
-          clash->second != event.path) {
+      std::string clash;
+      if (FoldedClash(event.path, &clash) && clash != event.old_path) {
         out.status = VaultOutcome::kCaseCollision;
-        out.colliding_path = clash->second;
+        out.colliding_path = clash;
         return out;
       }
-      // A MOVE PRODUCES NO OPERATIONS. The object keeps its identity and its
-      // document; only the path it is filed under changes. See vault.h.
-      by_path_.erase(event.old_path);
-      by_folded_.erase(FoldCase(event.old_path));
-      by_path_[event.path] = id;
-      by_folded_[folded] = event.path;
-      path_of_[id] = event.path;
+      ObjectId parent;
+      if (!EnsureParents(event.path, &parent, &out.tree_ops)) {
+        out.status = VaultOutcome::kUnknownPath;
+        return out;
+      }
+      const std::string name = BaseName(event.path);
+      if (name.empty()) {
+        out.status = VaultOutcome::kUnknownPath;
+        return out;
+      }
+      // ONE TREE OPERATION AND ZERO TEXT OPERATIONS. The object keeps its
+      // identity and its document; only its place in the tree changes. This is
+      // the property ADR 0002 established and ADR 0003 keeps.
+      const TreeOp op =
+          tree_.MakeMove(id, parent, name, tree_.IsDir(id), &clock_);
+      const TreeApply r = tree_.Apply(op);
+      if (r == TreeApply::kIgnoredCycle) {
+        // A local move cannot make a cycle unless the user moved a directory
+        // into its own descendant, which the filesystem refuses first. If it
+        // happens anyway the tree is right and we are wrong; report it rather
+        // than log an operation the tree ignored.
+        out.status = VaultOutcome::kUnknownPath;
+        return out;
+      }
+      if (r != TreeApply::kApplied) {
+        out.status = VaultOutcome::kUnknownPath;
+        return out;
+      }
+      out.tree_ops.push_back(op);
       out.object = id;
       out.was_pure_move = true;
       return out;

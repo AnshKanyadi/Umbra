@@ -117,21 +117,102 @@ LogStatus OpLog::Open(const std::string& dir, std::unique_ptr<OpLog>* out) {
   return LogStatus::kOk;
 }
 
-LogStatus OpLog::Append(const ObjectId& object, const std::vector<Op>& ops) {
+LogStatus OpLog::AppendRaw(const ObjectId& object,
+                           const std::vector<LoggedOp>& ops) {
   if (ops.empty()) return LogStatus::kOk;
   // ONE BATCH. Basalt applies a WriteBatch atomically, which is what makes the
   // log causally closed at every point a reader could observe it: either all of
   // these operations are there or none are, so a crash cannot leave a child
   // without its parent.
   basalt::WriteBatch batch;
-  for (const Op& op : ops) {
+  for (const LoggedOp& op : ops) {
     const std::string key = MakeOpLogKey(object, op.id.replica, op.id.counter);
-    const OpPayload payload = EncodeOp(op);
-    batch.Set(basalt::Slice(key), basalt::Slice(payload.bytes));
+    batch.Set(basalt::Slice(key), basalt::Slice(op.payload.bytes));
   }
   basalt::wal::SeqNum seq = 0;
   const basalt::Status s = impl_->db->Write(batch, &seq);
   return s.ok() ? LogStatus::kOk : LogStatus::kWriteFailed;
+}
+
+LogStatus OpLog::ReadRaw(const ObjectId& object,
+                         std::vector<LoggedOp>* out) const {
+  const std::string lo = MakeOpLogKey(object, ReplicaId{}, 0);
+  ReplicaId max_replica;
+  for (std::size_t i = 0; i < max_replica.bytes.size(); ++i) {
+    max_replica.bytes[i] = 0xFF;
+  }
+  std::string hi = MakeOpLogKey(object, max_replica, UINT64_MAX);
+  hi.push_back('\0');
+
+  basalt::IterOptions o;
+  o.lower = basalt::Bound::At(basalt::Slice(lo));
+  o.upper = basalt::Bound::At(basalt::Slice(hi));
+  std::unique_ptr<basalt::Iterator> it = impl_->db->NewIter(o);
+  for (bool ok = it->First(); ok; ok = it->Next()) {
+    LoggedOp lop;
+    ObjectId obj;
+    if (!ParseOpLogKey(it->Key().ToString(), &obj, &lop.id.replica,
+                       &lop.id.counter)) {
+      (void)it->Close();
+      return LogStatus::kCorrupt;
+    }
+    lop.payload.bytes = it->Value().ToString();
+    out->push_back(lop);
+  }
+  const basalt::Status err = it->Error();
+  (void)it->Close();
+  return err.ok() ? LogStatus::kOk : LogStatus::kReadFailed;
+}
+
+LogStatus OpLog::AppendTree(const std::vector<TreeOp>& ops) {
+  std::vector<LoggedOp> raw;
+  raw.reserve(ops.size());
+  for (const TreeOp& op : ops) {
+    LoggedOp l;
+    l.id = op.id;
+    l.payload = EncodeTreeOp(op);
+    raw.push_back(l);
+  }
+  return AppendRaw(TreeObject(), raw);
+}
+
+LogStatus OpLog::ReadTree(std::vector<TreeOp>* out) const {
+  std::vector<LoggedOp> raw;
+  const LogStatus s = ReadRaw(TreeObject(), &raw);
+  if (s != LogStatus::kOk) return s;
+  for (const LoggedOp& l : raw) {
+    TreeOp op;
+    if (!DecodeTreeOp(l.payload, &op)) return LogStatus::kCorrupt;
+    out->push_back(op);
+  }
+  return LogStatus::kOk;
+}
+
+LogStatus OpLog::ReplayTree(TreeDoc* tree,
+                            std::map<ReplicaId, uint64_t>* high_water) const {
+  std::vector<TreeOp> ops;
+  const LogStatus s = ReadTree(&ops);
+  if (s != LogStatus::kOk) return s;
+  for (const TreeOp& op : ops) {
+    const TreeApply r = tree->Apply(op);
+    if (r == TreeApply::kMalformed) return LogStatus::kCorrupt;
+    uint64_t& hw = (*high_water)[op.id.replica];
+    if (op.id.counter > hw) hw = op.id.counter;
+  }
+  return LogStatus::kOk;
+}
+
+LogStatus OpLog::Append(const ObjectId& object, const std::vector<Op>& ops) {
+  if (ops.empty()) return LogStatus::kOk;
+  std::vector<LoggedOp> raw;
+  raw.reserve(ops.size());
+  for (const Op& op : ops) {
+    LoggedOp l;
+    l.id = op.id;
+    l.payload = EncodeOp(op);
+    raw.push_back(l);
+  }
+  return AppendRaw(object, raw);
 }
 
 LogStatus OpLog::ReadObject(const ObjectId& object,

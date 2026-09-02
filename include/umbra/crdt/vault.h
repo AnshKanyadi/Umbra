@@ -54,6 +54,7 @@
 #include "umbra/crdt/op.h"
 #include "umbra/crdt/op_id.h"
 #include "umbra/crdt/text_doc.h"
+#include "umbra/crdt/tree.h"
 
 namespace umbra {
 
@@ -76,7 +77,11 @@ const char* VaultOutcomeName(VaultOutcome o);
 struct ChangeOutcome {
   VaultOutcome status = VaultOutcome::kOk;
   ObjectId object;
+  // Text operations for the object's document. Empty for a pure move.
   std::vector<Op> ops;
+  // Tree operations for the vault's shape. A create, rename, move or delete
+  // produces one; a modify produces none.
+  std::vector<TreeOp> tree_ops;
   // kCaseCollision only: the path already in the index that this one folds to.
   std::string colliding_path;
   // True when the change moved an object without touching its text. Exists so
@@ -97,11 +102,16 @@ class Vault {
   ChangeOutcome ApplyChange(const ChangeEvent& event,
                             const std::string& content);
 
+  // Apply a tree operation that arrived from another device. Text operations go
+  // to the document; this is the other half.
+  TreeApply ApplyTreeOp(const TreeOp& op);
+
   // Lookup and inspection.
   bool ObjectAt(const std::string& path, ObjectId* out) const;
   bool PathOf(const ObjectId& id, std::string* out) const;
   const TextDoc* Doc(const ObjectId& id) const;
-  std::size_t ObjectCount() const { return by_path_.size(); }
+  const TreeDoc& tree() const { return tree_; }
+  std::size_t ObjectCount() const;
 
   LamportClock* clock() { return &clock_; }
 
@@ -112,10 +122,18 @@ class Vault {
  private:
   ChangeOutcome SetContent(const ObjectId& id, const std::string& content);
 
+  // Ensure every directory on `path` exists, producing tree operations for any
+  // that do not. Returns the id of the containing directory.
+  bool EnsureParents(const std::string& path, ObjectId* parent,
+                     std::vector<TreeOp>* ops);
+  // The exact path already in the tree whose case-folded form matches, if any.
+  bool FoldedClash(const std::string& path, std::string* existing) const;
+
   LamportClock clock_;
-  std::map<std::string, ObjectId> by_path_;
-  std::map<std::string, std::string> by_folded_;  // folded -> exact path
-  std::map<ObjectId, std::string> path_of_;
+  // THE SHAPE OF THE VAULT LIVES IN THE TREE, not in a path map. Phase 1 kept a
+  // flat path-to-id table, which cannot express a directory move as one fact
+  // and cannot merge two devices that moved the same folder. See ADR 0003.
+  TreeDoc tree_;
   std::map<ObjectId, TextDoc> docs_;
 };
 

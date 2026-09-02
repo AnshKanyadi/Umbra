@@ -221,6 +221,53 @@ TEST(OpLog, RefusesALogThatIsNotCausallyClosed) {
   EXPECT_EQ(log->Replay(obj, &rebuilt, &high), LogStatus::kNotClosed);
 }
 
+TEST(OpLog, TreeOperationsShareTheKeyLayoutAndReplay) {
+  TempDir dir;
+  std::unique_ptr<OpLog> log;
+  ASSERT_EQ(OpLog::Open(dir.path() + "/db", &log), LogStatus::kOk);
+
+  TreeDoc src;
+  LamportClock c(ReplicaIdFromSeed(4));
+  ObjectId d;
+  d.bytes[0] = 0x11;
+  d.bytes[7] = 0xAA;
+  ObjectId f;
+  f.bytes[0] = 0x22;
+  f.bytes[7] = 0xAA;
+  std::vector<TreeOp> ops;
+  ops.push_back(src.MakeMove(d, TreeRoot(), "notes", true, &c));
+  ops.push_back(src.MakeMove(f, d, "a.md", false, &c));
+  ops.push_back(src.MakeMove(f, TreeRoot(), "a.md", false, &c));
+  for (const TreeOp& op : ops) ASSERT_EQ(src.Apply(op), TreeApply::kApplied);
+
+  ASSERT_EQ(log->AppendTree(ops), LogStatus::kOk);
+  ASSERT_EQ(log->Sync(), LogStatus::kOk);
+
+  TreeDoc rebuilt;
+  std::map<ReplicaId, uint64_t> high;
+  ASSERT_EQ(log->ReplayTree(&rebuilt, &high), LogStatus::kOk);
+  EXPECT_EQ(rebuilt.StateHash(), src.StateHash());
+  EXPECT_EQ(high[ReplicaIdFromSeed(4)], c.counter());
+
+  // THE SAME KEY LAYOUT. Tree operations are filed under a reserved object id,
+  // so a raw read of that object finds them and a read of any other does not.
+  std::vector<LoggedOp> raw;
+  ASSERT_EQ(log->ReadRaw(TreeObject(), &raw), LogStatus::kOk);
+  EXPECT_EQ(raw.size(), 3u);
+  for (const LoggedOp& l : raw) {
+    TreeOp decoded;
+    EXPECT_TRUE(DecodeTreeOp(l.payload, &decoded))
+        << "a stored tree payload did not decode";
+    EXPECT_EQ(decoded.id, l.id)
+        << "the key and the payload disagree on identity";
+  }
+  std::vector<LoggedOp> other;
+  ObjectId unrelated;
+  unrelated.bytes[0] = 0x99;
+  ASSERT_EQ(log->ReadRaw(unrelated, &other), LogStatus::kOk);
+  EXPECT_TRUE(other.empty()) << "tree operations leaked into another object";
+}
+
 // ------------------------------------------------------------------ vault
 
 ChangeEvent Event(ChangeKind k, const std::string& path,
@@ -291,18 +338,97 @@ TEST(Vault, MoveProducesNoOperationsAndKeepsIdentity) {
       << "the old path still resolves";
 }
 
-TEST(Vault, DeleteRemovesTextButKeepsTheObject) {
+TEST(Vault, DeleteIsATreeMoveAndLeavesTheTextAlone) {
   Vault v(ReplicaIdFromSeed(1));
   ChangeOutcome c = v.ApplyChange(Event(ChangeKind::kCreated, "a.md"), "gone");
   ASSERT_EQ(c.status, VaultOutcome::kOk);
   ChangeOutcome d =
       v.ApplyChange(Event(ChangeKind::kDeleted, "a.md"), std::string());
   ASSERT_EQ(d.status, VaultOutcome::kOk);
-  EXPECT_FALSE(d.ops.empty());
-  EXPECT_EQ(v.Doc(c.object)->Text(), "");
+
+  // ONE TREE OPERATION, ZERO TEXT OPERATIONS. Phase 1 emptied the document,
+  // which was the only way a flat path map could say "gone". The tree says it
+  // now, and saying it twice would mean a restore produced an empty file --
+  // see the restore test below.
+  EXPECT_EQ(d.tree_ops.size(), 1u);
+  EXPECT_TRUE(d.ops.empty()) << "a delete produced text operations";
+  EXPECT_EQ(v.Doc(c.object)->Text(), "gone") << "the text was destroyed";
+
   ObjectId still;
-  EXPECT_FALSE(v.ObjectAt("a.md", &still));
+  EXPECT_FALSE(v.ObjectAt("a.md", &still)) << "the path still resolves";
+  EXPECT_TRUE(v.tree().IsDeleted(c.object));
   EXPECT_NE(v.Doc(c.object), nullptr) << "the object itself was forgotten";
+}
+
+TEST(Vault, ADeletedFileCanBeRestoredWithItsContent) {
+  // The reason a delete must not empty the document: a delete is a move to the
+  // trash, and a move back out is a move. If the delete had emptied the text,
+  // this would restore an empty file.
+  Vault v(ReplicaIdFromSeed(1));
+  ChangeOutcome c =
+      v.ApplyChange(Event(ChangeKind::kCreated, "a.md"), "still here");
+  ASSERT_EQ(c.status, VaultOutcome::kOk);
+  ASSERT_EQ(
+      v.ApplyChange(Event(ChangeKind::kDeleted, "a.md"), std::string()).status,
+      VaultOutcome::kOk);
+  ASSERT_TRUE(v.tree().IsDeleted(c.object));
+
+  // Move it back out of the trash directly through the tree, as a peer's
+  // undelete would arrive.
+  LamportClock* clock = v.clock();
+  TreeDoc scratch;
+  TreeOp back;
+  back.id = clock->Tick(1);
+  back.child = c.object;
+  back.parent = TreeRoot();
+  back.name = "a.md";
+  back.is_dir = false;
+  ASSERT_EQ(v.ApplyTreeOp(back), TreeApply::kApplied);
+
+  ObjectId at;
+  ASSERT_TRUE(v.ObjectAt("a.md", &at));
+  EXPECT_EQ(at, c.object);
+  EXPECT_EQ(v.Doc(c.object)->Text(), "still here");
+}
+
+TEST(Vault, CreateInsideNestedDirectoriesMakesThePath) {
+  // The watcher reports the file, not the directories above it: a mkdir -p and
+  // a write arrive as one create. The tree needs the parents, so the vault
+  // makes them, and each one is an ordinary tree operation another device can
+  // merge.
+  Vault v(ReplicaIdFromSeed(1));
+  ChangeOutcome c =
+      v.ApplyChange(Event(ChangeKind::kCreated, "a/b/c/n.md"), "deep");
+  ASSERT_EQ(c.status, VaultOutcome::kOk);
+  EXPECT_EQ(c.tree_ops.size(), 4u) << "three directories and the file";
+  ObjectId at;
+  ASSERT_TRUE(v.ObjectAt("a/b/c/n.md", &at));
+  EXPECT_EQ(v.Doc(at)->Text(), "deep");
+  ObjectId dir;
+  ASSERT_TRUE(v.ObjectAt("a/b", &dir));
+  EXPECT_TRUE(v.tree().IsDir(dir));
+}
+
+TEST(Vault, MovingADirectoryMovesEveryFileUnderIt) {
+  Vault v(ReplicaIdFromSeed(1));
+  ASSERT_EQ(v.ApplyChange(Event(ChangeKind::kCreated, "old/n.md"), "x").status,
+            VaultOutcome::kOk);
+  ASSERT_EQ(v.ApplyChange(Event(ChangeKind::kCreated, "old/m.md"), "y").status,
+            VaultOutcome::kOk);
+  ObjectId n;
+  ASSERT_TRUE(v.ObjectAt("old/n.md", &n));
+
+  ChangeOutcome mv =
+      v.ApplyChange(Event(ChangeKind::kMoved, "new", "old"), std::string());
+  ASSERT_EQ(mv.status, VaultOutcome::kOk);
+  // ONE tree operation for the whole subtree, and no text operations.
+  EXPECT_EQ(mv.tree_ops.size(), 1u);
+  EXPECT_TRUE(mv.ops.empty());
+
+  ObjectId still;
+  EXPECT_TRUE(v.ObjectAt("new/n.md", &still));
+  EXPECT_EQ(still, n) << "a file under a moved directory changed identity";
+  EXPECT_EQ(v.Doc(n)->Text(), "x");
 }
 
 // THE REQUIREMENT: a case collision is detected and surfaced, never merged.
