@@ -174,6 +174,22 @@ SyncStatus Client::FetchObject(
         return SyncStatus::kChainBroken;
       }
 
+      // PERSISTED BEFORE THE CURSOR MOVES, and the order is the whole point.
+      //
+      // A cursor that advanced on APPLY rather than on PERSIST would claim this
+      // device holds an operation that a crash would take with it: the document
+      // is rebuilt from the log, the log would not have it, and the prefix mark
+      // this device reports would then be a lie in the dangerous direction.
+      // Found by asserting the shipped cursor against the harness's definition
+      // of a prefix mark; they disagreed.
+      StoredBlob stored;
+      stored.id.replica = source;
+      stored.id.counter = b.counter;
+      stored.epoch = b.epoch;
+      stored.sealed = b.payload;
+      if (log_->AppendStored(object, {stored}) != LogStatus::kOk) {
+        return SyncStatus::kLocalError;
+      }
       if (!apply(payload)) return SyncStatus::kLocalError;
       ++stats->applied;
       cursor = b.counter;

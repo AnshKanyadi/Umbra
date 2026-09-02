@@ -402,6 +402,29 @@ std::string CursorKey(const ObjectId& object, const ReplicaId& source) {
 
 }  // namespace
 
+LogStatus OpLog::AppendStored(const ObjectId& object,
+                              const std::vector<StoredBlob>& blobs) {
+  if (blobs.empty()) return LogStatus::kOk;
+  basalt::WriteBatch batch;
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
+  keys.reserve(blobs.size());
+  values.reserve(blobs.size());
+  for (const StoredBlob& b : blobs) {
+    keys.push_back(MakeOpLogKey(object, b.id.replica, b.id.counter));
+    std::string v;
+    if (impl_->keys != nullptr) PutEnvelope(b.epoch, &v);
+    v += b.sealed;
+    values.push_back(v);
+  }
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    batch.Set(basalt::Slice(keys[i]), basalt::Slice(values[i]));
+  }
+  basalt::wal::SeqNum seq = 0;
+  const basalt::Status s = impl_->db->Write(batch, &seq);
+  return s.ok() ? LogStatus::kOk : LogStatus::kWriteFailed;
+}
+
 LogStatus OpLog::ReadStoredFrom(const ObjectId& object,
                                 const ReplicaId& replica, uint64_t after,
                                 std::vector<StoredBlob>* out) const {

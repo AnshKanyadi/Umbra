@@ -174,6 +174,16 @@ class OpLog {
   LogStatus ReadFrom(const ObjectId& object, const ReplicaId& replica,
                      uint64_t after, std::vector<Op>* out) const;
 
+  // Write an already-sealed operation back verbatim, epoch and all.
+  //
+  // WHAT A FETCH USES, and the reason it exists rather than the fetch calling
+  // Append: re-sealing would draw a new nonce, so the bytes this device stores
+  // would differ from the bytes every other device stores for the same
+  // operation. Verbatim keeps them identical, which is what makes a push from
+  // this device idempotent at the relay too.
+  LogStatus AppendStored(const ObjectId& object,
+                         const std::vector<StoredBlob>& blobs);
+
   // Stored form, undecrypted, from one source after a counter. What push uses.
   LogStatus ReadStoredFrom(const ObjectId& object, const ReplicaId& replica,
                            uint64_t after, std::vector<StoredBlob>* out) const;

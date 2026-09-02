@@ -700,5 +700,76 @@ TEST_F(HostileRelay, DuplicateDeliveryIsHarmless) {
   EXPECT_EQ(cb.Cursor(object_, dev_a_), counters_[0]);
 }
 
+// THE CURSOR AND THE HARNESS AGREE ON WHAT A PREFIX MARK IS.
+//
+// sim/ computes the mark from what a source produced against what a replica
+// received, because the simulation knows both. The real client computes it from
+// a cursor it advanced across a verified chain. They must be the same number or
+// ADR 0003's condition is being tested against something other than what ships.
+TEST_F(HostileRelay, TheCursorEqualsTheHarnessPrefixMark) {
+  sync::Client cb(TestVault(), dev_b_, &keys_, log_b_.get(), honest_.get());
+  TextDoc doc;
+  sync::FetchStats st;
+  ASSERT_EQ(cb.FetchObject(
+                object_, dev_a_,
+                [&doc](const OpPayload& p) {
+                  Op op;
+                  if (!DecodeOp(p, &op)) return false;
+                  return doc.Apply(op) != ApplyResult::kMalformed;
+                },
+                &st),
+            sync::SyncStatus::kOk);
+
+  // The harness's definition, computed here from the same two facts it uses:
+  // what the source produced, in order, and what this replica received.
+  std::set<uint64_t> received;
+  {
+    std::vector<StoredBlob> got;
+    ASSERT_EQ(log_b_->ReadStoredFrom(object_, dev_a_, 0, &got), LogStatus::kOk);
+    for (const StoredBlob& b : got) received.insert(b.id.counter);
+  }
+  uint64_t harness_mark = 0;
+  for (uint64_t c : counters_) {
+    if (received.count(c) == 0) break;
+    harness_mark = c;
+  }
+
+  EXPECT_EQ(cb.Cursor(object_, dev_a_), harness_mark)
+      << "the shipped cursor and the harness disagree about the prefix mark";
+  EXPECT_EQ(harness_mark, counters_.back());
+}
+
+// And they still agree when the relay withheld something, which is the case
+// where disagreeing would matter.
+TEST_F(HostileRelay, TheCursorEqualsTheMarkAfterAWithheldOperation) {
+  HostileTransport hostile(store_.get());
+  hostile.OmitCounter(counters_[1]);
+  sync::Client cb(TestVault(), dev_b_, &keys_, log_b_.get(), &hostile);
+  TextDoc doc;
+  sync::FetchStats st;
+  (void)cb.FetchObject(
+      object_, dev_a_,
+      [&doc](const OpPayload& p) {
+        Op op;
+        if (!DecodeOp(p, &op)) return false;
+        return doc.Apply(op) != ApplyResult::kMalformed;
+      },
+      &st);
+
+  std::set<uint64_t> received;
+  {
+    std::vector<StoredBlob> got;
+    ASSERT_EQ(log_b_->ReadStoredFrom(object_, dev_a_, 0, &got), LogStatus::kOk);
+    for (const StoredBlob& b : got) received.insert(b.id.counter);
+  }
+  uint64_t harness_mark = 0;
+  for (uint64_t c : counters_) {
+    if (received.count(c) == 0) break;
+    harness_mark = c;
+  }
+  EXPECT_EQ(cb.Cursor(object_, dev_a_), harness_mark);
+  EXPECT_EQ(harness_mark, counters_[0]) << "both should stop before the hole";
+}
+
 }  // namespace
 }  // namespace umbra
