@@ -3,6 +3,13 @@
 // The convergence harness proves replicas agree under arbitrary schedules.
 // These pin down what the tree should SAY, so that agreement is not satisfied
 // by every replica being wrong together.
+// <algorithm> for std::sort and std::next_permutation.
+//
+// NOT OPTIONAL, and the omission compiled everywhere I could test it by hand:
+// libc++ pulls it in behind another header and so does libstdc++ under gcc.
+// Only ubuntu clang, which is libstdc++ WITHOUT gcc's transitive includes,
+// says so. That combination is in the matrix for exactly this.
+#include <algorithm>
 #include <string>
 #include <vector>
 
