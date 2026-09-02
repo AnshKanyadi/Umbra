@@ -171,7 +171,7 @@ TEST(Enrollment, ADeviceGetsTheEpochKeyAndAStrangerDoesNot) {
             CryptoStatus::kAuthFailed);
 }
 
-// THE REVOCATION PROPERTY, exactly as docs/threat-model.md section 6 states it:
+// THE REVOCATION PROPERTY, exactly as docs/threat-model.md section 7 states it:
 // rotation makes FUTURE writes unreadable to a removed device, and does nothing
 // about what it already has.
 TEST(Rotation, RemovesFutureReadsAndLeavesPastOnesAlone) {

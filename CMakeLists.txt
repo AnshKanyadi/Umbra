@@ -192,6 +192,7 @@ add_library(umbra STATIC
   src/crypto/aead.cc
   src/sync/report.cc
   src/sync/client.cc
+  src/sync/enroll.cc
   src/sync/tcp_transport.cc
   src/watcher/content_hash.cc
   src/watcher/object_id.cc
@@ -292,6 +293,7 @@ add_executable(umbra_test
   test/crdt_test.cc
   test/tree_test.cc
   test/crypto_test.cc
+  test/enroll_test.cc
   test/relay_test.cc
   test/oplog_test.cc
   test/converge_test.cc

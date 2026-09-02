@@ -109,12 +109,18 @@ const char* OpName(Op o) {
       return "put-report";
     case Op::kGetReports:
       return "get-reports";
+    case Op::kPutEnvelope:
+      return "put-envelope";
+    case Op::kGetEnvelopes:
+      return "get-envelopes";
     case Op::kOk:
       return "ok";
     case Op::kBlobs:
       return "blobs";
     case Op::kReports:
       return "reports";
+    case Op::kEnvelopes:
+      return "envelopes";
     case Op::kError:
       return "error";
   }
@@ -223,9 +229,12 @@ bool PeekOp(const std::string& body, Op* out) {
     case Op::kFetch:
     case Op::kPutReport:
     case Op::kGetReports:
+    case Op::kPutEnvelope:
+    case Op::kGetEnvelopes:
     case Op::kOk:
     case Op::kBlobs:
     case Op::kReports:
+    case Op::kEnvelopes:
     case Op::kError:
       *out = static_cast<Op>(v);
       return true;
@@ -326,6 +335,72 @@ bool DecodeError(const std::string& body, std::string* message) {
   uint8_t op = 0;
   if (!r.U8(&op) || static_cast<Op>(op) != Op::kError) return false;
   if (!r.Str(message)) return false;
+  return r.Done();
+}
+
+std::string EncodePutEnvelope(const PutEnvelopeRequest& r) {
+  std::string b;
+  PutU8(static_cast<uint8_t>(Op::kPutEnvelope), &b);
+  PutBytes(r.vault.bytes.data(), r.vault.bytes.size(), &b);
+  PutBytes(r.envelope.tag.data(), r.envelope.tag.size(), &b);
+  PutString(r.envelope.body, &b);
+  return Frame(b);
+}
+
+bool DecodePutEnvelope(const std::string& body, PutEnvelopeRequest* out) {
+  Reader r{&body, 0};
+  uint8_t op = 0;
+  if (!r.U8(&op) || static_cast<Op>(op) != Op::kPutEnvelope) return false;
+  if (!r.Bytes(out->vault.bytes.data(), out->vault.bytes.size())) return false;
+  if (!r.Bytes(out->envelope.tag.data(), out->envelope.tag.size()))
+    return false;
+  if (!r.Str(&out->envelope.body)) return false;
+  return r.Done();
+}
+
+std::string EncodeGetEnvelopes(const GetEnvelopesRequest& r) {
+  std::string b;
+  PutU8(static_cast<uint8_t>(Op::kGetEnvelopes), &b);
+  PutBytes(r.vault.bytes.data(), r.vault.bytes.size(), &b);
+  return Frame(b);
+}
+
+bool DecodeGetEnvelopes(const std::string& body, GetEnvelopesRequest* out) {
+  Reader r{&body, 0};
+  uint8_t op = 0;
+  if (!r.U8(&op) || static_cast<Op>(op) != Op::kGetEnvelopes) return false;
+  if (!r.Bytes(out->vault.bytes.data(), out->vault.bytes.size())) return false;
+  return r.Done();
+}
+
+std::string EncodeEnvelopes(const EnvelopesResponse& r) {
+  std::string b;
+  PutU8(static_cast<uint8_t>(Op::kEnvelopes), &b);
+  PutU32(static_cast<uint32_t>(r.envelopes.size()), &b);
+  for (const Envelope& e : r.envelopes) {
+    PutBytes(e.tag.data(), e.tag.size(), &b);
+    PutString(e.body, &b);
+  }
+  return Frame(b);
+}
+
+bool DecodeEnvelopes(const std::string& body, EnvelopesResponse* out) {
+  Reader r{&body, 0};
+  uint8_t op = 0;
+  if (!r.U8(&op) || static_cast<Op>(op) != Op::kEnvelopes) return false;
+  uint32_t n = 0;
+  if (!r.U32(&n)) return false;
+  // BOUND BEFORE RESERVING. A relay that claims four billion envelopes must
+  // not be able to make a client allocate for them.
+  if (n > kMaxEnvelopes) return false;
+  out->envelopes.clear();
+  out->envelopes.reserve(n);
+  for (uint32_t i = 0; i < n; ++i) {
+    Envelope e;
+    if (!r.Bytes(e.tag.data(), e.tag.size())) return false;
+    if (!r.Str(&e.body)) return false;
+    out->envelopes.push_back(e);
+  }
   return r.Done();
 }
 

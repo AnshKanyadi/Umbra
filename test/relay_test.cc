@@ -514,6 +514,15 @@ class HostileTransport : public sync::Transport {
     return true;
   }
 
+  bool PutEnvelope(const relay::PutEnvelopeRequest& req) override {
+    return store_->PutEnvelope(req) == relay::StoreStatus::kOk;
+  }
+
+  bool GetEnvelopes(const relay::GetEnvelopesRequest& req,
+                    relay::EnvelopesResponse* out) override {
+    return store_->GetEnvelopes(req, out) == relay::StoreStatus::kOk;
+  }
+
  private:
   relay::Store* store_;
   std::set<uint64_t> omit_;

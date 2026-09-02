@@ -63,6 +63,11 @@ class Store {
   StoreStatus PutReport(const PutReportRequest& req);
   StoreStatus GetReports(const GetReportsRequest& req, ReportsResponse* out);
 
+  // Enrolment envelopes. Opaque to the relay in both directions.
+  StoreStatus PutEnvelope(const PutEnvelopeRequest& req);
+  StoreStatus GetEnvelopes(const GetEnvelopesRequest& req,
+                           EnvelopesResponse* out);
+
   // Durability. Basalt's Write never blocks on I/O; a relay that answered OK
   // before this returned would be promising something it had not done.
   StoreStatus Sync();

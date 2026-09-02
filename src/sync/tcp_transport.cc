@@ -98,6 +98,20 @@ class TcpTransport : public Transport {
     return relay::DecodeReports(body, out);
   }
 
+  bool PutEnvelope(const relay::PutEnvelopeRequest& req) override {
+    std::string body;
+    if (!RoundTrip(relay::EncodePutEnvelope(req), &body)) return false;
+    relay::Op op;
+    return relay::PeekOp(body, &op) && op == relay::Op::kOk;
+  }
+
+  bool GetEnvelopes(const relay::GetEnvelopesRequest& req,
+                    relay::EnvelopesResponse* out) override {
+    std::string body;
+    if (!RoundTrip(relay::EncodeGetEnvelopes(req), &body)) return false;
+    return relay::DecodeEnvelopes(body, out);
+  }
+
  private:
   int Connect() {
     struct addrinfo hints;

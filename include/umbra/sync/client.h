@@ -90,6 +90,9 @@ class Transport {
   virtual bool PutReport(const relay::PutReportRequest& req) = 0;
   virtual bool GetReports(const relay::GetReportsRequest& req,
                           relay::ReportsResponse* out) = 0;
+  virtual bool PutEnvelope(const relay::PutEnvelopeRequest& req) = 0;
+  virtual bool GetEnvelopes(const relay::GetEnvelopesRequest& req,
+                            relay::EnvelopesResponse* out) = 0;
 };
 
 // A real one, over TCP.
@@ -129,6 +132,12 @@ class Client {
 
   // Publish this device's compaction report, sealed. `have` is built from the
   // cursors, which is what makes it a claim this device can honestly make.
+  // Enrolment. The client does not interpret an envelope; it moves bytes
+  // between a device and the relay and the crypto in enroll.h does the rest.
+  SyncStatus PublishEnvelope(const std::array<uint8_t, 32>& tag,
+                             const std::string& body);
+  SyncStatus CollectEnvelopes(std::vector<relay::Envelope>* out);
+
   SyncStatus PublishReport(uint64_t clock, const std::vector<ObjectId>& objects,
                            const ReplicaId& tree_object_source_hint);
 

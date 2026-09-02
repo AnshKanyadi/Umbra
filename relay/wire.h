@@ -49,6 +49,11 @@ using ReplicaId = Id16;
 // that a hostile frame length cannot exhaust a small VPS.
 constexpr uint32_t kMaxFrameBytes = 8u * 1024 * 1024;
 
+// A household, not a fleet. Enrolment envelopes are a handful per vault and a
+// relay claiming more than this is either broken or trying to make a client
+// allocate on its say-so.
+constexpr uint32_t kMaxEnvelopes = 256;
+
 // A vault is identified by an opaque 16-byte id, like everything else the relay
 // sees. It is NOT derived from the passphrase or from any key: a relay hosting
 // several vaults must be able to tell them apart without that telling it
@@ -57,14 +62,17 @@ using VaultId = Id16;
 
 // Closed; -Werror=switch applies.
 enum class Op : uint8_t {
-  kPush = 1,        // client -> relay: store these blobs
-  kFetch = 2,       // client -> relay: give me blobs after a cursor
-  kPutReport = 3,   // client -> relay: store my sealed compaction report
-  kGetReports = 4,  // client -> relay: give me every device's sealed report
-  kOk = 100,        // relay -> client
-  kBlobs = 101,     // relay -> client
-  kReports = 102,   // relay -> client
-  kError = 103,     // relay -> client
+  kPush = 1,          // client -> relay: store these blobs
+  kFetch = 2,         // client -> relay: give me blobs after a cursor
+  kPutReport = 3,     // client -> relay: store my sealed compaction report
+  kGetReports = 4,    // client -> relay: give me every device's sealed report
+  kPutEnvelope = 5,   // client -> relay: hold this enrolment envelope
+  kGetEnvelopes = 6,  // client -> relay: give me every envelope in this vault
+  kOk = 100,          // relay -> client
+  kBlobs = 101,       // relay -> client
+  kReports = 102,     // relay -> client
+  kEnvelopes = 104,   // relay -> client
+  kError = 103,       // relay -> client
 };
 
 const char* OpName(Op o);
@@ -113,6 +121,28 @@ struct SealedReport {
   std::string sealed;
 };
 
+// AN OPAQUE ENVELOPE. The relay does not know a request from a grant: both are
+// bytes under a 32-byte tag it never interprets. It cannot even tell which
+// direction an enrolment is going, only that one is happening -- which is
+// recorded in docs/threat-model.md rather than claimed away.
+struct Envelope {
+  std::array<uint8_t, 32> tag{};
+  std::string body;
+};
+
+struct PutEnvelopeRequest {
+  VaultId vault;
+  Envelope envelope;
+};
+
+struct GetEnvelopesRequest {
+  VaultId vault;
+};
+
+struct EnvelopesResponse {
+  std::vector<Envelope> envelopes;
+};
+
 struct PutReportRequest {
   VaultId vault;
   SealedReport report;
@@ -131,6 +161,9 @@ std::string EncodePush(const PushRequest& r);
 std::string EncodeFetch(const FetchRequest& r);
 std::string EncodePutReport(const PutReportRequest& r);
 std::string EncodeGetReports(const GetReportsRequest& r);
+std::string EncodePutEnvelope(const PutEnvelopeRequest& r);
+std::string EncodeGetEnvelopes(const GetEnvelopesRequest& r);
+std::string EncodeEnvelopes(const EnvelopesResponse& r);
 std::string EncodeOk();
 std::string EncodeBlobs(const BlobsResponse& r);
 std::string EncodeReports(const ReportsResponse& r);
@@ -145,6 +178,9 @@ bool DecodePutReport(const std::string& body, PutReportRequest* out);
 bool DecodeGetReports(const std::string& body, GetReportsRequest* out);
 bool DecodeBlobs(const std::string& body, BlobsResponse* out);
 bool DecodeReports(const std::string& body, ReportsResponse* out);
+bool DecodePutEnvelope(const std::string& body, PutEnvelopeRequest* out);
+bool DecodeGetEnvelopes(const std::string& body, GetEnvelopesRequest* out);
+bool DecodeEnvelopes(const std::string& body, EnvelopesResponse* out);
 bool DecodeError(const std::string& body, std::string* message);
 
 }  // namespace relay

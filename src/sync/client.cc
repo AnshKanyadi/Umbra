@@ -209,6 +209,25 @@ SyncStatus Client::FetchObject(
   return SyncStatus::kOk;
 }
 
+SyncStatus Client::PublishEnvelope(const std::array<uint8_t, 32>& tag,
+                                   const std::string& body) {
+  relay::PutEnvelopeRequest req;
+  req.vault = vault_;
+  req.envelope.tag = tag;
+  req.envelope.body = body;
+  if (!transport_->PutEnvelope(req)) return SyncStatus::kUnreachable;
+  return SyncStatus::kOk;
+}
+
+SyncStatus Client::CollectEnvelopes(std::vector<relay::Envelope>* out) {
+  relay::GetEnvelopesRequest req;
+  req.vault = vault_;
+  relay::EnvelopesResponse resp;
+  if (!transport_->GetEnvelopes(req, &resp)) return SyncStatus::kUnreachable;
+  out->swap(resp.envelopes);
+  return SyncStatus::kOk;
+}
+
 SyncStatus Client::PublishReport(uint64_t clock,
                                  const std::vector<ObjectId>& objects,
                                  const ReplicaId& tree_object_source_hint) {

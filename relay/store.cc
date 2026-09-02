@@ -32,6 +32,10 @@ uint64_t GetBe64(const char* p) {
 // argument for the client's own log.
 constexpr char kBlobPrefix = 'b';
 constexpr char kReportPrefix = 'r';
+// Enrolment envelopes. A separate prefix so a listing of one never sees the
+// other, and so a relay operator reading its own disk sees two opaque
+// key spaces rather than one it might be tempted to interpret.
+constexpr char kEnvelopePrefix = 'e';
 
 std::string BlobKey(const VaultId& v, const ObjectId& o, const ReplicaId& r,
                     uint64_t counter) {
@@ -48,6 +52,13 @@ std::string ReportKey(const VaultId& v, const ReplicaId& device) {
   k.append(reinterpret_cast<const char*>(v.bytes.data()), v.bytes.size());
   k.append(reinterpret_cast<const char*>(device.bytes.data()),
            device.bytes.size());
+  return k;
+}
+
+std::string EnvelopeKey(const VaultId& v, const std::array<uint8_t, 32>& tag) {
+  std::string k(1, kEnvelopePrefix);
+  k.append(reinterpret_cast<const char*>(v.bytes.data()), v.bytes.size());
+  k.append(reinterpret_cast<const char*>(tag.data()), tag.size());
   return k;
 }
 
@@ -204,6 +215,45 @@ StoreStatus Store::PutReport(const PutReportRequest& req) {
   return s.ok() ? StoreStatus::kOk : StoreStatus::kWriteFailed;
 }
 
+StoreStatus Store::PutEnvelope(const PutEnvelopeRequest& req) {
+  basalt::WriteBatch batch;
+  const std::string key = EnvelopeKey(req.vault, req.envelope.tag);
+  batch.Set(basalt::Slice(key), basalt::Slice(req.envelope.body));
+  basalt::wal::SeqNum seq = 0;
+  const basalt::Status s = impl_->db->Write(batch, &seq);
+  return s.ok() ? StoreStatus::kOk : StoreStatus::kWriteFailed;
+}
+
+StoreStatus Store::GetEnvelopes(const GetEnvelopesRequest& req,
+                                EnvelopesResponse* out) {
+  std::array<uint8_t, 32> lo_tag{};
+  std::array<uint8_t, 32> hi_tag{};
+  hi_tag.fill(0xFF);
+  const std::string lo = EnvelopeKey(req.vault, lo_tag);
+  std::string hi = EnvelopeKey(req.vault, hi_tag);
+  hi.push_back('\0');
+
+  basalt::IterOptions o;
+  o.lower = basalt::Bound::At(basalt::Slice(lo));
+  o.upper = basalt::Bound::At(basalt::Slice(hi));
+  std::unique_ptr<basalt::Iterator> it = impl_->db->NewIter(o);
+  for (bool ok = it->First(); ok; ok = it->Next()) {
+    if (out->envelopes.size() >= kMaxEnvelopes) break;
+    const std::string key = it->Key().ToString();
+    if (key.size() != 1 + 16 + 32) {
+      (void)it->Close();
+      return StoreStatus::kReadFailed;
+    }
+    Envelope e;
+    std::memcpy(e.tag.data(), key.data() + 1 + 16, e.tag.size());
+    e.body = it->Value().ToString();
+    out->envelopes.push_back(e);
+  }
+  const basalt::Status err = it->Error();
+  (void)it->Close();
+  return err.ok() ? StoreStatus::kOk : StoreStatus::kReadFailed;
+}
+
 StoreStatus Store::GetReports(const GetReportsRequest& req,
                               ReportsResponse* out) {
   ReplicaId lo_dev;
@@ -286,6 +336,28 @@ std::string HandleRequest(Store* store, const std::string& body) {
       if (store->Sync() != StoreStatus::kOk) return EncodeError("sync failed");
       return EncodeOk();
     }
+    case Op::kPutEnvelope: {
+      PutEnvelopeRequest req;
+      if (!DecodePutEnvelope(body, &req))
+        return EncodeError("malformed envelope");
+      if (store->PutEnvelope(req) != StoreStatus::kOk) {
+        return EncodeError("cannot store the envelope");
+      }
+      if (store->Sync() != StoreStatus::kOk) {
+        return EncodeError("cannot sync the envelope");
+      }
+      return EncodeOk();
+    }
+    case Op::kGetEnvelopes: {
+      GetEnvelopesRequest req;
+      if (!DecodeGetEnvelopes(body, &req))
+        return EncodeError("malformed get-envelopes");
+      EnvelopesResponse resp;
+      if (store->GetEnvelopes(req, &resp) != StoreStatus::kOk) {
+        return EncodeError("cannot read envelopes");
+      }
+      return EncodeEnvelopes(resp);
+    }
     case Op::kGetReports: {
       GetReportsRequest req;
       if (!DecodeGetReports(body, &req))
@@ -301,6 +373,7 @@ std::string HandleRequest(Store* store, const std::string& body) {
     case Op::kOk:
     case Op::kBlobs:
     case Op::kReports:
+    case Op::kEnvelopes:
     case Op::kError:
       return EncodeError("not a request");
   }

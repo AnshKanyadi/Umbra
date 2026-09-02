@@ -47,7 +47,7 @@ Also in scope, at lower priority:
   relay does; treated as a strictly weaker adversary and not modelled
   separately.
 - **A stolen device.** Addressed by the key hierarchy in §4 and by revocation
-  in §6, with the limits stated there.
+  in §7, with the limits stated there.
 
 Explicitly **not** in scope:
 
@@ -166,7 +166,7 @@ The relay authenticates devices individually and therefore knows how many there
 are, when a new one is enrolled, and when one stops appearing. Device identity
 has to be distinguishable to the relay for revocation to mean anything — a relay
 that cannot tell devices apart cannot refuse a removed one — so this leak is
-bought deliberately, in exchange for §6.
+bought deliberately, in exchange for §7.
 
 ### 5.4 Approximate total vault size — **not mitigated**
 
@@ -222,6 +222,18 @@ tells the user their relay is misbehaving; it does not get them their data. The
 answer to a relay that withholds is to host a different one, which is the point
 of the whole system being self-hostable.
 
+### 5.8 That an enrolment is happening — **not mitigated**
+
+Enrolment envelopes sit on the relay next to the operations. The relay sees a
+new 32-byte tag appear, sees a second envelope appear addressed to a tag derived
+from it, and sees a new device begin publishing reports shortly afterwards. It
+learns that a device joined, and when.
+
+It does not learn the epoch key, which is sealed to a public key it does not
+hold, and it does not learn the passphrase, which never leaves a device. What it
+learns is that the household grew, which is the same class of fact as §5.3 and
+is not separable from having an enrolment mechanism at all.
+
 ### 5.7 Summary
 
 | What the relay learns | Mitigated? | How, or why not |
@@ -237,6 +249,8 @@ of the whole system being self-hostable.
 | Long-term activity patterns | **No** | Follows from timing and correlation above |
 | Whether a client is missing an operation | Yes | Encrypted back-pointer chain; the cursor refuses to advance across a gap |
 | Whether the relay is withholding everything newer | **Detected, not prevented** | A denial of service that holds log compaction hostage; see §5.6 |
+| That a device enrolled, and when | **No** | Inseparable from having an enrolment mechanism; see §5.8 |
+| Who sealed an enrolment grant | **Detected, not prevented** | A pairing code the user compares; see §6a |
 
 Five of the first nine rows are "no". That ratio is what an encrypted-blob store
 against a hostile relay actually looks like, and a document that reported
@@ -245,7 +259,52 @@ otherwise would be describing a different system.
 The last two rows are integrity rather than confidentiality, and they are stated
 here because the same adversary produces both.
 
-## 6. Revocation, and what it cannot do
+## 6. Enrolment, and the one thing the user has to do
+
+A sealed box gives confidentiality and **not** authenticity. `keys.h` says so in
+its own comment: the ciphertext "does not say who sealed it". Anyone who can
+reach the relay can seal a grant to a joining device's real public key, and that
+grant decrypts perfectly. The joining device would then be enrolled in the
+attacker's vault while the user believes it joined theirs.
+
+So enrolment ends in a comparison the user makes:
+
+```
+joining device                     enrolling device
+--------------                     ----------------
+umbra_sync --enrol --vault ID      umbra_sync --approve DEVICE
+  pairing code 649 260               pairing code 649 260
+                                   
+umbra_sync --enrol --code 649260
+```
+
+Both devices display six digits derived from **both public keys**, sorted so the
+two sides compute the same value. The joining device is the one that checks,
+because the joining device is where a substituted key shows up: a relay that put
+its own key in front of it sealed the grant itself, so the `from` key in the
+grant is the relay's and the digits do not match. The check is made by the
+program against digits the user types, not left as an instruction to look
+carefully, so "I compared it" and "it matched" cannot come apart.
+
+**Twenty bits is a deliberate ceiling.** Six digits is one guess in a million.
+That holds because the attack is online and one-shot -- the attacker gets one
+try, in front of a user looking at two screens -- and because the code
+authenticates keys that have already been exchanged rather than being a secret
+anything is derived from. It would not hold if the code could be attacked
+offline.
+
+**If the user does not compare, this is trust-on-first-use through the relay,**
+and a hostile relay can enrol itself into the vault. That is the honest
+statement of the residual risk. It is not defaulted away, and the program does
+not enrol without a code.
+
+What an interceptor gets from watching an enrolment: two public keys, a vault
+id it already had, a salt that is public by construction, and a sealed epoch key
+it cannot open. Not the passphrase, which never leaves a device, and not the
+epoch key.
+
+
+## 7. Revocation, and what it cannot do
 
 Removing a device rotates keys so that **writes made after the rotation cannot
 be read by the removed device**. That is the whole of the guarantee.
@@ -270,7 +329,7 @@ protects nothing.
 Anything a device could read before the rotation should be treated as
 permanently disclosed to whoever holds that device.
 
-## 7. Integrity and rollback
+## 8. Integrity and rollback
 
 The relay can withhold data, serve old data, or serve different data to
 different devices. Encryption alone does not prevent any of these — a hostile
@@ -289,7 +348,7 @@ a device can distinguish "nothing has changed" from "the relay is not telling
 me what changed". Until then, Umbra defends confidentiality against a hostile
 relay and only partially defends freshness.
 
-## 8. Non-goals
+## 9. Non-goals
 
 - **Deniability.** The relay knows a vault exists, whose account it belongs to,
   and roughly how big it is. Umbra does not offer hidden volumes.
@@ -301,7 +360,7 @@ relay and only partially defends freshness.
 - **Protecting against the user's own backups.** A backup tool copying the vault
   folder copies plaintext.
 
-## 9. Terms this document will not use
+## 10. Terms this document will not use
 
 No claim in this repository will describe the cryptography as "military-grade",
 "unbreakable", "bank-level", or "zero-knowledge". The first three mean nothing.
@@ -309,5 +368,5 @@ The fourth means something specific and different from what Umbra does, and
 using it as a synonym for "encrypted client-side" is a claim the design does not
 support.
 
-What Umbra does is stated in §2 through §7, including the parts that are
+What Umbra does is stated in §2 through §8, including the parts that are
 uncomfortable.
