@@ -654,8 +654,15 @@ struct Sim {
   void CompactTreeLogRound() {
     std::vector<ReplicaId> enrolled;
     std::vector<DeviceReport> reports;
-    for (const Replica& r : replicas) {
+    for (std::size_t i = 0; i < replicas.size(); ++i) {
+      const Replica& r = replicas[i];
       enrolled.push_back(r.id);
+      // AN ISOLATED DEVICE'S REPORT DOES NOT ARRIVE, which is both what a
+      // partition looks like and what a withholding relay looks like. The
+      // watermark must collapse rather than assume the silent device is caught
+      // up -- deliberate defect C3 removes exactly that and the sweep has to
+      // notice.
+      if (Isolated(i)) continue;
       DeviceReport rep;
       rep.device = r.id;
       rep.have = r.tree.HaveMarks();
@@ -1103,7 +1110,7 @@ void RunTreeCompactThenMove(Sim* s) {
   s->Quiesce();
   s->CompactTreeLogRound();
 
-  // Now keep going. Operations produced after the round have counters above the
+  // Now keep going, compacting as we go rather than only at rest. Operations produced after the round have counters above the
   // watermark by construction, so the undo they need is still there -- and
   // delivery is deliberately reordered so that undo actually runs.
   for (std::size_t k = 0; k < s->cfg.steps / 4; ++k) {
@@ -1121,6 +1128,7 @@ void RunTreeCompactThenMove(Sim* s) {
       s->in_flight.erase(s->in_flight.begin() + static_cast<long>(j));
       s->DeliverMessage(m);
     }
+    if (s->rng.Chance(15)) s->CompactTreeLogRound();
   }
   // And re-offer some already-delivered operations past the cursor, which is
   // what a relay resending looks like and what clause 5 has to absorb.
@@ -1193,6 +1201,13 @@ void RunTreeRandom(Sim* s) {
       s->isolated_until[static_cast<std::size_t>(s->rng.Below(n))] =
           s->step + 1 + static_cast<std::size_t>(s->rng.Below(20));
     }
+    // COMPACTION RUNS MID-SCHEDULE, not only at quiescence, and that is the
+    // point rather than a detail. The condition is built to be safe at any
+    // moment; running it only when every replica is already identical means the
+    // clauses that protect against lagging clocks, missing reports and gapped
+    // logs are never exercised. Three deliberate defects went uncaught until
+    // this moved.
+    if (s->rng.Chance(8)) s->CompactTreeLogRound();
   }
 }
 
