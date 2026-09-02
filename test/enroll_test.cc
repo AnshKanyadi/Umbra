@@ -224,5 +224,106 @@ TEST(Revocation, ARemovedDeviceLosesTheFutureAndKeepsThePast) {
   EXPECT_EQ(fresh, "written after removal");
 }
 
+// TWO DEVICES ENROL AT THE SAME TIME.
+//
+// Both grants are sealed under the same epoch, from the same enroller, and
+// neither may displace the other: enrolment is not a slot. The failure this
+// guards against is a design where "the pending request" is singular, so the
+// second joiner overwrites the first and the first is left holding a key for a
+// vault that has moved on without it.
+TEST(Enrollment, TwoDevicesJoiningAtOnceBothEndUpWithTheKey) {
+  const std::array<uint8_t, kSaltBytes> salt = SaltFromSeed(5);
+  VaultKeys owner;
+  ASSERT_EQ(VaultKeys::Create("passphrase", salt, Fast(), &owner),
+            CryptoStatus::kOk);
+  const DeviceKeyPair one = NewDeviceKeyPair();
+  const DeviceKeyPair two = NewDeviceKeyPair();
+  ASSERT_NE(one.public_key, two.public_key);
+
+  CryptoStatus st = CryptoStatus::kOk;
+  const Epoch e = owner.current();
+  const std::string g1 = owner.SealEpochToDevice(e, one.public_key, &st);
+  ASSERT_EQ(st, CryptoStatus::kOk);
+  const std::string g2 = owner.SealEpochToDevice(e, two.public_key, &st);
+  ASSERT_EQ(st, CryptoStatus::kOk);
+  EXPECT_NE(g1, g2) << "two seals of the same key must not be identical";
+
+  VaultKeys k1;
+  VaultKeys k2;
+  ASSERT_EQ(VaultKeys::Create("passphrase", salt, Fast(), &k1),
+            CryptoStatus::kOk);
+  ASSERT_EQ(VaultKeys::Create("passphrase", salt, Fast(), &k2),
+            CryptoStatus::kOk);
+  ASSERT_EQ(k1.AcceptSealedEpoch(e, g1, one), CryptoStatus::kOk);
+  ASSERT_EQ(k2.AcceptSealedEpoch(e, g2, two), CryptoStatus::kOk);
+
+  // Neither may open the other's grant, and both must reach the same key.
+  VaultKeys wrong;
+  ASSERT_EQ(VaultKeys::Create("passphrase", salt, Fast(), &wrong),
+            CryptoStatus::kOk);
+  EXPECT_EQ(wrong.AcceptSealedEpoch(e, g1, two), CryptoStatus::kAuthFailed);
+
+  SealContext ctx;
+  ctx.epoch = e;
+  ctx.op.counter = 3;
+  SecretKey a;
+  SecretKey b;
+  ASSERT_EQ(k1.ContentKey(e, &a), CryptoStatus::kOk);
+  ASSERT_EQ(k2.ContentKey(e, &b), CryptoStatus::kOk);
+  const std::string sealed = Seal(a, ctx, "both of us can read this");
+  std::string opened;
+  EXPECT_EQ(::umbra::Open(b, ctx, sealed, &opened), CryptoStatus::kOk);
+  EXPECT_EQ(opened, "both of us can read this");
+  // And the pairing codes differ, so approving one is not approving the other.
+  const DeviceKeyPair enroller = NewDeviceKeyPair();
+  EXPECT_NE(PairingCode(enroller.public_key, one.public_key),
+            PairingCode(enroller.public_key, two.public_key));
+}
+
+// A DEVICE IS REVOKED WHILE ITS WRITES ARE IN FLIGHT.
+//
+// The writes were sealed under the old epoch before the rotation, so they are
+// readable -- rotation does not reach backwards, for the vault's own data any
+// more than for the removed device's. The point of the test is that they are
+// not silently LOST: a design that dropped everything from a revoked device
+// would destroy work the user did before they pressed the button.
+TEST(Revocation, WritesAlreadyInFlightAreStillReadableAfterTheRotation) {
+  const std::array<uint8_t, kSaltBytes> salt = SaltFromSeed(6);
+  VaultKeys owner;
+  ASSERT_EQ(VaultKeys::Create("passphrase", salt, Fast(), &owner),
+            CryptoStatus::kOk);
+  const Epoch before = owner.current();
+
+  SecretKey k_before;
+  ASSERT_EQ(owner.ContentKey(before, &k_before), CryptoStatus::kOk);
+  SealContext ctx;
+  ctx.epoch = before;
+  ctx.op.counter = 41;
+  const std::string in_flight =
+      Seal(k_before, ctx, "typed just before the button was pressed");
+
+  const Epoch after = owner.Rotate();
+  ASSERT_GT(after, before);
+
+  // The remaining device still holds the old epoch, so the in-flight write
+  // arrives and opens.
+  SecretKey still;
+  ASSERT_EQ(owner.ContentKey(before, &still), CryptoStatus::kOk);
+  std::string opened;
+  EXPECT_EQ(::umbra::Open(still, ctx, in_flight, &opened), CryptoStatus::kOk);
+  EXPECT_EQ(opened, "typed just before the button was pressed");
+
+  // But it cannot be re-sealed into the new epoch by anyone without the new
+  // key, and the old key does not open new-epoch data.
+  SealContext newer = ctx;
+  newer.epoch = after;
+  SecretKey k_after;
+  ASSERT_EQ(owner.ContentKey(after, &k_after), CryptoStatus::kOk);
+  const std::string fresh = Seal(k_after, newer, "after");
+  std::string nope;
+  EXPECT_EQ(::umbra::Open(still, newer, fresh, &nope),
+            CryptoStatus::kAuthFailed);
+}
+
 }  // namespace sync
 }  // namespace umbra

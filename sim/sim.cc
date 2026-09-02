@@ -1657,11 +1657,26 @@ void RunRelayStaleView(Sim* s) {
         if (mark == 0) continue;
         const std::map<ReplicaId, std::set<uint64_t>>::const_iterator g =
             s->replicas[i].got_tree.find(src);
-        if (g == s->replicas[i].got_tree.end() || g->second.count(mark) == 0) {
+        if (g == s->replicas[i].got_tree.end()) {
           s->result.failure = "a stale relay produced a mark of " +
                               std::to_string(mark) +
-                              " for an operation that never arrived";
+                              " for a source nothing arrived from";
           return;
+        }
+        // THE WHOLE PREFIX, not just the marked operation. Checking only that
+        // the marked operation arrived is far too weak: a mark that skipped a
+        // gap and landed on some later operation the replica does happen to
+        // hold passes that check, which is precisely the defect this schedule
+        // exists to catch. It did pass, under probe N1, until this loop was
+        // written.
+        for (uint64_t c : s->produced_tree[src]) {
+          if (c > mark) break;
+          if (g->second.count(c) == 0) {
+            s->result.failure = "a stale relay produced a mark of " +
+                                std::to_string(mark) + " while operation " +
+                                std::to_string(c) + " never arrived";
+            return;
+          }
         }
       }
     }
