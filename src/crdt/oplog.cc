@@ -10,6 +10,7 @@
 #include "basalt/posix_env.h"
 #include "basalt/slice.h"
 #include "check.h"
+#include "umbra/crypto/aead.h"
 
 namespace umbra {
 namespace {
@@ -72,6 +73,7 @@ bool ParseOpLogKey(const std::string& key, ObjectId* object, ReplicaId* replica,
 struct OpLog::Impl {
   std::unique_ptr<basalt::Env> env;
   std::unique_ptr<basalt::DB> db;
+  const VaultKeys* keys = nullptr;  // not owned; null means store plaintext
 };
 
 OpLog::OpLog() : impl_(new Impl()) {}
@@ -105,6 +107,34 @@ bool MakeDirs(const std::string& path) {
 
 }  // namespace
 
+namespace {
+
+void PutEnvelope(Epoch e, std::string* out) {
+  for (int i = 0; i < 4; ++i) {
+    out->push_back(static_cast<char>((e >> (8 * i)) & 0xFF));
+  }
+}
+
+bool GetEnvelope(const std::string& s, Epoch* e) {
+  if (s.size() < kEnvelopeBytes) return false;
+  *e = 0;
+  for (int i = 0; i < 4; ++i) {
+    *e |= static_cast<Epoch>(static_cast<unsigned char>(s[static_cast<std::size_t>(i)]))
+          << (8 * i);
+  }
+  return true;
+}
+
+}  // namespace
+
+LogStatus OpLog::OpenEncrypted(const std::string& dir, const VaultKeys* keys,
+                               std::unique_ptr<OpLog>* out) {
+  const LogStatus s = Open(dir, out);
+  if (s != LogStatus::kOk) return s;
+  (*out)->impl_->keys = keys;
+  return LogStatus::kOk;
+}
+
 LogStatus OpLog::Open(const std::string& dir, std::unique_ptr<OpLog>* out) {
   if (!MakeDirs(dir)) return LogStatus::kOpenFailed;
   std::unique_ptr<OpLog> log(new OpLog());
@@ -125,13 +155,102 @@ LogStatus OpLog::AppendRaw(const ObjectId& object,
   // these operations are there or none are, so a crash cannot leave a child
   // without its parent.
   basalt::WriteBatch batch;
+  // Values are built up front and kept alive for the whole batch: basalt::Slice
+  // does not own its bytes, so a temporary here would be a dangling read.
+  std::vector<std::string> keys_held;
+  std::vector<std::string> values_held;
+  keys_held.reserve(ops.size());
+  values_held.reserve(ops.size());
   for (const LoggedOp& op : ops) {
-    const std::string key = MakeOpLogKey(object, op.id.replica, op.id.counter);
-    batch.Set(basalt::Slice(key), basalt::Slice(op.payload.bytes));
+    keys_held.push_back(MakeOpLogKey(object, op.id.replica, op.id.counter));
+    if (impl_->keys == nullptr) {
+      values_held.push_back(op.payload.bytes);
+    } else {
+      // THE ONE PLACE ENCRYPTION HAPPENS. Above this line the system deals in
+      // OpPayload; below it, in ciphertext. No CRDT code is on either side of
+      // it.
+      const Epoch e = impl_->keys->current();
+      SecretKey k;
+      if (impl_->keys->ContentKey(e, &k) != CryptoStatus::kOk) {
+        return LogStatus::kWriteFailed;
+      }
+      SealContext ctx;
+      ctx.object = object;
+      ctx.op = op.id;
+      ctx.epoch = e;
+      std::string value;
+      PutEnvelope(e, &value);
+      value += Seal(k, ctx, op.payload.bytes);
+      values_held.push_back(value);
+    }
+  }
+  for (std::size_t i = 0; i < ops.size(); ++i) {
+    batch.Set(basalt::Slice(keys_held[i]), basalt::Slice(values_held[i]));
   }
   basalt::wal::SeqNum seq = 0;
   const basalt::Status s = impl_->db->Write(batch, &seq);
   return s.ok() ? LogStatus::kOk : LogStatus::kWriteFailed;
+}
+
+// THE ONE READ PATH, and it is one on purpose.
+//
+// Before encryption there were three readers -- ReadRaw, ReadObject and
+// ReadFrom -- each with its own iterator. Adding decryption to ReadRaw left the
+// other two returning ciphertext to a decoder, which is how
+// RelayView.TheVaultRoundTripsThroughAnEncryptedLog failed. The payload
+// boundary held on the WRITE side, where there was already a single AppendRaw;
+// it did not hold on the read side, because nobody had made the reads go
+// through one place. They do now.
+LogStatus OpLog::ReadBounded(const ObjectId& object, const std::string& lo,
+                             const std::string& hi_exclusive,
+                             std::vector<LoggedOp>* out) const {
+  basalt::IterOptions o;
+  o.lower = basalt::Bound::At(basalt::Slice(lo));
+  o.upper = basalt::Bound::At(basalt::Slice(hi_exclusive));
+  std::unique_ptr<basalt::Iterator> it = impl_->db->NewIter(o);
+  for (bool ok = it->First(); ok; ok = it->Next()) {
+    LoggedOp lop;
+    ObjectId obj;
+    if (!ParseOpLogKey(it->Key().ToString(), &obj, &lop.id.replica,
+                       &lop.id.counter)) {
+      (void)it->Close();
+      return LogStatus::kCorrupt;
+    }
+    const std::string stored = it->Value().ToString();
+    if (impl_->keys == nullptr) {
+      lop.payload.bytes = stored;
+    } else {
+      Epoch e = 0;
+      if (!GetEnvelope(stored, &e)) {
+        (void)it->Close();
+        return LogStatus::kCorrupt;
+      }
+      SecretKey k;
+      if (impl_->keys->ContentKey(e, &k) != CryptoStatus::kOk) {
+        // A payload from an epoch this device does not hold. That is what a
+        // removed device sees, and it is a legitimate outcome rather than
+        // corruption -- but this log belongs to a device that should have the
+        // key, so it is reported rather than skipped.
+        (void)it->Close();
+        return LogStatus::kCorrupt;
+      }
+      SealContext ctx;
+      ctx.object = obj;
+      ctx.op = lop.id;
+      ctx.epoch = e;
+      // Qualified: OpLog::Open is in scope here and would be found first.
+      if (::umbra::Open(k, ctx, stored.substr(kEnvelopeBytes),
+                        &lop.payload.bytes) != CryptoStatus::kOk) {
+        (void)it->Close();
+        return LogStatus::kCorrupt;
+      }
+    }
+    out->push_back(lop);
+  }
+  const basalt::Status err = it->Error();
+  (void)it->Close();
+  (void)object;
+  return err.ok() ? LogStatus::kOk : LogStatus::kReadFailed;
 }
 
 LogStatus OpLog::ReadRaw(const ObjectId& object,
@@ -143,25 +262,7 @@ LogStatus OpLog::ReadRaw(const ObjectId& object,
   }
   std::string hi = MakeOpLogKey(object, max_replica, UINT64_MAX);
   hi.push_back('\0');
-
-  basalt::IterOptions o;
-  o.lower = basalt::Bound::At(basalt::Slice(lo));
-  o.upper = basalt::Bound::At(basalt::Slice(hi));
-  std::unique_ptr<basalt::Iterator> it = impl_->db->NewIter(o);
-  for (bool ok = it->First(); ok; ok = it->Next()) {
-    LoggedOp lop;
-    ObjectId obj;
-    if (!ParseOpLogKey(it->Key().ToString(), &obj, &lop.id.replica,
-                       &lop.id.counter)) {
-      (void)it->Close();
-      return LogStatus::kCorrupt;
-    }
-    lop.payload.bytes = it->Value().ToString();
-    out->push_back(lop);
-  }
-  const basalt::Status err = it->Error();
-  (void)it->Close();
-  return err.ok() ? LogStatus::kOk : LogStatus::kReadFailed;
+  return ReadBounded(object, lo, hi, out);
 }
 
 LogStatus OpLog::AppendTree(const std::vector<TreeOp>& ops) {
@@ -217,62 +318,31 @@ LogStatus OpLog::Append(const ObjectId& object, const std::vector<Op>& ops) {
 
 LogStatus OpLog::ReadObject(const ObjectId& object,
                             std::vector<Op>* out) const {
-  // The object id is the key prefix, so the whole object is one bounded range.
-  const std::string lo = MakeOpLogKey(object, ReplicaId{}, 0);
-  ReplicaId max_replica;
-  for (std::size_t i = 0; i < max_replica.bytes.size(); ++i) {
-    max_replica.bytes[i] = 0xFF;
-  }
-  const std::string hi = MakeOpLogKey(object, max_replica, UINT64_MAX);
-
-  basalt::IterOptions o;
-  o.lower = basalt::Bound::At(basalt::Slice(lo));
-  // Upper is exclusive and the highest legal key must be included, so the bound
-  // is one byte past it rather than equal to it.
-  std::string hi_exclusive = hi;
-  hi_exclusive.push_back('\0');
-  o.upper = basalt::Bound::At(basalt::Slice(hi_exclusive));
-
-  std::unique_ptr<basalt::Iterator> it = impl_->db->NewIter(o);
-  for (bool ok = it->First(); ok; ok = it->Next()) {
-    OpPayload p;
-    p.bytes = it->Value().ToString();
+  std::vector<LoggedOp> raw;
+  const LogStatus s = ReadRaw(object, &raw);
+  if (s != LogStatus::kOk) return s;
+  for (const LoggedOp& l : raw) {
     Op op;
-    if (!DecodeOp(p, &op)) {
-      (void)it->Close();
-      return LogStatus::kCorrupt;
-    }
+    if (!DecodeOp(l.payload, &op)) return LogStatus::kCorrupt;
     out->push_back(op);
   }
-  const basalt::Status err = it->Error();
-  (void)it->Close();
-  return err.ok() ? LogStatus::kOk : LogStatus::kReadFailed;
+  return LogStatus::kOk;
 }
 
 LogStatus OpLog::ReadFrom(const ObjectId& object, const ReplicaId& replica,
                           uint64_t after, std::vector<Op>* out) const {
   const std::string lo = MakeOpLogKey(object, replica, after + 1);
-  const std::string hi = MakeOpLogKey(object, replica, UINT64_MAX);
-  std::string hi_exclusive = hi;
-  hi_exclusive.push_back('\0');
-
-  basalt::IterOptions o;
-  o.lower = basalt::Bound::At(basalt::Slice(lo));
-  o.upper = basalt::Bound::At(basalt::Slice(hi_exclusive));
-  std::unique_ptr<basalt::Iterator> it = impl_->db->NewIter(o);
-  for (bool ok = it->First(); ok; ok = it->Next()) {
-    OpPayload p;
-    p.bytes = it->Value().ToString();
+  std::string hi = MakeOpLogKey(object, replica, UINT64_MAX);
+  hi.push_back('\0');
+  std::vector<LoggedOp> raw;
+  const LogStatus s = ReadBounded(object, lo, hi, &raw);
+  if (s != LogStatus::kOk) return s;
+  for (const LoggedOp& l : raw) {
     Op op;
-    if (!DecodeOp(p, &op)) {
-      (void)it->Close();
-      return LogStatus::kCorrupt;
-    }
+    if (!DecodeOp(l.payload, &op)) return LogStatus::kCorrupt;
     out->push_back(op);
   }
-  const basalt::Status err = it->Error();
-  (void)it->Close();
-  return err.ok() ? LogStatus::kOk : LogStatus::kReadFailed;
+  return LogStatus::kOk;
 }
 
 LogStatus OpLog::Replay(const ObjectId& object, TextDoc* doc,

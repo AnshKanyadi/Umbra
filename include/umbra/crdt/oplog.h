@@ -58,6 +58,7 @@
 #include "umbra/crdt/op_id.h"
 #include "umbra/crdt/text_doc.h"
 #include "umbra/crdt/tree.h"
+#include "umbra/crypto/keys.h"
 
 namespace umbra {
 
@@ -98,9 +99,27 @@ struct LoggedOp {
   OpPayload payload;
 };
 
+// The envelope a stored value carries outside the ciphertext.
+//
+// Only the epoch, and only because the reader has to know WHICH KEY GENERATION
+// sealed the payload before it can open it. Four bytes in the clear, which the
+// threat model already concedes -- a relay can count rotations, and knowing a
+// vault rotated is not knowing anything about its contents.
+constexpr std::size_t kEnvelopeBytes = 4;
+
 class OpLog {
  public:
+  // Without keys: payloads are stored as-is. Used by tests that are about the
+  // log rather than about the crypto, and by nothing else.
   static LogStatus Open(const std::string& dir, std::unique_ptr<OpLog>* out);
+
+  // WITH KEYS, WHICH IS THE REAL CONFIGURATION. Every payload is sealed on the
+  // way in and opened on the way out, and NOTHING ELSE IN THE SYSTEM CHANGES:
+  // the CRDTs hand this an opaque OpPayload and get one back, exactly as they
+  // did before there was any encryption. `keys` is not owned and must outlive
+  // the log.
+  static LogStatus OpenEncrypted(const std::string& dir, const VaultKeys* keys,
+                                 std::unique_ptr<OpLog>* out);
   ~OpLog();
 
   // The one write path. Everything below encodes to this.
@@ -147,6 +166,12 @@ class OpLog {
 
  private:
   OpLog();
+  // Every read goes through here, which is where decryption happens. See the
+  // note in oplog.cc: having three readers is how two of them ended up handing
+  // ciphertext to a decoder.
+  LogStatus ReadBounded(const ObjectId& object, const std::string& lo,
+                        const std::string& hi_exclusive,
+                        std::vector<LoggedOp>* out) const;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

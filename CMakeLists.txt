@@ -173,6 +173,8 @@ add_library(umbra STATIC
   src/crdt/tree.cc
   src/crdt/oplog.cc
   src/crdt/vault.cc
+  src/crypto/keys.cc
+  src/crypto/aead.cc
   src/watcher/content_hash.cc
   src/watcher/object_id.cc
   src/watcher/scan.cc
@@ -190,7 +192,7 @@ add_library(umbra::umbra ALIAS umbra)
 target_include_directories(umbra
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
          $<INSTALL_INTERFACE:include>
-  PRIVATE src src/watcher src/crdt)
+  PRIVATE src src/watcher src/crdt src/crypto)
 target_compile_options(umbra PRIVATE ${UMBRA_CXX_FLAGS})
 # sodium is PRIVATE: BLAKE2b is how ContentHash is computed, which is an
 # implementation detail of this library. A consumer of <umbra/change_event.h>
@@ -270,11 +272,19 @@ add_executable(umbra_test
   test/watcher_test.cc
   test/crdt_test.cc
   test/tree_test.cc
+  test/crypto_test.cc
   test/oplog_test.cc
   test/converge_test.cc
 )
-target_link_libraries(umbra_test PRIVATE umbra_testing umbra_sim gtest_main)
-target_include_directories(umbra_test PRIVATE src src/watcher src/crdt)
+# umbra::sodium is linked into the TEST but not exposed by the library.
+#
+# The parameter test asserts that the shipped Argon2id settings equal
+# libsodium's own MODERATE constants, which means it has to see them. Asserting
+# against numbers copied into the test would assert that two copies of a number
+# match, which is not the claim being made.
+target_link_libraries(umbra_test PRIVATE umbra_testing umbra_sim umbra::sodium
+                                         gtest_main)
+target_include_directories(umbra_test PRIVATE src src/watcher src/crdt src/crypto)
 target_compile_options(umbra_test PRIVATE ${UMBRA_CXX_FLAGS})
 target_compile_definitions(umbra_test PRIVATE ${UMBRA_SANITIZER_DEFINE})
 add_test(NAME umbra_test COMMAND umbra_test)
