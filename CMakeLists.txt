@@ -277,6 +277,7 @@ add_executable(umbra_test
   test/crdt_test.cc
   test/tree_test.cc
   test/crypto_test.cc
+  test/relay_test.cc
   test/oplog_test.cc
   test/converge_test.cc
 )
