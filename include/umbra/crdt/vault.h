@@ -104,7 +104,11 @@ class Vault {
 
   // Apply a tree operation that arrived from another device. Text operations go
   // to the document; this is the other half.
+  //
+  // BOTH ADVANCE THE CLOCK. Applying an operation is seeing it, and a clock
+  // that does not move reissues counters this replica has already used.
   TreeApply ApplyTreeOp(const TreeOp& op);
+  ApplyResult ApplyOp(const ObjectId& id, const Op& op);
 
   // Lookup and inspection.
   bool ObjectAt(const std::string& path, ObjectId* out) const;

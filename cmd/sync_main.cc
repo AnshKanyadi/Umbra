@@ -92,13 +92,13 @@ bool WriteWholeFile(const std::string& path, const std::string& body) {
 
 // Every .md file under the vault, vault-relative.
 void ListVault(const std::string& root, std::vector<std::string>* out) {
-  WalkSubtree(root, std::string(), [&](const std::string& rel,
-                                       const FileState& st) {
-    if (st.is_dir || rel.empty()) return;
-    if (rel.compare(0, 7, ".umbra/") == 0) return;  // our own state
-    if (!IsVaultFile(rel)) return;
-    out->push_back(rel);
-  });
+  WalkSubtree(root, std::string(),
+              [&](const std::string& rel, const FileState& st) {
+                if (st.is_dir || rel.empty()) return;
+                if (rel.compare(0, 7, ".umbra/") == 0) return;  // our own state
+                if (!IsVaultFile(rel)) return;
+                out->push_back(rel);
+              });
 }
 
 std::array<uint8_t, kSaltBytes> LoadOrCreateSalt(const std::string& dir) {
@@ -112,12 +112,54 @@ std::array<uint8_t, kSaltBytes> LoadOrCreateSalt(const std::string& dir) {
   salt = NewSalt();
   (void)MakeDirs(dir + "/.umbra");
   (void)WriteWholeFile(
-      path, std::string(reinterpret_cast<const char*>(salt.data()), kSaltBytes));
+      path,
+      std::string(reinterpret_cast<const char*>(salt.data()), kSaltBytes));
   return salt;
 }
 
 // A stable replica id for a vault directory, so restarting the client does not
 // look like a new device.
+// Rebuild a vault from everything the log holds.
+//
+// OUT OF ORDER IS NORMAL, NOT AN ERROR. The oplog is keyed by
+// object||replica||counter, so iteration is grouped by replica: every operation
+// from A, then every operation from B. An insert of B's whose parent is a later
+// operation of A's therefore arrives before its parent and comes back
+// kNotReady, which text_doc.h says the caller must hold and retry. A loop that
+// drops those replays a DIFFERENT document than the one in memory, and the
+// client then "corrects" the file on disk to match -- which is how a line came
+// to appear twice and why both devices produced new operations every round
+// without ever settling.
+//
+// So: keep passing over the pending set until a pass applies nothing.
+void RebuildFromLog(OpLog* log, Vault* v) {
+  std::vector<TreeOp> tree_ops;
+  (void)log->ReadTree(&tree_ops);
+  // The move operation is order-independent by construction (undo, do, redo),
+  // so the tree needs no retry pass. See docs/adr/0003-tree.md.
+  for (const TreeOp& op : tree_ops) (void)v->ApplyTreeOp(op);
+
+  for (const std::pair<std::string, ObjectId>& kv : v->tree().Listing()) {
+    if (v->tree().IsDir(kv.second)) continue;
+    std::vector<Op> pending;
+    if (log->ReadObject(kv.second, &pending) != LogStatus::kOk) continue;
+    for (;;) {
+      std::vector<Op> again;
+      std::size_t applied = 0;
+      for (const Op& op : pending) {
+        const ApplyResult r = v->ApplyOp(kv.second, op);
+        if (r == ApplyResult::kApplied || r == ApplyResult::kDuplicate) {
+          ++applied;
+        } else if (r == ApplyResult::kNotReady) {
+          again.push_back(op);
+        }
+      }
+      if (again.empty() || applied == 0) break;
+      pending.swap(again);
+    }
+  }
+}
+
 ReplicaId LoadOrCreateReplica(const std::string& dir) {
   const std::string path = dir + "/.umbra/replica";
   std::string existing;
@@ -128,9 +170,9 @@ ReplicaId LoadOrCreateReplica(const std::string& dir) {
   }
   r = NewReplicaId();
   (void)MakeDirs(dir + "/.umbra");
-  (void)WriteWholeFile(path, std::string(reinterpret_cast<const char*>(
-                                             r.bytes.data()),
-                                         r.bytes.size()));
+  (void)WriteWholeFile(
+      path, std::string(reinterpret_cast<const char*>(r.bytes.data()),
+                        r.bytes.size()));
   return r;
 }
 
@@ -141,12 +183,17 @@ double SecondsSince(const std::chrono::steady_clock::time_point& t) {
 }
 
 void Usage() {
-  std::fprintf(stderr,
-               "umbra_sync --dir PATH --relay HOST:PORT --pass PASSPHRASE\n"
-               "           [--once | --watch] [--interval SECONDS] [-v]\n"
-               "\n"
-               "--pass on the command line is for driving tests. A real client\n"
-               "prompts or reads a keychain; this lands in shell history.\n");
+  std::fprintf(
+      stderr,
+      "umbra_sync --dir PATH --relay HOST:PORT --pass PASSPHRASE\n"
+      "           [--salt-from PATH] [--once | --watch]\n"
+      "           [--interval SECONDS] [-v]\n"
+      "\n"
+      "--salt-from copies another vault's .umbra/salt so the two are\n"
+      "the same vault. Enrolment carries this in a real client.\n"
+      "\n"
+      "--pass on the command line is for driving tests. A real client\n"
+      "prompts or reads a keychain; this lands in shell history.\n");
 }
 
 }  // namespace
@@ -155,6 +202,7 @@ int main(int argc, char** argv) {
   std::string dir;
   std::string relay = "127.0.0.1:9000";
   std::string pass;
+  std::string salt_from;
   bool watch = false;
   int interval = 2;
   bool verbose = false;
@@ -162,19 +210,42 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     const char* next = (i + 1 < argc) ? argv[i + 1] : nullptr;
-    if (a == "--dir" && next) { dir = next; ++i; }
-    else if (a == "--relay" && next) { relay = next; ++i; }
-    else if (a == "--pass" && next) { pass = next; ++i; }
-    else if (a == "--interval" && next) { interval = std::atoi(next); ++i; }
-    else if (a == "--watch") { watch = true; }
-    else if (a == "--once") { watch = false; }
-    else if (a == "-v") { verbose = true; }
-    else { Usage(); return 2; }
+    if (a == "--dir" && next) {
+      dir = next;
+      ++i;
+    } else if (a == "--relay" && next) {
+      relay = next;
+      ++i;
+    } else if (a == "--pass" && next) {
+      pass = next;
+      ++i;
+    } else if (a == "--salt-from" && next) {
+      salt_from = next;
+      ++i;
+    } else if (a == "--interval" && next) {
+      interval = std::atoi(next);
+      ++i;
+    } else if (a == "--watch") {
+      watch = true;
+    } else if (a == "--once") {
+      watch = false;
+    } else if (a == "-v") {
+      verbose = true;
+    } else {
+      Usage();
+      return 2;
+    }
   }
-  if (dir.empty() || pass.empty()) { Usage(); return 2; }
+  if (dir.empty() || pass.empty()) {
+    Usage();
+    return 2;
+  }
 
   const std::size_t colon = relay.rfind(':');
-  if (colon == std::string::npos) { Usage(); return 2; }
+  if (colon == std::string::npos) {
+    Usage();
+    return 2;
+  }
   const std::string host = relay.substr(0, colon);
   const uint16_t port =
       static_cast<uint16_t>(std::atoi(relay.c_str() + colon + 1));
@@ -187,6 +258,21 @@ int main(int argc, char** argv) {
 
   const auto key_start = std::chrono::steady_clock::now();
   VaultKeys keys;
+  // THE SALT IS VAULT-LEVEL, NOT DEVICE-LEVEL, and a device that generates its
+  // own is a different vault however identical its passphrase. Enrolment is
+  // what carries it between devices; --salt-from stands in for that here, and
+  // the first end-to-end run without it produced two vaults that could never
+  // see each other.
+  if (!salt_from.empty()) {
+    std::string bytes;
+    if (!ReadWholeFile(salt_from, &bytes) || bytes.size() != kSaltBytes) {
+      std::fprintf(stderr, "cannot read a %zu-byte salt from %s\n",
+                   static_cast<std::size_t>(kSaltBytes), salt_from.c_str());
+      return 1;
+    }
+    (void)MakeDirs(root + "/.umbra");
+    (void)WriteWholeFile(root + "/.umbra/salt", bytes);
+  }
   const std::array<uint8_t, kSaltBytes> salt = LoadOrCreateSalt(root);
   if (VaultKeys::Create(pass, salt, Argon2idParams::Default(), &keys) !=
       CryptoStatus::kOk) {
@@ -235,29 +321,19 @@ int main(int argc, char** argv) {
   for (;;) {
     const auto t0 = std::chrono::steady_clock::now();
 
-    // 1. Rebuild the world from the local log.
-    TreeDoc tree;
-    std::map<ReplicaId, uint64_t> high;
-    if (log->ReplayTree(&tree, &high) != LogStatus::kOk) {
-      std::fprintf(stderr, "the tree log will not replay\n");
-      return 1;
-    }
-    LamportClock clock(me);
-    for (const std::map<ReplicaId, uint64_t>::value_type& kv : high) {
-      clock.Observe(OpId{kv.second, kv.first});
-    }
-
-    std::map<ObjectId, TextDoc> docs;
-    for (const std::pair<std::string, ObjectId>& kv : tree.Listing()) {
-      TextDoc d;
-      std::map<ReplicaId, uint64_t> h;
-      if (log->Replay(kv.second, &d, &h) == LogStatus::kOk) {
-        for (const std::map<ReplicaId, uint64_t>::value_type& e : h) {
-          clock.Observe(OpId{e.second, e.first});
-        }
-        docs[kv.second] = d;
-      }
-    }
+    // 1. REBUILD THE WORLD ONCE, INTO ONE VAULT, AND KEEP IT FOR THE WHOLE
+    // ROUND. An earlier version kept a separate document map filled from the
+    // log BEFORE the local edits were appended, then applied the remote
+    // operations onto that stale copy and wrote the result to disk. A device
+    // therefore erased its own edit every time it pulled: the run where A
+    // wrote "- two from A", pushed it, and then overwrote its own file with a
+    // version that did not contain it.
+    //
+    // The vault holds the local edits (ApplyChange applies as it produces) and
+    // the remote ones (ApplyOp / ApplyTreeOp below), so there is one document
+    // per object and no second copy to fall behind.
+    Vault v(me);
+    RebuildFromLog(log.get(), &v);
 
     // 2. What is on disk that the vault does not know about, or differs.
     std::vector<std::string> on_disk;
@@ -267,18 +343,10 @@ int main(int argc, char** argv) {
       std::string body;
       if (!ReadWholeFile(root + "/" + rel, &body)) continue;
       ObjectId id;
-      const bool known = tree.Resolve(rel, &id) && !IsTreeRoot(id);
-      if (known && docs.count(id) != 0 && docs[id].Text() == body) continue;
-
-      Vault v(me);
-      // Seed the vault's tree and document with what the log already says, so
-      // the change it produces is a diff rather than a rewrite.
-      for (const TreeOp& op : [&] {
-             std::vector<TreeOp> all;
-             (void)log->ReadTree(&all);
-             return all;
-           }()) {
-        (void)v.ApplyTreeOp(op);
+      const bool known = v.ObjectAt(rel, &id);
+      if (known) {
+        const TextDoc* d = v.Doc(id);
+        if (d != nullptr && d->Text() == body) continue;
       }
       ChangeEvent e;
       e.kind = known ? ChangeKind::kModified : ChangeKind::kCreated;
@@ -291,12 +359,10 @@ int main(int argc, char** argv) {
         }
         continue;
       }
-      if (!c.tree_ops.empty()) {
-        if (log->AppendTree(c.tree_ops) != LogStatus::kOk) return 1;
-      }
-      if (!c.ops.empty()) {
-        if (log->Append(c.object, c.ops) != LogStatus::kOk) return 1;
-      }
+      if (!c.tree_ops.empty() && log->AppendTree(c.tree_ops) != LogStatus::kOk)
+        return 1;
+      if (!c.ops.empty() && log->Append(c.object, c.ops) != LogStatus::kOk)
+        return 1;
       local_changes += c.ops.size() + c.tree_ops.size();
     }
     if (local_changes > 0 && log->Sync() != LogStatus::kOk) return 1;
@@ -305,11 +371,14 @@ int main(int argc, char** argv) {
     const auto push_start = std::chrono::steady_clock::now();
     std::size_t pushed = 0;
     std::size_t n = 0;
-    if (client.PushObject(TreeObject(), &n) == sync::SyncStatus::kOk) pushed += n;
-    for (const std::pair<std::string, ObjectId>& kv : tree.Listing()) {
-      if (client.PushObject(kv.second, &n) == sync::SyncStatus::kOk) pushed += n;
+    if (client.PushObject(TreeObject(), &n) == sync::SyncStatus::kOk)
+      pushed += n;
+    for (const std::pair<std::string, ObjectId>& kv : v.tree().Listing()) {
+      if (v.tree().IsDir(kv.second)) continue;
+      if (client.PushObject(kv.second, &n) == sync::SyncStatus::kOk)
+        pushed += n;
     }
-    (void)client.PublishReport(clock.counter(), {TreeObject()}, me);
+    (void)client.PublishReport(v.clock()->counter(), {TreeObject()}, me);
     const double push_seconds = SecondsSince(push_start);
 
     const auto pull_start = std::chrono::steady_clock::now();
@@ -336,10 +405,10 @@ int main(int argc, char** argv) {
       sync::FetchStats st;
       const sync::SyncStatus s = client.FetchObject(
           TreeObject(), d,
-          [&tree](const OpPayload& p) {
+          [&v](const OpPayload& p) {
             TreeOp op;
             if (!DecodeTreeOp(p, &op)) return false;
-            return tree.Apply(op) != TreeApply::kMalformed;
+            return v.ApplyTreeOp(op) != TreeApply::kMalformed;
           },
           &st);
       if (s != sync::SyncStatus::kOk && verbose) {
@@ -349,17 +418,20 @@ int main(int argc, char** argv) {
       applied += st.applied;
     }
     // Objects can only be fetched once the tree names them.
-    for (const std::pair<std::string, ObjectId>& kv : tree.Listing()) {
+    for (const std::pair<std::string, ObjectId>& kv : v.tree().Listing()) {
+      if (v.tree().IsDir(kv.second)) continue;
+      const ObjectId object = kv.second;
       for (const ReplicaId& d : devices) {
         if (d == me) continue;
-        TextDoc& doc = docs[kv.second];
         sync::FetchStats st;
         const sync::SyncStatus s = client.FetchObject(
-            kv.second, d,
-            [&doc](const OpPayload& p) {
+            object, d,
+            [&v, &object](const OpPayload& p) {
               Op op;
               if (!DecodeOp(p, &op)) return false;
-              return doc.Apply(op) != ApplyResult::kMalformed;
+              // kNotReady is not a refusal: the operation is real and the
+              // log keeps it. Only a malformed one breaks the fetch.
+              return v.ApplyOp(object, op) != ApplyResult::kMalformed;
             },
             &st);
         if (s != sync::SyncStatus::kOk && verbose) {
@@ -369,15 +441,37 @@ int main(int argc, char** argv) {
         applied += st.applied;
       }
     }
+    // THE PULL MUST BE DURABLE. FetchObject persists each operation and its
+    // cursor through the log, but nothing forced those to disk, so a process
+    // that exited here came back with the cursor at zero and re-applied
+    // everything.
+    if (applied > 0 && log->Sync() != LogStatus::kOk) return 1;
+    // WRITE BACK WHAT THE LOG REPLAYS, NOT WHAT MEMORY HOLDS. The fetch
+    // callback accepts an operation the document is not ready for -- it is in
+    // the log, and holding it there is the point -- so the in-memory vault can
+    // be missing operations the next round will replay. Rebuilding here makes
+    // the file on disk equal to the document the next scan will diff against,
+    // which is the invariant that stops the client generating operations
+    // forever.
+    if (applied > 0) {
+      v = Vault(me);
+      RebuildFromLog(log.get(), &v);
+    }
     const double pull_seconds = SecondsSince(pull_start);
 
     // 4. Write the merged result back to the folder.
     std::size_t written = 0;
-    for (const std::pair<std::string, ObjectId>& kv : tree.Listing()) {
-      const std::map<ObjectId, TextDoc>::const_iterator it =
-          docs.find(kv.second);
-      if (it == docs.end()) continue;
-      const std::string want = it->second.Text();
+    for (const std::pair<std::string, ObjectId>& kv : v.tree().Listing()) {
+      // A directory node is a directory. Materialising it through the text
+      // path wrote an empty FILE named notes, after which the real
+      // notes/meeting.md could not be created at all.
+      if (v.tree().IsDir(kv.second)) {
+        (void)MakeDirs(root + "/" + kv.first);
+        continue;
+      }
+      const TextDoc* d = v.Doc(kv.second);
+      if (d == nullptr) continue;
+      const std::string want = d->Text();
       std::string have;
       if (ReadWholeFile(root + "/" + kv.first, &have) && have == want) continue;
       if (WriteWholeFile(root + "/" + kv.first, want)) ++written;

@@ -70,7 +70,25 @@ const TextDoc* Vault::Doc(const ObjectId& id) const {
   return it == docs_.end() ? nullptr : &it->second;
 }
 
-TreeApply Vault::ApplyTreeOp(const TreeOp& op) { return tree_.Apply(op); }
+// A REPLICA THAT APPLIES AN OPERATION HAS SEEN IT, so the clock must move.
+// Without this, a vault seeded from its own log or from a peer issues its next
+// operation at counter 1 and silently overwrites what it just learned: the
+// oplog is keyed by object||replica||counter, so a duplicate counter from the
+// same replica is not a conflict, it is a lost write. The first end-to-end run
+// lost a file exactly this way -- three tree operations were created, all at
+// counter 1, and one survived.
+TreeApply Vault::ApplyTreeOp(const TreeOp& op) {
+  clock_.Observe(op.id);
+  return tree_.Apply(op);
+}
+
+ApplyResult Vault::ApplyOp(const ObjectId& id, const Op& op) {
+  // LastId, not op.id: a run insert owns a range of counters and a clock told
+  // only about the first hands out the second next. op.h says so; this is the
+  // second time that has been worth writing down.
+  clock_.Observe(LastId(op));
+  return docs_[id].Apply(op);
+}
 
 bool Vault::FoldedClash(const std::string& path, std::string* existing) const {
   const std::string folded = FoldCase(path);

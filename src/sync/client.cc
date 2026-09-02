@@ -280,6 +280,10 @@ SyncStatus Client::CollectReports(const std::vector<ReplicaId>& enrolled,
 bool Client::RelayLooksStale(const std::vector<ReplicaId>& enrolled,
                              std::string* why) {
   for (const ReplicaId& d : enrolled) {
+    // Never our own report. This device does not fetch from itself, so its
+    // cursor for itself is always zero and comparing the two would report every
+    // relay as stale.
+    if (d == self_) continue;
     const std::map<ReplicaId, DeviceReport>::const_iterator it =
         last_reports_.find(d);
     if (it == last_reports_.end()) continue;

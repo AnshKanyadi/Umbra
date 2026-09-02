@@ -4,6 +4,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <algorithm>
+#include <set>
 
 #include <string>
 #include <vector>
@@ -513,4 +515,166 @@ TEST(Vault, OperationsFromAVaultReplayThroughTheOpLog) {
 }
 
 }  // namespace
+
+// A vault seeded from a log or from a peer must not reissue counters it has
+// already seen. This is the defect the first end-to-end run hit: three tree
+// operations were produced for one round, every one of them at counter 1, and
+// because the oplog is keyed by object||replica||counter the last write won and
+// a file disappeared. The test asserts the counters are distinct rather than
+// asserting the clock's value, because distinctness is the property the log
+// actually depends on.
+TEST(Vault, ASeededVaultDoesNotReissueCountersItHasSeen) {
+  const ReplicaId r = NewReplicaId();
+  Vault a(r);
+
+  ChangeEvent e1;
+  e1.kind = ChangeKind::kCreated;
+  e1.path = "notes/one.md";
+  const ChangeOutcome c1 = a.ApplyChange(e1, "first\n");
+  ASSERT_EQ(c1.status, VaultOutcome::kOk);
+  ASSERT_FALSE(c1.tree_ops.empty());
+
+  // A second vault for the SAME replica, rebuilt from what the first produced,
+  // as a client does on every start.
+  Vault b(r);
+  for (const TreeOp& op : c1.tree_ops)
+    EXPECT_NE(b.ApplyTreeOp(op), TreeApply::kMalformed);
+  for (const Op& op : c1.ops)
+    EXPECT_NE(b.ApplyOp(c1.object, op), ApplyResult::kMalformed);
+
+  ChangeEvent e2;
+  e2.kind = ChangeKind::kCreated;
+  e2.path = "notes/two.md";
+  const ChangeOutcome c2 = b.ApplyChange(e2, "second\n");
+  ASSERT_EQ(c2.status, VaultOutcome::kOk);
+
+  std::set<uint64_t> seen;
+  for (const TreeOp& op : c1.tree_ops)
+    EXPECT_TRUE(seen.insert(op.id.counter).second);
+  for (const TreeOp& op : c2.tree_ops) {
+    EXPECT_TRUE(seen.insert(op.id.counter).second)
+        << "tree counter " << op.id.counter << " was reissued after a replay";
+  }
+}
+
+// The same property for text: a document rebuilt from its own operations must
+// continue the counter sequence rather than restart it.
+TEST(Vault, ASeededDocumentContinuesItsCounterSequence) {
+  const ReplicaId r = NewReplicaId();
+  Vault a(r);
+  ChangeEvent e;
+  e.kind = ChangeKind::kCreated;
+  e.path = "n.md";
+  const ChangeOutcome first = a.ApplyChange(e, "ab");
+  ASSERT_EQ(first.status, VaultOutcome::kOk);
+
+  Vault b(r);
+  for (const TreeOp& op : first.tree_ops) (void)b.ApplyTreeOp(op);
+  for (const Op& op : first.ops) (void)b.ApplyOp(first.object, op);
+
+  ChangeEvent m;
+  m.kind = ChangeKind::kModified;
+  m.path = "n.md";
+  const ChangeOutcome second = b.ApplyChange(m, "abc");
+  ASSERT_EQ(second.status, VaultOutcome::kOk);
+  ASSERT_FALSE(second.ops.empty());
+
+  uint64_t highest = 0;
+  for (const Op& op : first.ops) highest = std::max(highest, op.id.counter);
+  for (const Op& op : second.ops) {
+    EXPECT_GT(op.id.counter, highest)
+        << "text counter " << op.id.counter << " was reissued after a replay";
+  }
+}
+
+// The oplog is keyed by object||replica||counter, so reading an object back
+// yields every operation from one replica, then every operation from the next.
+// THAT IS NOT CAUSAL ORDER. A replica whose id sorts low can hold an insert
+// whose parent belongs to a replica whose id sorts high, and that insert comes
+// back before the node it hangs from.
+//
+// text_doc.h says kNotReady means hold it and retry. A client that instead
+// drops it replays a shorter document than the one it had in memory, writes
+// that to disk, and the next scan reads the difference back as a local edit --
+// which is how a line came to be inserted twice and why two devices produced
+// operations every round without ever settling. cmd/sync_main.cc RebuildFromLog
+// is the retry loop; this is the property it exists for.
+TEST(OpLog, ReplayingInLogOrderNeedsARetryPass) {
+  TempDir dir;
+  std::unique_ptr<OpLog> log;
+  ASSERT_EQ(OpLog::Open(dir.path(), &log), LogStatus::kOk);
+
+  // Chosen, not random: the replica that DEPENDS sorts first, so the log hands
+  // its operation back before the one it needs.
+  ReplicaId later;    // writes first, sorts second
+  ReplicaId earlier;  // writes second, sorts first
+  later.bytes.fill(0x02);
+  earlier.bytes.fill(0x01);
+  ASSERT_TRUE(earlier < later);
+
+  const ObjectId object = ObjectFromSeed(42);
+
+  TextDoc first;
+  LamportClock c1(later);
+  std::vector<Op> ops_later;
+  ASSERT_TRUE(first.LocalInsert(0, "hello", &c1, &ops_later));
+
+  // The second replica has seen the first, so its insert hangs off a node the
+  // first replica created.
+  TextDoc second;
+  LamportClock c2(earlier);
+  for (const Op& op : ops_later) {
+    ASSERT_EQ(second.Apply(op), ApplyResult::kApplied);
+    c2.Observe(LastId(op));
+  }
+  std::vector<Op> ops_earlier;
+  ASSERT_TRUE(second.LocalInsert(5, " world", &c2, &ops_earlier));
+  const std::string want = second.Text();
+  ASSERT_EQ(want, "hello world");
+
+  ASSERT_EQ(log->Append(object, ops_later), LogStatus::kOk);
+  ASSERT_EQ(log->Append(object, ops_earlier), LogStatus::kOk);
+  ASSERT_EQ(log->Sync(), LogStatus::kOk);
+
+  std::vector<Op> in_log_order;
+  ASSERT_EQ(log->ReadObject(object, &in_log_order), LogStatus::kOk);
+  ASSERT_EQ(in_log_order.size(), ops_later.size() + ops_earlier.size());
+  EXPECT_EQ(in_log_order.front().id.replica, earlier)
+      << "the log did not order by replica, so this test proves nothing";
+
+  // One pass, dropping what is not ready: this is the defect.
+  {
+    TextDoc naive;
+    std::size_t not_ready = 0;
+    for (const Op& op : in_log_order) {
+      if (naive.Apply(op) == ApplyResult::kNotReady) ++not_ready;
+    }
+    EXPECT_GT(not_ready, 0u)
+        << "no operation arrived early; the case is not set up";
+    EXPECT_NE(naive.Text(), want)
+        << "a single pass happened to be enough, so the retry loop is untested";
+  }
+
+  // The retry loop, which is what the client does.
+  {
+    TextDoc doc;
+    std::vector<Op> pending = in_log_order;
+    for (;;) {
+      std::vector<Op> again;
+      std::size_t applied = 0;
+      for (const Op& op : pending) {
+        const ApplyResult r = doc.Apply(op);
+        if (r == ApplyResult::kApplied || r == ApplyResult::kDuplicate) {
+          ++applied;
+        } else if (r == ApplyResult::kNotReady) {
+          again.push_back(op);
+        }
+      }
+      if (again.empty() || applied == 0) break;
+      pending.swap(again);
+    }
+    EXPECT_EQ(doc.Text(), want);
+  }
+}
+
 }  // namespace umbra
