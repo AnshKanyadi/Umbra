@@ -59,6 +59,16 @@ const char* AdversarialName(Adversarial a) {
       return "crash-after-every-apply";
     case Adversarial::kCompactThenEdit:
       return "compact-then-edit";
+    case Adversarial::kTreeRenameCycleThreeWay:
+      return "tree-rename-cycle-three-way";
+    case Adversarial::kTreeMoveWhileEditingInside:
+      return "tree-move-while-editing-inside";
+    case Adversarial::kTreeMoveIntoDeleted:
+      return "tree-move-into-deleted";
+    case Adversarial::kTreeMoveIntoEachOther:
+      return "tree-move-into-each-other";
+    case Adversarial::kTreeRandom:
+      return "tree-random";
   }
   return "unknown";
 }
@@ -73,6 +83,131 @@ void Oracle::RecordInsert(const Op& op, bool contiguity_exempt) {
 
 void Oracle::RecordDelete(const Op& op) {
   for (uint32_t i = 0; i < op.count; ++i) deleted_.insert(op.target.Plus(i));
+}
+
+// ------------------------------------------------------------- tree oracle
+
+namespace {
+
+struct ModelEntry {
+  ObjectId parent;
+  std::string name;
+  bool is_dir = false;
+};
+using Model = std::map<ObjectId, ModelEntry>;
+
+bool ModelWouldCycle(const Model& m, const ObjectId& child,
+                     const ObjectId& parent) {
+  if (child == parent) return true;
+  ObjectId cur = parent;
+  std::size_t steps = 0;
+  while (!IsTreeRoot(cur) && !IsTreeTrash(cur)) {
+    if (cur == child) return true;
+    const Model::const_iterator it = m.find(cur);
+    if (it == m.end()) return false;
+    cur = it->second.parent;
+    if (++steps > m.size() + 2) return true;  // a cycle already, refuse
+  }
+  return false;
+}
+
+bool ModelPathOf(const Model& m, const ObjectId& id, std::string* out) {
+  if (IsTreeRoot(id)) {
+    out->clear();
+    return true;
+  }
+  std::vector<std::string> parts;
+  ObjectId cur = id;
+  std::size_t steps = 0;
+  while (!IsTreeRoot(cur)) {
+    if (IsTreeTrash(cur)) return false;
+    const Model::const_iterator it = m.find(cur);
+    if (it == m.end()) return false;
+    parts.push_back(it->second.name);
+    cur = it->second.parent;
+    if (++steps > m.size() + 2) return false;
+  }
+  std::string path;
+  for (std::vector<std::string>::reverse_iterator it = parts.rbegin();
+       it != parts.rend(); ++it) {
+    if (!path.empty()) path.push_back('/');
+    path += *it;
+  }
+  *out = path;
+  return true;
+}
+
+}  // namespace
+
+void TreeOracle::Record(const TreeOp& op) { ops_.push_back(op); }
+
+std::string TreeOracle::Check(const TreeDoc& tree) const {
+  // THE INDEPENDENT MODEL: sort every operation by timestamp and apply in that
+  // order with the cycle rule, and nothing else. No undo, no redo, no log.
+  //
+  // That is the whole claim TreeDoc makes -- that incrementally undoing and
+  // redoing reaches the same place as sorting would have -- so computing it the
+  // other way is a real second opinion rather than a restatement.
+  std::vector<TreeOp> sorted = ops_;
+  std::sort(sorted.begin(), sorted.end(),
+            [](const TreeOp& a, const TreeOp& b) { return a.id < b.id; });
+
+  Model model;
+  for (const TreeOp& op : sorted) {
+    if (ModelWouldCycle(model, op.child, op.parent)) continue;  // ignored
+    ModelEntry e;
+    e.parent = op.parent;
+    e.name = op.name;
+    e.is_dir = op.is_dir;
+    model[op.child] = e;
+  }
+
+  std::vector<std::pair<std::string, ObjectId>> want;
+  for (const Model::value_type& kv : model) {
+    std::string p;
+    if (!ModelPathOf(model, kv.first, &p)) continue;  // trashed or detached
+    want.emplace_back(p, kv.first);
+  }
+  std::sort(want.begin(), want.end());
+
+  const std::vector<std::pair<std::string, ObjectId>> got = tree.Listing();
+  if (want.size() != got.size()) {
+    std::ostringstream os;
+    os << "the tree has " << got.size() << " live paths, the model expects "
+       << want.size();
+    // Naming the first difference is worth more than the counts.
+    std::set<std::string> gp;
+    for (const std::pair<std::string, ObjectId>& kv : got) gp.insert(kv.first);
+    for (const std::pair<std::string, ObjectId>& kv : want) {
+      if (gp.count(kv.first) == 0) {
+        os << "; missing \"" << kv.first << "\"";
+        break;
+      }
+    }
+    return os.str();
+  }
+  for (std::size_t i = 0; i < want.size(); ++i) {
+    if (want[i].first != got[i].first) {
+      return "path mismatch: model says \"" + want[i].first +
+             "\", tree says \"" + got[i].first + "\"";
+    }
+    if (!(want[i].second == got[i].second)) {
+      return "\"" + want[i].first +
+             "\" holds a different object than the model expects";
+    }
+  }
+
+  // EVERY NODE STILL EXISTS SOMEWHERE. A cycle in the tree makes nodes
+  // unreachable, which the listing comparison above would catch as a missing
+  // path -- but a node moved to the trash is legitimately absent from the
+  // listing, so this checks the stronger thing separately.
+  for (const Model::value_type& kv : model) {
+    if (!tree.Exists(kv.first)) {
+      return "node " + kv.first.ToHex().substr(0, 8) +
+             " was moved at least once and is not in the tree at all";
+    }
+  }
+  return std::string();
 }
 
 bool ScheduleRequiresContiguousRuns(Adversarial a) {
@@ -91,6 +226,11 @@ bool ScheduleRequiresContiguousRuns(Adversarial a) {
     case Adversarial::kDuplicateAndReverse:
     case Adversarial::kCrashAfterEveryApply:
     case Adversarial::kCompactThenEdit:
+    case Adversarial::kTreeRandom:
+    case Adversarial::kTreeMoveIntoEachOther:
+    case Adversarial::kTreeMoveIntoDeleted:
+    case Adversarial::kTreeMoveWhileEditingInside:
+    case Adversarial::kTreeRenameCycleThreeWay:
       return false;
   }
   return false;
@@ -204,6 +344,12 @@ struct Sim {
   std::vector<Replica> replicas;
   std::vector<Message> in_flight;
   Oracle oracle;
+  TreeOracle tree_oracle;
+  // Object ids handed out by this simulation, so a schedule can move one.
+  std::vector<ObjectId> objects;
+  std::vector<ObjectId> dirs;
+  // What each replica has produced, so the final flush can re-offer it.
+  std::vector<std::vector<TreeOp>> tree_log;
   // partition[i] is the step at which replica i rejoins. Steps below it mean
   // isolated.
   std::vector<std::size_t> isolated_until;
@@ -215,6 +361,7 @@ struct Sim {
     result.seed = seed;
     replicas.resize(cfg.replicas);
     isolated_until.assign(cfg.replicas, 0);
+    tree_log.resize(cfg.replicas);
     for (std::size_t i = 0; i < cfg.replicas; ++i) {
       // Derived from the seed AND the index, so a seed fixes the whole replica
       // set and two runs of the same seed use the same ids -- which is what
@@ -267,15 +414,87 @@ struct Sim {
       ++result.ops;
       for (std::size_t j = 0; j < replicas.size(); ++j) {
         if (j == i) continue;
-        in_flight.push_back(Message{j, op});
+        Message m;
+        m.to = j;
+        m.op = op;
+        in_flight.push_back(m);
       }
     }
+  }
+
+  // A tree operation this replica produced. Same rules as text: it is durable
+  // before it is published, and the applied-but-unpersisted prefix goes with
+  // it.
+  void OriginateTree(std::size_t i, const TreeOp& op) {
+    tree_oracle.Record(op);
+    tree_log[i].push_back(op);
+    ++result.tree_ops;
+    replicas[i].received.insert(op.id);
+    for (std::size_t j = 0; j < replicas.size(); ++j) {
+      if (j == i) continue;
+      Message m;
+      m.to = j;
+      m.is_tree = true;
+      m.tree_op = op;
+      in_flight.push_back(m);
+    }
+  }
+
+  // Allocate an object id deterministically from the seed, so a failing seed
+  // replays with the same ids.
+  ObjectId NextObjectId() {
+    ObjectId id;
+    const uint64_t a = rng.Next();
+    const uint64_t b = rng.Next();
+    for (int k = 0; k < 8; ++k) {
+      id.bytes[static_cast<std::size_t>(k)] =
+          static_cast<uint8_t>((a >> (56 - 8 * k)) & 0xFF);
+      id.bytes[static_cast<std::size_t>(8 + k)] =
+          static_cast<uint8_t>((b >> (56 - 8 * k)) & 0xFF);
+    }
+    // Keep clear of the reserved ids, which are all-zero but for the last byte.
+    id.bytes[0] |= 0x40;
+    return id;
   }
 
   void Commit(std::size_t i) {
     Replica& r = replicas[i];
     for (const Op& op : r.uncommitted) r.durable.push_back(op);
     r.uncommitted.clear();
+  }
+
+  void DeliverTree(std::size_t to, const TreeOp& op) {
+    Replica& r = replicas[to];
+    r.received.insert(op.id);
+    ++result.deliveries;
+    const TreeApply res = r.tree.Apply(op);
+    switch (res) {
+      case TreeApply::kApplied:
+      case TreeApply::kDuplicate:
+        r.clock.Observe(op.id);
+        break;
+      case TreeApply::kIgnoredCycle:
+        // NOT AN ERROR. It is the defined outcome for a move that would make a
+        // node its own ancestor, and both replicas must reach it for the same
+        // operation. Counted so the report can say the schedules actually
+        // produced cycles rather than merely claiming to.
+        r.clock.Observe(op.id);
+        ++result.cycles_refused;
+        break;
+      case TreeApply::kMalformed:
+        result.failure =
+            "replica " + std::to_string(to) +
+            " called a generated tree operation malformed: " + op.ToString();
+        break;
+    }
+  }
+
+  void DeliverMessage(const Message& m) {
+    if (m.is_tree) {
+      DeliverTree(m.to, m.tree_op);
+    } else {
+      Deliver(m.to, m.op);
+    }
   }
 
   // Deliver one operation into a replica, buffering it if it is early.
@@ -460,12 +679,30 @@ struct Sim {
         // ONLY WHAT THE PEER HAS NOT BEEN SENT. See Replica::received.
         for (const Op& op : replicas[i].durable) {
           if (replicas[j].received.count(op.id) == 0) {
-            in_flight.push_back(Message{j, op});
+            Message m;
+            m.to = j;
+            m.op = op;
+            in_flight.push_back(m);
           }
         }
         for (const Op& op : replicas[i].uncommitted) {
           if (replicas[j].received.count(op.id) == 0) {
-            in_flight.push_back(Message{j, op});
+            Message m;
+            m.to = j;
+            m.op = op;
+            in_flight.push_back(m);
+          }
+        }
+        // Tree operations too. A replica's tree log is durable by construction
+        // -- there is no uncommitted tier for it, because a tree operation is
+        // never not-ready and so never waits.
+        for (const TreeOp& op : tree_log[i]) {
+          if (replicas[j].received.count(op.id) == 0) {
+            Message m;
+            m.to = j;
+            m.is_tree = true;
+            m.tree_op = op;
+            in_flight.push_back(m);
           }
         }
       }
@@ -475,7 +712,7 @@ struct Sim {
     for (int round = 0; round < 64 && !in_flight.empty(); ++round) {
       std::vector<Message> batch;
       batch.swap(in_flight);
-      for (const Message& m : batch) Deliver(m.to, m.op);
+      for (const Message& m : batch) DeliverMessage(m);
       for (std::size_t i = 0; i < replicas.size(); ++i) DrainPending(i);
     }
     for (std::size_t i = 0; i < replicas.size(); ++i) Commit(i);
@@ -521,12 +758,40 @@ struct Sim {
                " operations it could never apply:" + detail;
       }
     }
-    // 3. And the agreed answer is the right one.
+    // 3. All replicas agree on the SHAPE of the vault, not only its contents.
+    const std::string tref = replicas[0].tree.StateHash();
+    for (std::size_t i = 1; i < replicas.size(); ++i) {
+      if (replicas[i].tree.StateHash() != tref) {
+        std::ostringstream os;
+        os << "replicas 0 and " << i << " have different trees\n";
+        for (const std::pair<std::string, ObjectId>& kv :
+             replicas[0].tree.Listing()) {
+          os << "  0: " << kv.first << "\n";
+        }
+        for (const std::pair<std::string, ObjectId>& kv :
+             replicas[i].tree.Listing()) {
+          os << "  " << i << ": " << kv.first << "\n";
+        }
+        return os.str();
+      }
+    }
+
+    // 4. And the agreed answers are the right ones.
     const std::string oracle_says =
         oracle.Check(replicas[0].doc, require_contiguous_runs);
     if (!oracle_says.empty()) {
       return "all replicas agree on a document the reference model rejects: " +
              oracle_says + "\n  text: " + Quote(ref);
+    }
+    const std::string tree_says = tree_oracle.Check(replicas[0].tree);
+    if (!tree_says.empty()) {
+      std::string listing;
+      for (const std::pair<std::string, ObjectId>& kv :
+           replicas[0].tree.Listing()) {
+        listing += "\n    " + kv.first;
+      }
+      return "all replicas agree on a tree the reference model rejects: " +
+             tree_says + listing;
     }
     result.final_text = ref;
     return std::string();
@@ -723,6 +988,194 @@ void RunDuplicateAndReverse(Sim* s) {
 // Edit, settle, compact EVERYWHERE at once, then edit again. The second half is
 // the point: it asks whether operations produced after a compaction round still
 // apply, on replicas that compacted and on the tree that is left.
+// ------------------------------------------------------------ tree schedules
+
+namespace {
+
+// Give every replica the same starting tree, delivered directly so the setup is
+// not itself the thing under test.
+std::vector<TreeOp> SeedTree(Sim* s, const std::vector<std::string>& dir_names,
+                             std::vector<ObjectId>* dirs) {
+  std::vector<TreeOp> ops;
+  for (const std::string& name : dir_names) {
+    const ObjectId id = s->NextObjectId();
+    const TreeOp op = s->replicas[0].tree.MakeMove(id, TreeRoot(), name, true,
+                                                   &s->replicas[0].clock);
+    if (s->replicas[0].tree.Apply(op) != TreeApply::kApplied) continue;
+    s->tree_oracle.Record(op);
+    s->tree_log[0].push_back(op);
+    s->replicas[0].received.insert(op.id);
+    ++s->result.tree_ops;
+    ops.push_back(op);
+    dirs->push_back(id);
+  }
+  for (std::size_t i = 1; i < s->replicas.size(); ++i) {
+    for (const TreeOp& op : ops) s->DeliverTree(i, op);
+  }
+  return ops;
+}
+
+// A file under `parent` on replica i, with content, published.
+ObjectId MakeFile(Sim* s, std::size_t i, const ObjectId& parent,
+                  const std::string& name) {
+  const ObjectId id = s->NextObjectId();
+  const TreeOp op = s->replicas[i].tree.MakeMove(id, parent, name, false,
+                                                 &s->replicas[i].clock);
+  if (s->replicas[i].tree.Apply(op) == TreeApply::kMalformed) return id;
+  s->OriginateTree(i, op);
+  return id;
+}
+
+void MoveNode(Sim* s, std::size_t i, const ObjectId& child,
+              const ObjectId& parent, const std::string& name, bool is_dir) {
+  const TreeOp op = s->replicas[i].tree.MakeMove(child, parent, name, is_dir,
+                                                 &s->replicas[i].clock);
+  const TreeApply r = s->replicas[i].tree.Apply(op);
+  if (r == TreeApply::kMalformed) return;
+  if (r == TreeApply::kIgnoredCycle) ++s->result.cycles_refused;
+  s->OriginateTree(i, op);
+}
+
+}  // namespace
+
+// Tree operations mixed in with text ones, under the same partitions,
+// reordering, duplication and crashes.
+void RunTreeRandom(Sim* s) {
+  std::vector<ObjectId> dirs;
+  SeedTree(s, {"a", "b", "c"}, &dirs);
+  std::vector<ObjectId> files;
+  for (s->step = 0; s->step < s->cfg.steps; ++s->step) {
+    const std::size_t n = s->replicas.size();
+    const std::size_t who = static_cast<std::size_t>(s->rng.Below(n));
+    const uint64_t what = s->rng.Below(100);
+    if (what < 20) {
+      const ObjectId parent = dirs[static_cast<std::size_t>(
+          s->rng.Below(static_cast<uint64_t>(dirs.size())))];
+      files.push_back(
+          MakeFile(s, who, parent, "f" + std::to_string(s->step) + ".md"));
+    } else if (what < 35 && !files.empty()) {
+      const ObjectId child = files[static_cast<std::size_t>(
+          s->rng.Below(static_cast<uint64_t>(files.size())))];
+      const ObjectId parent = dirs[static_cast<std::size_t>(
+          s->rng.Below(static_cast<uint64_t>(dirs.size())))];
+      MoveNode(s, who, child, parent, "m" + std::to_string(s->step) + ".md",
+               false);
+    } else if (what < 42 && !files.empty()) {
+      const ObjectId child = files[static_cast<std::size_t>(
+          s->rng.Below(static_cast<uint64_t>(files.size())))];
+      MoveNode(s, who, child, TreeTrash(), "gone.md", false);
+    } else if (what < 50) {
+      // Move a DIRECTORY into another, which is where cycles come from.
+      const ObjectId child = dirs[static_cast<std::size_t>(
+          s->rng.Below(static_cast<uint64_t>(dirs.size())))];
+      const ObjectId parent = dirs[static_cast<std::size_t>(
+          s->rng.Below(static_cast<uint64_t>(dirs.size())))];
+      if (!(child == parent)) MoveNode(s, who, child, parent, "d", true);
+    } else if (what < 75) {
+      s->LocalEdit(who);
+    }
+    if (!s->in_flight.empty() && s->rng.Chance(60)) {
+      const std::size_t k =
+          static_cast<std::size_t>(s->rng.Below(s->in_flight.size()));
+      const Message m = s->in_flight[k];
+      s->in_flight.erase(s->in_flight.begin() + static_cast<long>(k));
+      if (s->Isolated(m.to)) {
+        s->in_flight.push_back(m);
+      } else {
+        s->DeliverMessage(m);
+        if (s->rng.Chance(s->cfg.p_duplicate)) s->in_flight.push_back(m);
+      }
+    }
+    if (s->rng.Chance(s->cfg.p_partition)) {
+      s->isolated_until[static_cast<std::size_t>(s->rng.Below(n))] =
+          s->step + 1 + static_cast<std::size_t>(s->rng.Below(20));
+    }
+  }
+}
+
+// TWO REPLICAS MOVE THE SAME DIRECTORY INTO EACH OTHER. The case a naive design
+// turns into a cycle, which makes both directories and everything under them
+// vanish from every replica at once.
+void RunTreeMoveIntoEachOther(Sim* s) {
+  std::vector<ObjectId> dirs;
+  SeedTree(s, {"a", "b"}, &dirs);
+  if (dirs.size() < 2) return;
+  // Files inside, so a cycle would take real content with it and the oracle
+  // would see paths disappear.
+  MakeFile(s, 0, dirs[0], "inside-a.md");
+  MakeFile(s, 0, dirs[1], "inside-b.md");
+  s->Quiesce();
+
+  // Concurrent and contradictory, issued with no knowledge of each other.
+  MoveNode(s, 0, dirs[0], dirs[1], "a", true);
+  if (s->replicas.size() > 1) MoveNode(s, 1, dirs[1], dirs[0], "b", true);
+  // And a third replica piling on, if there is one.
+  if (s->replicas.size() > 2) MoveNode(s, 2, dirs[0], dirs[1], "a2", true);
+}
+
+// A move into a directory, concurrent with a delete of that directory.
+void RunTreeMoveIntoDeleted(Sim* s) {
+  std::vector<ObjectId> dirs;
+  SeedTree(s, {"target", "other"}, &dirs);
+  if (dirs.size() < 2) return;
+  const ObjectId file = MakeFile(s, 0, dirs[1], "n.md");
+  s->Quiesce();
+
+  MoveNode(s, 0, file, dirs[0], "n.md", false);
+  if (s->replicas.size() > 1) {
+    MoveNode(s, 1, dirs[0], TreeTrash(), "target", true);
+  }
+  if (s->replicas.size() > 2) {
+    // A third replica moves it straight back out, so the winner is not simply
+    // whoever went last.
+    MoveNode(s, 2, file, TreeRoot(), "rescued.md", false);
+  }
+}
+
+// A directory moved while another replica edits a file inside it. The move must
+// cost ZERO text operations and the edits must survive it.
+void RunTreeMoveWhileEditingInside(Sim* s) {
+  std::vector<ObjectId> dirs;
+  SeedTree(s, {"src", "dst"}, &dirs);
+  if (dirs.size() < 2) return;
+  MakeFile(s, 0, dirs[0], "n.md");
+  s->Quiesce();
+
+  const std::size_t tree_ops_before = s->result.tree_ops;
+  const std::size_t text_ops_before = s->result.ops;
+
+  // Replica 0 moves the containing directory.
+  MoveNode(s, 0, dirs[0], dirs[1], "src", true);
+  const std::size_t after_move_text = s->result.ops;
+  UMBRA_CHECK(after_move_text == text_ops_before,
+              "moving a directory produced text operations");
+  (void)tree_ops_before;
+
+  // Everyone else edits, concurrently, knowing nothing of the move.
+  for (std::size_t i = 1; i < s->replicas.size(); ++i) {
+    for (int k = 0; k < 4; ++k) s->LocalEdit(i);
+  }
+  for (int k = 0; k < 4; ++k) s->LocalEdit(0);
+}
+
+// A -> B -> C -> A, issued by three replicas at once.
+void RunTreeRenameCycleThreeWay(Sim* s) {
+  std::vector<ObjectId> dirs;
+  SeedTree(s, {"a", "b", "c"}, &dirs);
+  if (dirs.size() < 3) return;
+  MakeFile(s, 0, dirs[0], "in-a.md");
+  MakeFile(s, 0, dirs[1], "in-b.md");
+  MakeFile(s, 0, dirs[2], "in-c.md");
+  s->Quiesce();
+
+  // Each replica moves one directory into the next, so the three together
+  // describe a loop. At most two of the three can survive.
+  const std::size_t n = s->replicas.size();
+  MoveNode(s, 0 % n, dirs[0], dirs[1], "a", true);
+  MoveNode(s, 1 % n, dirs[1], dirs[2], "b", true);
+  MoveNode(s, 2 % n, dirs[2], dirs[0], "c", true);
+}
+
 void RunCompactThenEdit(Sim* s) {
   const std::size_t half = s->cfg.steps / 2;
   for (s->step = 0; s->step < half; ++s->step) {
@@ -759,7 +1212,10 @@ void RunCompactThenEdit(Sim* s) {
         const std::size_t to = static_cast<std::size_t>(
             s->rng.Below(static_cast<uint64_t>(s->replicas.size())));
         if (to == i) continue;
-        replays.push_back(Message{to, op});
+        Message m;
+        m.to = to;
+        m.op = op;
+        replays.push_back(m);
       }
     }
     for (const Message& m : replays) s->Deliver(m.to, m.op);
@@ -825,6 +1281,21 @@ Result RunSchedule(uint64_t seed, const Config& cfg, Adversarial adversarial) {
       break;
     case Adversarial::kCompactThenEdit:
       RunCompactThenEdit(&s);
+      break;
+    case Adversarial::kTreeRandom:
+      RunTreeRandom(&s);
+      break;
+    case Adversarial::kTreeMoveIntoEachOther:
+      RunTreeMoveIntoEachOther(&s);
+      break;
+    case Adversarial::kTreeMoveIntoDeleted:
+      RunTreeMoveIntoDeleted(&s);
+      break;
+    case Adversarial::kTreeMoveWhileEditingInside:
+      RunTreeMoveWhileEditingInside(&s);
+      break;
+    case Adversarial::kTreeRenameCycleThreeWay:
+      RunTreeRenameCycleThreeWay(&s);
       break;
   }
   if (!s.result.failure.empty()) {

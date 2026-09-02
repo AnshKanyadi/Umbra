@@ -27,6 +27,7 @@
 #include "umbra/crdt/op.h"
 #include "umbra/crdt/op_id.h"
 #include "umbra/crdt/text_doc.h"
+#include "umbra/crdt/tree.h"
 
 namespace umbra {
 namespace sim {
@@ -130,11 +131,40 @@ class Oracle {
   std::vector<std::pair<std::string, std::vector<OpId>>> groups_;
 };
 
+// THE TREE'S REFERENCE MODEL.
+//
+// It cannot predict which of two concurrent moves wins -- that is the CRDT's to
+// decide by timestamp, and either answer is correct. It knows the things that
+// are NOT the CRDT's to decide, and those are enough to fail a wrong answer
+// that every replica agrees on:
+//
+//   - THE TREE IS ACYCLIC and every live node reaches the root. This is the one
+//     that matters: the failure mode of a naive design is a cycle, which makes
+//     files vanish from every replica at once, so convergence alone would call
+//     it a success.
+//   - Every node that was ever created still exists somewhere -- under the root
+//     or under the trash. Nodes do not evaporate.
+//   - A node's name is one it was actually given by some operation.
+//   - The winner of a set of moves for one child is the one with the highest
+//     timestamp that was not refused for a cycle, computed here by replaying
+//     the operations independently of TreeDoc.
+class TreeOracle {
+ public:
+  void Record(const TreeOp& op);
+  // Empty when the tree satisfies the model, otherwise the first violation.
+  std::string Check(const TreeDoc& tree) const;
+  std::size_t ops() const { return ops_.size(); }
+
+ private:
+  std::vector<TreeOp> ops_;
+};
+
 // One simulated device.
 struct Replica {
   ReplicaId id;
   LamportClock clock{ReplicaId{}};
   TextDoc doc;
+  TreeDoc tree;
 
   // Operations this replica has accepted and persisted, in the order it
   // persisted them. A crash rebuilds the document from exactly this.
@@ -158,10 +188,13 @@ struct Replica {
   bool crashed_this_run = false;
 };
 
-// A message in flight.
+// A message in flight. Exactly one of the two operation kinds is set, which is
+// what `is_tree` says; the network does not care which.
 struct Message {
   std::size_t to = 0;
+  bool is_tree = false;
   Op op;
+  TreeOp tree_op;
 };
 
 struct Config {
@@ -191,6 +224,8 @@ struct Result {
   std::size_t crashes = 0;
   std::size_t max_partition_steps = 0;
   std::size_t tombstones_dropped = 0;
+  std::size_t tree_ops = 0;
+  std::size_t cycles_refused = 0;
 };
 
 // Named, hand-built schedules that exercise shapes a uniform random walk
@@ -213,10 +248,24 @@ enum class Adversarial : uint8_t {
   // Edit, settle, run a coordinated compaction round, then keep editing. The
   // schedule that asks whether compaction breaks anything that comes after it.
   kCompactThenEdit,
+
+  // ---------------------------------------------------------------- tree
+  // Random tree operations alongside text ones.
+  kTreeRandom,
+  // TWO REPLICAS MOVE THE SAME DIRECTORY INTO EACH OTHER. The case naive
+  // designs turn into a cycle, and therefore into files that vanish.
+  kTreeMoveIntoEachOther,
+  // A move into a directory, concurrent with a delete of that directory.
+  kTreeMoveIntoDeleted,
+  // A directory moved while another replica edits a file inside it. The move
+  // must cost zero text operations and the edits must survive.
+  kTreeMoveWhileEditingInside,
+  // A -> B -> C -> A, issued by three replicas at once.
+  kTreeRenameCycleThreeWay,
 };
 
 const char* AdversarialName(Adversarial a);
-constexpr std::size_t kAdversarialCount = 8;
+constexpr std::size_t kAdversarialCount = 13;
 
 // True when a schedule never has a replica insert into text it received from
 // another, which is the condition under which every run must still be
