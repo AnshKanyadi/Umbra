@@ -193,8 +193,17 @@ void TreeDoc::DoOp(const TreeOp& op, LogMove* record) {
 }
 
 void TreeDoc::UndoOp(const LogMove& record) {
-  if (record.ignored)
-    return;  // it changed nothing, so there is nothing to undo
+  // An ignored operation changed nothing, so there is nothing to undo.
+  //
+  // THIS IS AN OPTIMIZATION AND A STATEMENT OF INTENT, NOT A CORRECTNESS
+  // REQUIREMENT, and that is worth knowing rather than assuming. DoOp records
+  // what it displaced BEFORE it runs the cycle check, so an ignored record's
+  // old_entry is exactly what is there now and undoing it restores the same
+  // thing. Deleting this line was tried as a deliberate defect and the sweep
+  // stayed green, correctly. It is kept because "undo what the operation did"
+  // reads as a rule, and a rule with a silent exception is worse than an
+  // explicit one.
+  if (record.ignored) return;
   if (record.had_old) {
     nodes_[record.op.child] = record.old_entry;
   } else {
