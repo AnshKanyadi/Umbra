@@ -119,7 +119,8 @@ bool GetEnvelope(const std::string& s, Epoch* e) {
   if (s.size() < kEnvelopeBytes) return false;
   *e = 0;
   for (int i = 0; i < 4; ++i) {
-    *e |= static_cast<Epoch>(static_cast<unsigned char>(s[static_cast<std::size_t>(i)]))
+    *e |= static_cast<Epoch>(
+              static_cast<unsigned char>(s[static_cast<std::size_t>(i)]))
           << (8 * i);
   }
   return true;

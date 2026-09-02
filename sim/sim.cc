@@ -61,6 +61,8 @@ const char* AdversarialName(Adversarial a) {
       return "compact-then-edit";
     case Adversarial::kTreeRenameCycleThreeWay:
       return "tree-rename-cycle-three-way";
+    case Adversarial::kTreeCompactThenMove:
+      return "tree-compact-then-move";
     case Adversarial::kTreeMoveWhileEditingInside:
       return "tree-move-while-editing-inside";
     case Adversarial::kTreeMoveIntoDeleted:
@@ -231,6 +233,7 @@ bool ScheduleRequiresContiguousRuns(Adversarial a) {
     case Adversarial::kTreeMoveIntoDeleted:
     case Adversarial::kTreeMoveWhileEditingInside:
     case Adversarial::kTreeRenameCycleThreeWay:
+    case Adversarial::kTreeCompactThenMove:
       return false;
   }
   return false;
@@ -641,6 +644,31 @@ struct Sim {
   // it needs the sync protocol to provide one, and a device that never
   // participates holds the whole vault's tombstones. docs/adr/0002-crdt.md
   // carries the condition.
+  // THE TREE LOG COMPACTION ROUND, per docs/adr/0003-tree.md.
+  //
+  // The watermark is computed from what every replica honestly reports, and the
+  // simulation reports honestly -- a device that lies is out of scope, and a
+  // relay that lies can only withhold, which lowers the watermark. Every
+  // replica compacts to the SAME mark, because a mark computed from a minimum
+  // over all of them is the same number for all of them.
+  void CompactTreeLogRound() {
+    std::vector<ReplicaId> enrolled;
+    std::vector<DeviceReport> reports;
+    for (const Replica& r : replicas) {
+      enrolled.push_back(r.id);
+      DeviceReport rep;
+      rep.device = r.id;
+      rep.have = r.tree.HaveMarks();
+      rep.clock = r.clock.counter();
+      reports.push_back(rep);
+    }
+    const uint64_t w = CompactionWatermark(enrolled, reports);
+    if (w == 0) return;
+    for (Replica& r : replicas) {
+      result.tree_log_dropped += r.tree.CompactLog(w);
+    }
+  }
+
   void CompactRound(bool everyone) {
     const std::map<ReplicaId, uint64_t> w = GlobalWatermark();
     for (std::size_t i = 0; i < replicas.size(); ++i) {
@@ -720,6 +748,9 @@ struct Sim {
     // different compaction states. Safe here because nothing follows: if
     // compaction ever changed the visible text, this is where it would show.
     CompactRound(/*everyone=*/false);
+    // The tree log too, on every replica: unlike tombstones, the watermark is
+    // one number and every replica computes the same one.
+    CompactTreeLogRound();
   }
 
   std::string CheckConverged() {
@@ -1040,6 +1071,78 @@ void MoveNode(Sim* s, std::size_t i, const ObjectId& child,
 
 // Tree operations mixed in with text ones, under the same partitions,
 // reordering, duplication and crashes.
+// Tree operations, a coordinated log compaction round, then MORE tree
+// operations, some of them arriving out of order. The second half is the point:
+// it asks whether an operation produced after compaction can still undo what it
+// needs to.
+void RunTreeCompactThenMove(Sim* s) {
+  std::vector<ObjectId> dirs;
+  SeedTree(s, {"a", "b", "c"}, &dirs);
+  if (dirs.size() < 3) return;
+  std::vector<ObjectId> files;
+  for (std::size_t i = 0; i < 4; ++i) {
+    files.push_back(MakeFile(s, i % s->replicas.size(), dirs[i % dirs.size()],
+                             "f" + std::to_string(i) + ".md"));
+  }
+  for (std::size_t k = 0; k < s->cfg.steps / 4; ++k) {
+    const std::size_t who = static_cast<std::size_t>(
+        s->rng.Below(static_cast<uint64_t>(s->replicas.size())));
+    const ObjectId child = files[static_cast<std::size_t>(
+        s->rng.Below(static_cast<uint64_t>(files.size())))];
+    const ObjectId parent = dirs[static_cast<std::size_t>(
+        s->rng.Below(static_cast<uint64_t>(dirs.size())))];
+    MoveNode(s, who, child, parent, "m" + std::to_string(k) + ".md", false);
+    if (!s->in_flight.empty() && s->rng.Chance(70)) {
+      const std::size_t j =
+          static_cast<std::size_t>(s->rng.Below(s->in_flight.size()));
+      const Message m = s->in_flight[j];
+      s->in_flight.erase(s->in_flight.begin() + static_cast<long>(j));
+      s->DeliverMessage(m);
+    }
+  }
+  s->Quiesce();
+  s->CompactTreeLogRound();
+
+  // Now keep going. Operations produced after the round have counters above the
+  // watermark by construction, so the undo they need is still there -- and
+  // delivery is deliberately reordered so that undo actually runs.
+  for (std::size_t k = 0; k < s->cfg.steps / 4; ++k) {
+    const std::size_t who = static_cast<std::size_t>(
+        s->rng.Below(static_cast<uint64_t>(s->replicas.size())));
+    const ObjectId child = dirs[static_cast<std::size_t>(
+        s->rng.Below(static_cast<uint64_t>(dirs.size())))];
+    const ObjectId parent = dirs[static_cast<std::size_t>(
+        s->rng.Below(static_cast<uint64_t>(dirs.size())))];
+    if (!(child == parent)) MoveNode(s, who, child, parent, "d", true);
+    if (!s->in_flight.empty() && s->rng.Chance(50)) {
+      const std::size_t j =
+          static_cast<std::size_t>(s->rng.Below(s->in_flight.size()));
+      const Message m = s->in_flight[j];
+      s->in_flight.erase(s->in_flight.begin() + static_cast<long>(j));
+      s->DeliverMessage(m);
+    }
+  }
+  // And re-offer some already-delivered operations past the cursor, which is
+  // what a relay resending looks like and what clause 5 has to absorb.
+  {
+    std::vector<Message> replays;
+    for (std::size_t i = 0; i < s->replicas.size(); ++i) {
+      for (const TreeOp& op : s->tree_log[i]) {
+        if (!s->rng.Chance(30)) continue;
+        const std::size_t to = static_cast<std::size_t>(
+            s->rng.Below(static_cast<uint64_t>(s->replicas.size())));
+        if (to == i) continue;
+        Message m;
+        m.to = to;
+        m.is_tree = true;
+        m.tree_op = op;
+        replays.push_back(m);
+      }
+    }
+    for (const Message& m : replays) s->DeliverMessage(m);
+  }
+}
+
 void RunTreeRandom(Sim* s) {
   std::vector<ObjectId> dirs;
   SeedTree(s, {"a", "b", "c"}, &dirs);
@@ -1296,6 +1399,9 @@ Result RunSchedule(uint64_t seed, const Config& cfg, Adversarial adversarial) {
       break;
     case Adversarial::kTreeRenameCycleThreeWay:
       RunTreeRenameCycleThreeWay(&s);
+      break;
+    case Adversarial::kTreeCompactThenMove:
+      RunTreeCompactThenMove(&s);
       break;
   }
   if (!s.result.failure.empty()) {

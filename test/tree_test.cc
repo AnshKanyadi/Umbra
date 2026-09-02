@@ -309,6 +309,175 @@ TEST(Tree, MoveConcurrentWithDeleteOfTheDestination) {
   EXPECT_TRUE(left.IsDeleted(dir));
 }
 
+// ------------------------------------------------------- log compaction
+
+TEST(TreeCompaction, DropsThePrefixAndAbsorbsItsRedelivery) {
+  TreeDoc t;
+  LamportClock c = ClockFor(1);
+  const ObjectId a = Obj(1);
+  const ObjectId b = Obj(2);
+  std::vector<TreeOp> ops;
+  ops.push_back(t.MakeMove(a, TreeRoot(), "a", true, &c));
+  ops.push_back(t.MakeMove(b, TreeRoot(), "b", true, &c));
+  ops.push_back(t.MakeMove(b, a, "b", true, &c));
+  ApplyAll(&t, ops);
+  ASSERT_EQ(t.LogSize(), 3u);
+  const std::string before = t.StateHash();
+
+  // Drop the first two.
+  EXPECT_EQ(t.CompactLog(2), 2u);
+  EXPECT_EQ(t.LogSize(), 1u);
+  EXPECT_EQ(t.StateHash(), before) << "compaction changed the visible tree";
+  EXPECT_EQ(t.compacted_through(), 2u);
+
+  // CLAUSE 5: re-delivery of a dropped operation must be absorbed, not
+  // re-applied. Re-applying would undo the whole remaining log to make room.
+  for (const TreeOp& op : ops) {
+    if (op.id.counter > 2) continue;
+    EXPECT_EQ(t.Apply(op), TreeApply::kDuplicate) << op.ToString();
+  }
+  EXPECT_EQ(t.StateHash(), before);
+  EXPECT_EQ(t.LogSize(), 1u);
+}
+
+TEST(TreeCompaction, LeavesTheUndoRangeThatIsStillReachable) {
+  // An operation arriving after compaction must still be able to undo
+  // everything newer than itself, which is exactly what was kept.
+  TreeDoc t;
+  LamportClock c1 = ClockFor(1);
+  LamportClock c2 = ClockFor(2);
+  const ObjectId a = Obj(1);
+  const ObjectId b = Obj(2);
+  std::vector<TreeOp> early;
+  early.push_back(t.MakeMove(a, TreeRoot(), "a", true, &c1));
+  early.push_back(t.MakeMove(b, TreeRoot(), "b", true, &c1));
+  ApplyAll(&t, early);
+
+  c2.Observe(early.back().id);
+  const TreeOp late = t.MakeMove(a, b, "a", true, &c2);
+  ASSERT_EQ(t.Apply(late), TreeApply::kApplied);
+  ASSERT_EQ(PathOr(t, a, "?"), "b/a");
+
+  EXPECT_EQ(t.CompactLog(2), 2u);
+
+  // Now an operation between the compacted prefix and `late` arrives. It has a
+  // counter above the mark, so it is legal, and undoing `late` is still
+  // possible because `late` was kept.
+  LamportClock c3 = ClockFor(3);
+  c3.Observe(early.back().id);
+  const TreeOp middle = t.MakeMove(b, TreeRoot(), "renamed", true, &c3);
+  ASSERT_LT(middle.id.counter, late.id.counter + 1);
+  const TreeApply r = t.Apply(middle);
+  EXPECT_NE(r, TreeApply::kMalformed);
+  // Whatever the outcome, the tree is intact and both nodes are reachable.
+  EXPECT_FALSE(PathOr(t, a, "").empty());
+  EXPECT_FALSE(PathOr(t, b, "").empty());
+}
+
+TEST(TreeCompaction, HaveMarksStopAtTheFirstGap) {
+  TreeDoc t;
+  const ReplicaId r = ReplicaIdFromSeed(1);
+  LamportClock c(r);
+  const ObjectId a = Obj(1);
+  const ObjectId b = Obj(2);
+  const ObjectId d = Obj(3);
+  const TreeOp o1 = t.MakeMove(a, TreeRoot(), "a", true, &c);
+  const TreeOp o2 = t.MakeMove(b, TreeRoot(), "b", true, &c);
+  const TreeOp o3 = t.MakeMove(d, TreeRoot(), "d", true, &c);
+  ASSERT_EQ(t.Apply(o1), TreeApply::kApplied);
+  // o2 is deliberately skipped: the device has 1 and 3 but not 2.
+  ASSERT_EQ(t.Apply(o3), TreeApply::kApplied);
+
+  const std::map<ReplicaId, uint64_t> marks = t.HaveMarks();
+  ASSERT_EQ(marks.count(r), 1u);
+  EXPECT_EQ(marks.at(r), 1u)
+      << "the mark must be the contiguous prefix, not the highest held";
+
+  ASSERT_EQ(t.Apply(o2), TreeApply::kApplied);
+  EXPECT_EQ(t.HaveMarks().at(r), 3u) << "the gap closed and the mark did not";
+}
+
+TEST(TreeCompaction, TheWatermarkIsAMinimumOverEverything) {
+  const ReplicaId d1 = ReplicaIdFromSeed(1);
+  const ReplicaId d2 = ReplicaIdFromSeed(2);
+  const std::vector<ReplicaId> enrolled{d1, d2};
+
+  DeviceReport r1;
+  r1.device = d1;
+  r1.clock = 100;
+  r1.have[d1] = 50;
+  r1.have[d2] = 40;
+  DeviceReport r2;
+  r2.device = d2;
+  r2.clock = 100;
+  r2.have[d1] = 45;
+  r2.have[d2] = 60;
+
+  // acked[d1] = min(50,45) = 45; acked[d2] = min(40,60) = 40; clocks are 100.
+  EXPECT_EQ(CompactionWatermark(enrolled, {r1, r2}), 40u);
+
+  // A SLOW CLOCK CAPS IT, and this is the term ADR 0002's text condition does
+  // not have. A device at clock 10 will issue counter 11 next; compacting to 40
+  // would drop entries that operation needs to undo.
+  DeviceReport slow = r2;
+  slow.clock = 10;
+  EXPECT_EQ(CompactionWatermark(enrolled, {r1, slow}), 10u);
+
+  // A MISSING REPORT COLLAPSES IT. This is what a withholding relay can force,
+  // and it is the safe direction.
+  EXPECT_EQ(CompactionWatermark(enrolled, {r1}), 0u);
+  EXPECT_EQ(CompactionWatermark(enrolled, {}), 0u);
+
+  // A device that has never heard of a source that HAS produced counts as zero,
+  // because it is genuinely behind.
+  DeviceReport blind = r2;
+  blind.have.erase(d1);
+  EXPECT_EQ(CompactionWatermark(enrolled, {r1, blind}), 0u);
+}
+
+TEST(TreeCompaction, ASilentSourceDoesNotBlockTheWatermark) {
+  // A device that has produced nothing imposes no constraint. Without this the
+  // first implementation compacted nothing at all in 420 schedules, because
+  // some replica always happened not to have touched the tree.
+  const ReplicaId writer = ReplicaIdFromSeed(1);
+  const ReplicaId silent = ReplicaIdFromSeed(2);
+  const std::vector<ReplicaId> enrolled{writer, silent};
+
+  DeviceReport w;
+  w.device = writer;
+  w.clock = 80;
+  w.have[writer] = 60;  // it has produced and holds its own
+  DeviceReport s;
+  s.device = silent;
+  s.clock = 80;
+  s.have[writer] = 60;  // caught up on the writer, and produced nothing itself
+
+  EXPECT_EQ(CompactionWatermark(enrolled, {w, s}), 60u);
+
+  // But the silent device's CLOCK still binds it. A device sitting at 10 will
+  // issue counter 11 next, which must not fall below the watermark.
+  DeviceReport slow = s;
+  slow.clock = 10;
+  EXPECT_EQ(CompactionWatermark(enrolled, {w, slow}), 10u);
+}
+
+TEST(TreeCompaction, ReportsFromUnenrolledDevicesAreIgnored) {
+  const ReplicaId d1 = ReplicaIdFromSeed(1);
+  const ReplicaId stranger = ReplicaIdFromSeed(9);
+  const std::vector<ReplicaId> enrolled{d1};
+  DeviceReport r1;
+  r1.device = d1;
+  r1.clock = 30;
+  r1.have[d1] = 30;
+  DeviceReport rs;
+  rs.device = stranger;
+  rs.clock = 1;
+  rs.have[d1] = 1;
+  // A revoked device must not be able to hold compaction back forever, and an
+  // unknown one must not be able to push it forward.
+  EXPECT_EQ(CompactionWatermark(enrolled, {r1, rs}), 30u);
+}
+
 // ------------------------------------------------------------------- codec
 
 TEST(TreeCodec, RoundTripsAndRefusesMalformed) {

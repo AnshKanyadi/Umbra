@@ -124,6 +124,7 @@ int main(int argc, char** argv) {
   std::size_t total_crashes = 0;
   std::size_t total_tree_ops = 0;
   std::size_t total_cycles = 0;
+  std::size_t total_log_dropped = 0;
 
   for (uint64_t seed = from; seed < to; ++seed) {
     for (std::size_t k = 0; k < umbra::sim::kAdversarialCount; ++k) {
@@ -144,6 +145,7 @@ int main(int argc, char** argv) {
       total_crashes += r.crashes;
       total_tree_ops += r.tree_ops;
       total_cycles += r.cycles_refused;
+      total_log_dropped += r.tree_log_dropped;
       if (!r.ok) {
         ++failed;
         std::printf("FAIL seed=%llu schedule=%s replicas=%zu steps=%zu\n",
@@ -170,10 +172,12 @@ int main(int argc, char** argv) {
           .count();
   std::printf(
       "%zu schedules, seeds [%llu,%llu), %zu replicas, %zu text ops, %zu tree "
-      "ops, %zu deliveries, %zu crashes, %zu cycles refused, %.2fs\n",
+      "ops, %zu deliveries, %zu crashes, %zu cycles refused, %zu tree log "
+      "entries dropped, %.2fs\n",
       run, static_cast<unsigned long long>(from),
       static_cast<unsigned long long>(to), cfg.replicas, total_ops,
-      total_tree_ops, total_deliveries, total_crashes, total_cycles, secs);
+      total_tree_ops, total_deliveries, total_crashes, total_cycles,
+      total_log_dropped, secs);
   // A CYCLE COUNT OF ZERO WOULD MEAN THE TREE SCHEDULES NEVER REACHED THE CASE
   // THEY EXIST FOR, so it is reported rather than left to be assumed.
   if (total_tree_ops > 0 && total_cycles == 0) {

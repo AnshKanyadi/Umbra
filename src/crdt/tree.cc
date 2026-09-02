@@ -211,7 +211,100 @@ void TreeDoc::UndoOp(const LogMove& record) {
   }
 }
 
+std::size_t TreeDoc::CompactLog(uint64_t through) {
+  if (through > compacted_through_) compacted_through_ = through;
+  std::size_t dropped = 0;
+  std::map<OpId, LogMove>::iterator it = log_.begin();
+  while (it != log_.end()) {
+    if (it->first.counter > through)
+      break;  // the map is ordered by counter first
+    it = log_.erase(it);
+    ++dropped;
+  }
+  return dropped;
+}
+
+std::map<ReplicaId, uint64_t> TreeDoc::HaveMarks() const {
+  // Group the log by source, then walk each source's counters looking for the
+  // first gap. The mark is the last counter before it.
+  std::map<ReplicaId, std::vector<uint64_t>> by_source;
+  for (const std::map<OpId, LogMove>::value_type& kv : log_) {
+    by_source[kv.first.replica].push_back(kv.first.counter);
+  }
+  std::map<ReplicaId, uint64_t> marks;
+  for (std::map<ReplicaId, std::vector<uint64_t>>::value_type& kv : by_source) {
+    std::sort(kv.second.begin(), kv.second.end());
+    // Everything at or below what was already compacted is held by definition:
+    // it was seen, applied and then dropped.
+    uint64_t mark = compacted_through_;
+    for (uint64_t c : kv.second) {
+      if (c <= mark) continue;
+      if (c == mark + 1) {
+        mark = c;
+      } else {
+        break;  // a gap; the contiguous prefix ends here
+      }
+    }
+    marks[kv.first] = mark;
+  }
+  return marks;
+}
+
+uint64_t CompactionWatermark(const std::vector<ReplicaId>& enrolled,
+                             const std::vector<DeviceReport>& reports) {
+  if (enrolled.empty()) return 0;
+  std::map<ReplicaId, const DeviceReport*> by_device;
+  for (const DeviceReport& r : reports) by_device[r.device] = &r;
+
+  // AN ENROLLED DEVICE THAT HAS NOT REPORTED COLLAPSES THE WATERMARK. This is
+  // the conservative direction and it is also the only thing a withholding
+  // relay can force, which is what makes the computation safe against one. See
+  // docs/adr/0003-tree.md.
+  for (const ReplicaId& d : enrolled) {
+    if (by_device.find(d) == by_device.end()) return 0;
+  }
+
+  uint64_t w = UINT64_MAX;
+  // Second term of clause 3: no device may be behind the watermark, or its next
+  // operation sorts below it.
+  for (const ReplicaId& d : enrolled) {
+    w = std::min(w, by_device[d]->clock);
+  }
+  // First term: for every source, the point below which EVERY device holds
+  // everything.
+  //
+  // A SOURCE THAT HAS PRODUCED NOTHING IMPOSES NO CONSTRAINT, and getting this
+  // wrong is what made the first implementation compact nothing at all. A
+  // device reporting no mark for source S means one of two things it cannot
+  // tell apart locally: "S has produced nothing" or "I am missing everything
+  // from S". Only S distinguishes them, and it does -- a device trivially holds
+  // all of its own operations, so its own mark says how far it has got.
+  //
+  // Skipping a silent source is safe because the clock term above still binds
+  // it: anything it produces later has a counter above the watermark.
+  for (const ReplicaId& source : enrolled) {
+    const std::map<ReplicaId, uint64_t>& own = by_device[source]->have;
+    const std::map<ReplicaId, uint64_t>::const_iterator produced =
+        own.find(source);
+    if (produced == own.end() || produced->second == 0) continue;
+
+    uint64_t acked = UINT64_MAX;
+    for (const ReplicaId& d : enrolled) {
+      const std::map<ReplicaId, uint64_t>& have = by_device[d]->have;
+      const std::map<ReplicaId, uint64_t>::const_iterator it =
+          have.find(source);
+      acked = std::min(acked, it == have.end() ? 0 : it->second);
+    }
+    w = std::min(w, acked);
+  }
+  return w == UINT64_MAX ? 0 : w;
+}
+
 TreeApply TreeDoc::Apply(const TreeOp& op) {
+  // CLAUSE 5. Anything at or below the compaction mark has already been seen,
+  // applied, and had its log entry dropped. Re-applying it would undo the
+  // entire remaining log to make room for an operation everyone already has.
+  if (op.id.counter <= compacted_through_) return TreeApply::kDuplicate;
   if (IsTreeRoot(op.child) || IsTreeTrash(op.child)) {
     return TreeApply::kMalformed;  // the fixed points do not move
   }

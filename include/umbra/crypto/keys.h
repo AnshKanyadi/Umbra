@@ -179,8 +179,7 @@ class VaultKeys {
   // is the path that must work when every device is gone.
   static CryptoStatus RecoverFromPassphrase(
       const std::string& passphrase,
-      const std::array<uint8_t, kSaltBytes>& salt,
-      const Argon2idParams& params,
+      const std::array<uint8_t, kSaltBytes>& salt, const Argon2idParams& params,
       const std::map<Epoch, std::string>& root_wrapped, VaultKeys* out);
 
   // Rotation. Generates a new epoch key, makes it current, and returns the new

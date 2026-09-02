@@ -162,6 +162,30 @@ class TreeDoc {
   std::size_t NodeCount() const { return nodes_.size(); }
   std::size_t LogSize() const { return log_.size(); }
 
+  // ------------------------------------------------------ log compaction
+  //
+  // Drop every log entry whose timestamp counter is at or below `through`.
+  // docs/adr/0003-tree.md carries the five-part condition the caller must have
+  // satisfied; CompactionWatermark below computes the only value that
+  // satisfies it. Returns how many entries went.
+  //
+  // THE WATERMARK IS REMEMBERED, and that is clause 5 of the condition.
+  // Dropping the log entry does not drop the operation: a peer or a relay can
+  // still hand it back, and re-applying it would undo the entire remaining log
+  // to make room for it. Anything at or below the mark is treated as already
+  // seen instead.
+  std::size_t CompactLog(uint64_t through);
+  uint64_t compacted_through() const { return compacted_through_; }
+
+  // What this device would report for clause 2: its own view of how far it has
+  // seen each source contiguously. Derived from the log, so it is exactly what
+  // the device can honestly claim.
+  //
+  // CONTIGUOUS IS THE WORD THAT MATTERS. A device holding 1, 2 and 5 from a
+  // source reports 2, not 5, because the guarantee the condition needs is
+  // "everything at or below this", not "the highest thing I happen to have".
+  std::map<ReplicaId, uint64_t> HaveMarks() const;
+
   // A fingerprint of the VISIBLE tree: every live path and what is at it. Two
   // replicas that have converged produce the same value.
   std::string StateHash() const;
@@ -193,7 +217,30 @@ class TreeDoc {
   // Ordered by timestamp. A map rather than a vector because the common
   // operation is "everything after t", which is a range.
   std::map<OpId, LogMove> log_;
+  uint64_t compacted_through_ = 0;
 };
+
+// One device's report, clause 2 of the condition.
+struct DeviceReport {
+  ReplicaId device;
+  // Contiguous prefix marks: source -> highest counter for which this device
+  // holds everything at or below it.
+  std::map<ReplicaId, uint64_t> have;
+  // This device's Lamport clock. Load-bearing and easy to leave out: without
+  // it, a device whose clock is behind the watermark will issue a counter below
+  // it and need log entries that are gone.
+  uint64_t clock = 0;
+};
+
+// Clause 3, computed. Returns 0 -- meaning compact nothing -- whenever any
+// enrolled device has not reported, which is the conservative direction and the
+// one a withholding relay can force.
+//
+// `enrolled` is the set the vault knows about. A report from a device that is
+// not enrolled is ignored; an enrolled device with no report collapses the
+// watermark.
+uint64_t CompactionWatermark(const std::vector<ReplicaId>& enrolled,
+                             const std::vector<DeviceReport>& reports);
 
 // Encoding, to the same opaque OpPayload text operations use, so the oplog and
 // the encryption layer treat both identically. See op.h for why the payload is

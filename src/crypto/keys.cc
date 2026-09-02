@@ -10,9 +10,7 @@
 namespace umbra {
 namespace {
 
-void EnsureSodium() {
-  UMBRA_CHECK(::sodium_init() >= 0, "sodium_init failed");
-}
+void EnsureSodium() { UMBRA_CHECK(::sodium_init() >= 0, "sodium_init failed"); }
 
 // crypto_kdf contexts are exactly 8 bytes. Named constants rather than string
 // literals at call sites so a typo is a compile error rather than a silently
@@ -24,11 +22,16 @@ constexpr char kCtxContent[] = "umbCont1";
 
 const char* CryptoStatusName(CryptoStatus s) {
   switch (s) {
-    case CryptoStatus::kOk: return "ok";
-    case CryptoStatus::kOutOfMemory: return "out-of-memory";
-    case CryptoStatus::kBadInput: return "bad-input";
-    case CryptoStatus::kAuthFailed: return "auth-failed";
-    case CryptoStatus::kUnknownEpoch: return "unknown-epoch";
+    case CryptoStatus::kOk:
+      return "ok";
+    case CryptoStatus::kOutOfMemory:
+      return "out-of-memory";
+    case CryptoStatus::kBadInput:
+      return "bad-input";
+    case CryptoStatus::kAuthFailed:
+      return "auth-failed";
+    case CryptoStatus::kUnknownEpoch:
+      return "unknown-epoch";
   }
   return "unknown";
 }
@@ -91,9 +94,8 @@ SecretKey DeriveSubkey(const SecretKey& parent, uint64_t subkey_id,
   UMBRA_CHECK(std::strlen(context) == crypto_kdf_CONTEXTBYTES,
               "a crypto_kdf context must be exactly 8 bytes");
   SecretKey out;
-  const int rc = ::crypto_kdf_derive_from_key(out.data(), SecretKey::size(),
-                                              subkey_id, context,
-                                              parent.data());
+  const int rc = ::crypto_kdf_derive_from_key(
+      out.data(), SecretKey::size(), subkey_id, context, parent.data());
   UMBRA_CHECK(rc == 0, "crypto_kdf_derive_from_key failed");
   return out;
 }
@@ -116,7 +118,8 @@ DeviceKeyPair NewDeviceKeyPair() {
                 "public key length must match crypto_box");
   static_assert(kSecretKeyBytes == crypto_box_SECRETKEYBYTES,
                 "secret key length must match crypto_box");
-  const int rc = ::crypto_box_keypair(kp.public_key.data(), kp.secret_key.data());
+  const int rc =
+      ::crypto_box_keypair(kp.public_key.data(), kp.secret_key.data());
   UMBRA_CHECK(rc == 0, "crypto_box_keypair failed");
   return kp;
 }
@@ -169,15 +172,16 @@ std::string VaultKeys::SealEpochToDevice(
   // the device count, and not which device did the enrolling.
   std::string out;
   out.resize(SecretKey::size() + crypto_box_SEALBYTES);
-  const int rc = ::crypto_box_seal(
-      reinterpret_cast<unsigned char*>(&out[0]), it->second.data(),
-      SecretKey::size(), device_public.data());
+  const int rc = ::crypto_box_seal(reinterpret_cast<unsigned char*>(&out[0]),
+                                   it->second.data(), SecretKey::size(),
+                                   device_public.data());
   UMBRA_CHECK(rc == 0, "crypto_box_seal failed");
   *status = CryptoStatus::kOk;
   return out;
 }
 
-CryptoStatus VaultKeys::AcceptSealedEpoch(Epoch epoch, const std::string& sealed,
+CryptoStatus VaultKeys::AcceptSealedEpoch(Epoch epoch,
+                                          const std::string& sealed,
                                           const DeviceKeyPair& me) {
   EnsureSodium();
   if (sealed.size() != SecretKey::size() + crypto_box_SEALBYTES) {

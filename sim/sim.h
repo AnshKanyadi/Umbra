@@ -226,6 +226,7 @@ struct Result {
   std::size_t tombstones_dropped = 0;
   std::size_t tree_ops = 0;
   std::size_t cycles_refused = 0;
+  std::size_t tree_log_dropped = 0;
 };
 
 // Named, hand-built schedules that exercise shapes a uniform random walk
@@ -262,10 +263,14 @@ enum class Adversarial : uint8_t {
   kTreeMoveWhileEditingInside,
   // A -> B -> C -> A, issued by three replicas at once.
   kTreeRenameCycleThreeWay,
+  // Tree operations, a coordinated log compaction round, then more tree
+  // operations. The schedule that asks whether truncating the log breaks the
+  // undo the algorithm still needs.
+  kTreeCompactThenMove,
 };
 
 const char* AdversarialName(Adversarial a);
-constexpr std::size_t kAdversarialCount = 13;
+constexpr std::size_t kAdversarialCount = 14;
 
 // True when a schedule never has a replica insert into text it received from
 // another, which is the condition under which every run must still be
