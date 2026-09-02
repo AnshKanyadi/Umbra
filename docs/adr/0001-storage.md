@@ -4,6 +4,8 @@
 - Date: 2026-09-01
 - Depends on: [docs/threat-model.md](../threat-model.md)
 - Amended 2026-09-01: the content-addressing hash, left open below, is BLAKE2b-256
+- Amended 2026-09-02: the key carries what ROUTING needs and not what COMPLETENESS
+  needs; a per-(object, replica) back-pointer inside the payload closes the gap
 
 ## Context
 
@@ -123,6 +125,94 @@ leak the threat model rules out for file paths in §3. Hash the ciphertext.
 argument. Its compaction, its bloom filters and its ordered iteration all serve
 small keys with real update churn. Feeding it blobs would have made its
 benchmarks meaningless as a predictor of Umbra's behaviour.
+
+## Ordering is not completeness
+
+*Added 2026-09-02, while designing the sync protocol.*
+
+The key was chosen so that a range scan answers "everything from replica R after
+counter C" in counter order. It does. What it cannot answer is **"and nothing
+was left out"**, and the difference is the whole of this section.
+
+**Counters are sparse per (object, replica).** A device's Lamport clock is shared
+across every object and both CRDTs, so most counters do not exist for any given
+object. Measured on eight files created, edited five times each, and one moved:
+
+| Key range | Counters present | Span | Density |
+|---|---|---|---|
+| tree object | 11 | 147 | **7.5%** |
+| text object | 17 | 124 | 13.7% |
+| text object | 17 | 94 | 18.1% |
+
+At that density a client cannot distinguish *"the relay omitted the operation at
+counter 41"* from *"no operation exists at counter 41"*. Both are a hole in an
+ordered sequence.
+
+### Why that is worse than a missing message
+
+ADR 0003's log compaction rests on a **prefix mark**: a device's claim that it
+holds everything from a source at or below some counter. A relay that omits one
+interior operation makes a client advance its cursor past it, and the client then
+reports a mark that is false **through no fault of its own**.
+
+> **Authenticating a report does not make it true. It makes it un-forgeable by
+> the relay, which is a different property.** A device induced to believe
+> something false will seal that belief honestly, and every other device will
+> verify the signature and accept it.
+
+The watermark then advances past an operation one device never received, its log
+entry is dropped, and clause 5 of ADR 0003's condition absorbs the operation as a
+duplicate when it finally arrives. It is lost permanently and silently. This is
+the failure the sealing in ADR 0003 clause 2 does **not** cover, and noticing it
+is the reason this section exists.
+
+### The back-pointer
+
+Every operation carries, inside its encrypted payload, the counter of the
+previous operation from the same replica for the same object. The first is zero.
+
+A client walks its cursor forward and accepts an operation only when its
+back-pointer equals the cursor. A skipped operation is then unambiguous: the
+arriving operation points at something the client has not reached.
+
+**Inside the payload, not in the key**, and that is the deciding argument rather
+than a detail. A dense per-object sequence number in the key would give the same
+detection and would tell the relay exactly how many operations each device made
+against each file — a new leak in a threat model whose central claim is that
+structure is content (threat model §3). Eight bytes under the AEAD costs less.
+
+### The chain's own safety condition
+
+> A client holding cursor `c` for (object, replica) accepts an operation `O`
+> iff `O.prev == c`, and then advances the cursor to `O.counter`. Otherwise it
+> refuses to advance past `c`.
+
+**The chain and log compaction do not interact, by construction:**
+
+- Compaction drops `LogMove` entries from a client's in-memory tree log. It does
+  not touch the cursor, which is durable and separate, and it does not touch the
+  operations stored in the oplog.
+- **Verification is relative to the cursor, not to zero.** A client with cursor
+  `c` verifies continuity from `c` forward only; history below `c` was verified
+  when it was crossed and is never re-examined. So a back-pointer naming an
+  operation whose log entry has been compacted is still verifiable, because
+  verification never consults log entries.
+
+**What would break it is relay-side garbage collection, which is not
+implemented.** If the relay dropped operations, the chain would have a truncated
+head and a device joining later could not verify back to `prev == 0`. Such a
+device could not rebuild the document from a truncated log in any case — that
+needs a snapshot — so relay GC requires both a snapshot mechanism and a rule
+admitting a chain start at or below a published watermark. Neither exists. **The
+relay keeps everything**, and the cost of that is stated in the threat model.
+
+### What it does not detect
+
+**A withheld tail.** If the relay simply stops serving new operations, the client
+sees nothing new, which is indistinguishable from nothing new existing. That is
+*safe* rather than wrong — the cursor does not move, the mark stays truthful, and
+the watermark stays low — but it is a denial of service, recorded as such in the
+threat model.
 
 ## Alternatives considered
 

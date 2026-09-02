@@ -190,7 +190,39 @@ would also break the relay's ability to garbage collect superseded versions and
 a new device's ability to fetch an object it has not seen. That trade has been
 made in favour of stable IDs, and the leak is the price.
 
-### 5.6 Summary
+### 5.6 Withholding, and what it costs — **partially mitigated**
+
+A relay cannot read, forge or reorder anything. It can **refuse to hand things
+over**, and that is worth its own entry because it is the attack the rest of the
+design is most exposed to.
+
+Two shapes, and they are not equally dangerous:
+
+**Omitting an operation from the middle of a range — detected.** Every operation
+carries, inside its encrypted payload, the counter of the previous operation from
+the same device for the same object (ADR 0001, "Ordering is not completeness").
+A client accepts an operation only when that back-pointer equals its cursor, so a
+skipped operation is unambiguous and the cursor refuses to advance. Without this
+a relay could induce a client to believe it held something it did not, and the
+client would then seal that false belief honestly — **authentication makes a
+report un-forgeable, it does not make it true.**
+
+**Withholding everything newer — not prevented, and it is a denial of service.**
+A relay that serves a correct but stale view, claiming to have nothing newer when
+it does, cannot corrupt anything: the cursor does not move, the prefix mark stays
+truthful, and log compaction stays conservative. What it can do is **hold
+compaction hostage indefinitely**, because the watermark is a minimum over what
+every device has received. The tree log then grows without bound on every device,
+which is the cost ADR 0003 accepts in exchange for its safety condition.
+
+It is **detectable but not preventable**. A device's own report says how far it
+has produced, so a client that holds a device's report claiming counter 57 while
+its own cursor for that device sits at 41 knows the relay is stale. Detection
+tells the user their relay is misbehaving; it does not get them their data. The
+answer to a relay that withholds is to host a different one, which is the point
+of the whole system being self-hostable.
+
+### 5.7 Summary
 
 | What the relay learns | Mitigated? | How, or why not |
 |---|---|---|
@@ -203,10 +235,15 @@ made in favour of stable IDs, and the leak is the price.
 | Approximate total vault size | **No** | Follows from per-object sizes and object count |
 | Which objects change together | **No** | Follows from stable object IDs, which are required |
 | Long-term activity patterns | **No** | Follows from timing and correlation above |
+| Whether a client is missing an operation | Yes | Encrypted back-pointer chain; the cursor refuses to advance across a gap |
+| Whether the relay is withholding everything newer | **Detected, not prevented** | A denial of service that holds log compaction hostage; see §5.6 |
 
-Five of the nine rows are "no". That ratio is what an encrypted-blob store
+Five of the first nine rows are "no". That ratio is what an encrypted-blob store
 against a hostile relay actually looks like, and a document that reported
 otherwise would be describing a different system.
+
+The last two rows are integrity rather than confidentiality, and they are stated
+here because the same adversary produces both.
 
 ## 6. Revocation, and what it cannot do
 
