@@ -374,27 +374,45 @@ TEST(TreeCompaction, LeavesTheUndoRangeThatIsStillReachable) {
   EXPECT_FALSE(PathOr(t, b, "").empty());
 }
 
-TEST(TreeCompaction, HaveMarksStopAtTheFirstGap) {
-  TreeDoc t;
-  const ReplicaId r = ReplicaIdFromSeed(1);
-  LamportClock c(r);
-  const ObjectId a = Obj(1);
-  const ObjectId b = Obj(2);
-  const ObjectId d = Obj(3);
-  const TreeOp o1 = t.MakeMove(a, TreeRoot(), "a", true, &c);
-  const TreeOp o2 = t.MakeMove(b, TreeRoot(), "b", true, &c);
-  const TreeOp o3 = t.MakeMove(d, TreeRoot(), "d", true, &c);
-  ASSERT_EQ(t.Apply(o1), TreeApply::kApplied);
-  // o2 is deliberately skipped: the device has 1 and 3 but not 2.
-  ASSERT_EQ(t.Apply(o3), TreeApply::kApplied);
+// THE PREFIX MARK IS NOT A LOG QUESTION, and this test is what is left of a
+// version that thought it was.
+//
+// TreeDoc briefly offered HaveMarks(), deriving the mark from runs of
+// consecutive counters in its log. That is wrong twice over: text and tree
+// operations share one counter space per device, so tree counters are almost
+// never consecutive, and a device whose first tree operation was not counter 1
+// reported ZERO -- which CompactionWatermark reads as "this source produced
+// nothing" and skips. Operations still in flight were then compacted past, and
+// two replicas ended with different trees. Seed 68 of tree-random.
+//
+// The mark is a sync cursor. What can still be asserted here is the property
+// the cursor must have, so that the protocol built on it in the next phase has
+// something to be checked against.
+TEST(TreeCompaction, AMarkMeansEverythingAtOrBelowIt) {
+  // Given what a source produced and what a device received, the mark is the
+  // largest prefix of the former contained in the latter. Stated as a test so
+  // the sync layer has a definition to implement rather than a description.
+  const std::vector<uint64_t> produced{3, 7, 8, 12};
 
-  const std::map<ReplicaId, uint64_t> marks = t.HaveMarks();
-  ASSERT_EQ(marks.count(r), 1u);
-  EXPECT_EQ(marks.at(r), 1u)
-      << "the mark must be the contiguous prefix, not the highest held";
+  std::set<uint64_t> got;
+  auto mark = [&produced, &got]() {
+    uint64_t m = 0;
+    for (uint64_t c : produced) {
+      if (got.count(c) == 0) break;
+      m = c;
+    }
+    return m;
+  };
 
-  ASSERT_EQ(t.Apply(o2), TreeApply::kApplied);
-  EXPECT_EQ(t.HaveMarks().at(r), 3u) << "the gap closed and the mark did not";
+  EXPECT_EQ(mark(), 0u) << "nothing received";
+  got.insert(7);
+  EXPECT_EQ(mark(), 0u) << "a later operation without an earlier one is a gap";
+  got.insert(3);
+  EXPECT_EQ(mark(), 7u);
+  got.insert(12);
+  EXPECT_EQ(mark(), 7u) << "still a gap at 8";
+  got.insert(8);
+  EXPECT_EQ(mark(), 12u);
 }
 
 TEST(TreeCompaction, TheWatermarkIsAMinimumOverEverything) {
@@ -503,7 +521,6 @@ TEST(TreeCompaction, AClockIsNeverBelowTheMarksItReports) {
   const ObjectId a = Obj(1);
   const ObjectId b = Obj(2);
 
-  // A second replica whose operations this one receives.
   const ReplicaId other = ReplicaIdFromSeed(2);
   LamportClock oc(other);
   TreeDoc source;
@@ -512,38 +529,21 @@ TEST(TreeCompaction, AClockIsNeverBelowTheMarksItReports) {
   theirs.push_back(source.MakeMove(b, TreeRoot(), "b", true, &oc));
   ApplyAll(&source, theirs);
 
+  uint64_t highest_held = 0;
   for (const TreeOp& op : theirs) {
     ASSERT_EQ(t.Apply(op), TreeApply::kApplied);
     // This is what a real client must do on every applied operation, and the
-    // invariant above depends on it.
+    // invariant depends on it.
     c.Observe(op.id);
+    highest_held = std::max(highest_held, op.id.counter);
   }
   const TreeOp mine = t.MakeMove(a, b, "a", true, &c);
   ASSERT_EQ(t.Apply(mine), TreeApply::kApplied);
+  highest_held = std::max(highest_held, mine.id.counter);
 
-  const std::map<ReplicaId, uint64_t> marks = t.HaveMarks();
-  for (const std::map<ReplicaId, uint64_t>::value_type& kv : marks) {
-    EXPECT_GE(c.counter(), kv.second)
-        << "the clock is behind a mark this device reports, which would make "
-           "the clock term in the watermark load-bearing";
-  }
-
-  // And the watermark computed for a single-device vault is exactly its marks,
-  // never capped by the clock.
-  DeviceReport rep;
-  rep.device = r;
-  rep.have = marks;
-  rep.clock = c.counter();
-  const uint64_t w = CompactionWatermark({r}, {rep});
-  uint64_t lowest_mark = UINT64_MAX;
-  for (const std::map<ReplicaId, uint64_t>::value_type& kv : marks) {
-    const std::map<ReplicaId, uint64_t>::const_iterator own =
-        marks.find(kv.first);
-    if (kv.first == r && own != marks.end() && own->second > 0) {
-      lowest_mark = std::min(lowest_mark, kv.second);
-    }
-  }
-  EXPECT_EQ(w, lowest_mark == UINT64_MAX ? c.counter() : lowest_mark);
+  EXPECT_GE(c.counter(), highest_held)
+      << "the clock is behind an operation this device holds, which would make "
+         "the clock term in the watermark load-bearing";
 }
 
 // ------------------------------------------------------------------- codec

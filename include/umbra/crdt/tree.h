@@ -177,14 +177,24 @@ class TreeDoc {
   std::size_t CompactLog(uint64_t through);
   uint64_t compacted_through() const { return compacted_through_; }
 
-  // What this device would report for clause 2: its own view of how far it has
-  // seen each source contiguously. Derived from the log, so it is exactly what
-  // the device can honestly claim.
+  // THE PREFIX MARK IS NOT DERIVABLE FROM THIS LOG, and an earlier version of
+  // this file offered a HaveMarks() that pretended otherwise.
   //
-  // CONTIGUOUS IS THE WORD THAT MATTERS. A device holding 1, 2 and 5 from a
-  // source reports 2, not 5, because the guarantee the condition needs is
-  // "everything at or below this", not "the highest thing I happen to have".
-  std::map<ReplicaId, uint64_t> HaveMarks() const;
+  // Clause 2 of the condition needs "the highest counter from source S for
+  // which I hold EVERY operation at or below it". A log can only be asked which
+  // counters it holds, and a run of consecutive integers is not the same
+  // question: text and tree operations share one Lamport counter space per
+  // device, so a device's tree operations are almost never consecutive. The
+  // old implementation therefore stopped at the first text-operation counter
+  // and reported a mark far below the truth -- and, worse, reported ZERO for a
+  // device whose first tree operation was not counter 1, which the watermark
+  // read as "this source has produced nothing" and skipped entirely. Operations
+  // that were still in flight were then compacted past. Seed 68 of tree-random.
+  //
+  // The mark is a SYNC quantity: a cursor says "I have fetched everything from
+  // S up to counter c", which is exactly the guarantee, and it is true because
+  // the fetch is ordered by counter (ADR 0001's key layout). It is supplied by
+  // the caller, not computed here.
 
   // A fingerprint of the VISIBLE tree: every live path and what is at it. Two
   // replicas that have converged produce the same value.

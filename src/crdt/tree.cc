@@ -224,32 +224,6 @@ std::size_t TreeDoc::CompactLog(uint64_t through) {
   return dropped;
 }
 
-std::map<ReplicaId, uint64_t> TreeDoc::HaveMarks() const {
-  // Group the log by source, then walk each source's counters looking for the
-  // first gap. The mark is the last counter before it.
-  std::map<ReplicaId, std::vector<uint64_t>> by_source;
-  for (const std::map<OpId, LogMove>::value_type& kv : log_) {
-    by_source[kv.first.replica].push_back(kv.first.counter);
-  }
-  std::map<ReplicaId, uint64_t> marks;
-  for (std::map<ReplicaId, std::vector<uint64_t>>::value_type& kv : by_source) {
-    std::sort(kv.second.begin(), kv.second.end());
-    // Everything at or below what was already compacted is held by definition:
-    // it was seen, applied and then dropped.
-    uint64_t mark = compacted_through_;
-    for (uint64_t c : kv.second) {
-      if (c <= mark) continue;
-      if (c == mark + 1) {
-        mark = c;
-      } else {
-        break;  // a gap; the contiguous prefix ends here
-      }
-    }
-    marks[kv.first] = mark;
-  }
-  return marks;
-}
-
 uint64_t CompactionWatermark(const std::vector<ReplicaId>& enrolled,
                              const std::vector<DeviceReport>& reports) {
   if (enrolled.empty()) return 0;

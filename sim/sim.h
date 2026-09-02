@@ -174,6 +174,12 @@ struct Replica {
   // Arrived but not yet applicable, because something they name is missing.
   std::vector<Op> pending;
 
+  // Per source, the counters of TREE operations this replica has received. The
+  // compaction mark is computed from this against what the source actually
+  // produced, which is the honest form of clause 2's prefix mark -- see the
+  // note where HaveMarks used to be in tree.h.
+  std::map<ReplicaId, std::set<uint64_t>> got_tree;
+
   // WHAT THIS REPLICA HAS ALREADY BEEN SENT, which is what a sync cursor
   // remembers. The final flush re-offers only what is NOT here.
   //

@@ -353,6 +353,8 @@ struct Sim {
   std::vector<ObjectId> dirs;
   // What each replica has produced, so the final flush can re-offer it.
   std::vector<std::vector<TreeOp>> tree_log;
+  // Per source, the counters of every tree operation it has produced, in order.
+  std::map<ReplicaId, std::vector<uint64_t>> produced_tree;
   // partition[i] is the step at which replica i rejoins. Steps below it mean
   // isolated.
   std::vector<std::size_t> isolated_until;
@@ -431,6 +433,8 @@ struct Sim {
   void OriginateTree(std::size_t i, const TreeOp& op) {
     tree_oracle.Record(op);
     tree_log[i].push_back(op);
+    produced_tree[op.id.replica].push_back(op.id.counter);
+    replicas[i].got_tree[op.id.replica].insert(op.id.counter);
     ++result.tree_ops;
     replicas[i].received.insert(op.id);
     for (std::size_t j = 0; j < replicas.size(); ++j) {
@@ -469,6 +473,7 @@ struct Sim {
   void DeliverTree(std::size_t to, const TreeOp& op) {
     Replica& r = replicas[to];
     r.received.insert(op.id);
+    r.got_tree[op.id.replica].insert(op.id.counter);
     ++result.deliveries;
     const TreeApply res = r.tree.Apply(op);
     switch (res) {
@@ -576,6 +581,9 @@ struct Sim {
     // persisted will legitimately be asked for again.
     r.received.clear();
     for (const Op& op : r.durable) r.received.insert(op.id);
+    // The tree log is durable by construction, so what this replica has of the
+    // tree survives the crash and so does the cursor derived from it.
+    for (const TreeOp& op : tree_log[i]) r.received.insert(op.id);
     for (const Op& op : r.durable) {
       const ApplyResult res = r.doc.Apply(op);
       r.clock.Observe(LastId(op));
@@ -651,6 +659,26 @@ struct Sim {
   // relay that lies can only withhold, which lowers the watermark. Every
   // replica compacts to the SAME mark, because a mark computed from a minimum
   // over all of them is the same number for all of them.
+  // The true prefix mark: the largest prefix of what `source` produced that
+  // `who` has actually received. In the real system a sync cursor gives this
+  // for free, because the fetch is ordered by counter. Here the simulation
+  // knows what was produced, so it can compute the same number without
+  // pretending a log can answer it.
+  uint64_t PrefixMark(std::size_t who, const ReplicaId& source) const {
+    const std::map<ReplicaId, std::vector<uint64_t>>::const_iterator p =
+        produced_tree.find(source);
+    if (p == produced_tree.end() || p->second.empty()) return 0;
+    const std::map<ReplicaId, std::set<uint64_t>>::const_iterator g =
+        replicas[who].got_tree.find(source);
+    if (g == replicas[who].got_tree.end()) return 0;
+    uint64_t mark = 0;
+    for (uint64_t c : p->second) {
+      if (g->second.count(c) == 0) break;
+      mark = c;
+    }
+    return mark;
+  }
+
   void CompactTreeLogRound() {
     std::vector<ReplicaId> enrolled;
     std::vector<DeviceReport> reports;
@@ -665,7 +693,9 @@ struct Sim {
       if (Isolated(i)) continue;
       DeviceReport rep;
       rep.device = r.id;
-      rep.have = r.tree.HaveMarks();
+      for (const Replica& source : replicas) {
+        rep.have[source.id] = PrefixMark(i, source.id);
+      }
       rep.clock = r.clock.counter();
       reports.push_back(rep);
     }
