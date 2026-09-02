@@ -82,7 +82,8 @@ const char* OpKindName(OpKind k) {
 }
 
 std::string Op::ToString() const {
-  std::string s = std::string(OpKindName(kind)) + " " + id.ToString();
+  std::string s = std::string(OpKindName(kind)) + " " + id.ToString() +
+                  " prev=" + std::to_string(prev);
   if (kind == OpKind::kInsert) {
     s += " under " + parent.ToString() + (side == Side::kLeft ? " L" : " R") +
          " x" + std::to_string(text.size());
@@ -110,6 +111,7 @@ OpPayload EncodeOp(const Op& op) {
   PutU8(kOpEncodingVersion, &out);
   PutU8(static_cast<uint8_t>(op.kind), &out);
   PutOpId(op.id, &out);
+  PutU64(op.prev, &out);
   switch (op.kind) {
     case OpKind::kInsert:
       PutOpId(op.parent, &out);
@@ -140,6 +142,10 @@ bool DecodeOp(const OpPayload& payload, Op* out) {
   if (!r.Id(&out->id)) return false;
   // counter 0 is the root, which is not an operation.
   if (out->id.counter == 0) return false;
+  if (!r.U64(&out->prev)) return false;
+  // A back-pointer must be strictly behind the operation it belongs to, or the
+  // chain could loop.
+  if (out->prev >= out->id.counter) return false;
 
   switch (out->kind) {
     case OpKind::kInsert: {

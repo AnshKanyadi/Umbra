@@ -113,6 +113,45 @@ TEST(OpCodec, EncodingIsCanonical) {
   EXPECT_EQ(EncodeOp(a).bytes, EncodeOp(b).bytes);
 }
 
+// THE BACK-POINTER CHAIN. ADR 0001, "Ordering is not completeness": counters
+// are 7.5 to 18 per cent dense per object, so an ordered fetch cannot tell a
+// withheld operation from a counter that was never used. The chain can.
+TEST(OpCodec, ChainsOperationsToTheirPredecessor) {
+  TextDoc d;
+  LamportClock c = ClockFor(1);
+  std::vector<Op> ops;
+  ASSERT_TRUE(d.LocalInsert(0, "abc", &c, &ops));
+  ASSERT_TRUE(d.LocalInsert(3, "def", &c, &ops));
+  ASSERT_TRUE(d.LocalDelete(0, 1, &c, &ops));
+  ASSERT_EQ(ops.size(), 3u);
+
+  EXPECT_EQ(ops[0].prev, 0u) << "the first operation starts the chain";
+  for (std::size_t i = 1; i < ops.size(); ++i) {
+    EXPECT_EQ(ops[i].prev, ops[i - 1].id.counter)
+        << "operation " << i << " does not point at its predecessor";
+    EXPECT_LT(ops[i].prev, ops[i].id.counter) << "a chain must go backwards";
+  }
+}
+
+TEST(OpCodec, RefusesAChainPointerThatDoesNotGoBackwards) {
+  // A back-pointer at or above its own counter would let a chain loop, so it is
+  // refused at decode rather than trusted and checked later.
+  Op op;
+  op.kind = OpKind::kDelete;
+  op.id = OpId{5, ReplicaIdFromSeed(1)};
+  op.target = OpId{2, ReplicaIdFromSeed(1)};
+  op.count = 1;
+  op.prev = 4;
+  Op back;
+  EXPECT_TRUE(DecodeOp(EncodeOp(op), &back));
+  EXPECT_EQ(back.prev, 4u);
+
+  op.prev = 5;
+  EXPECT_FALSE(DecodeOp(EncodeOp(op), &back)) << "prev == counter accepted";
+  op.prev = 6;
+  EXPECT_FALSE(DecodeOp(EncodeOp(op), &back)) << "prev > counter accepted";
+}
+
 TEST(OpCodec, RefusesMalformedPayloads) {
   Op op;
   EXPECT_FALSE(DecodeOp(OpPayload{""}, &op)) << "empty";

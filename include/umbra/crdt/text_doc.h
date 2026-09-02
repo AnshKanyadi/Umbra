@@ -211,6 +211,9 @@ class TextDoc {
 
   bool AlreadyCompacted(const OpId& id) const;
 
+  // The highest counter seen from each replica FOR THIS OBJECT, which is what a
+  // locally produced operation writes into its back-pointer. See op.h.
+  std::map<ReplicaId, uint64_t> last_counter_;
   std::map<OpId, Node> nodes_;
   std::map<ReplicaId, uint64_t> compacted_;
   // The root's children. The root has no left children by construction: it is

@@ -117,7 +117,8 @@ const char* TreeApplyName(TreeApply a) {
 }
 
 std::string TreeOp::ToString() const {
-  return "move " + id.ToString() + " child=" + child.ToHex().substr(0, 8) +
+  return "move " + id.ToString() + " prev=" + std::to_string(prev) +
+         " child=" + child.ToHex().substr(0, 8) +
          " -> parent=" + parent.ToHex().substr(0, 8) + " name=\"" + name +
          "\"" + (is_dir ? " dir" : "");
 }
@@ -275,6 +276,13 @@ uint64_t CompactionWatermark(const std::vector<ReplicaId>& enrolled,
 }
 
 TreeApply TreeDoc::Apply(const TreeOp& op) {
+  // Track the chain head for this replica before anything else, so an operation
+  // produced next points at the right predecessor even if this one is a
+  // duplicate or is refused for a cycle.
+  {
+    uint64_t& last = last_counter_[op.id.replica];
+    if (op.id.counter > last) last = op.id.counter;
+  }
   // CLAUSE 5. Anything at or below the compaction mark has already been seen,
   // applied, and had its log entry dropped. Re-applying it would undo the
   // entire remaining log to make room for an operation everyone already has.
@@ -318,8 +326,11 @@ TreeApply TreeDoc::Apply(const TreeOp& op) {
 
 TreeOp TreeDoc::MakeMove(const ObjectId& child, const ObjectId& parent,
                          const std::string& name, bool is_dir,
-                         LamportClock* clock) const {
+                         LamportClock* clock) {
   TreeOp op;
+  const std::map<ReplicaId, uint64_t>::const_iterator it =
+      last_counter_.find(clock->replica());
+  op.prev = it == last_counter_.end() ? 0 : it->second;
   op.id = clock->Tick(1);
   op.child = child;
   op.parent = parent;
@@ -424,6 +435,7 @@ OpPayload EncodeTreeOp(const TreeOp& op) {
   std::string& out = p.bytes;
   PutU8(kTreeOpEncodingVersion, &out);
   PutOpId(op.id, &out);
+  PutU64(op.prev, &out);
   PutObjectId(op.child, &out);
   PutObjectId(op.parent, &out);
   PutU8(op.is_dir ? 1 : 0, &out);
@@ -440,6 +452,8 @@ bool DecodeTreeOp(const OpPayload& payload, TreeOp* out) {
   *out = TreeOp();
   if (!r.Id(&out->id)) return false;
   if (out->id.counter == 0) return false;
+  if (!r.U64(&out->prev)) return false;
+  if (out->prev >= out->id.counter) return false;
   if (!r.Obj(&out->child)) return false;
   if (!r.Obj(&out->parent)) return false;
   uint8_t dir = 0;

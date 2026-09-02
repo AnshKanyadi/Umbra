@@ -77,6 +77,17 @@ struct Op {
   // See text_doc.h.
   std::vector<char32_t> text;
 
+  // THE BACK-POINTER: the counter of the previous operation this replica made
+  // for THIS OBJECT, or 0 for its first.
+  //
+  // It is here, inside the payload and therefore inside the AEAD, so that a
+  // client can tell "the relay skipped an operation" from "no operation exists
+  // at that counter" -- counters are 7.5 to 18 per cent dense per object, so an
+  // ordered fetch alone cannot. ADR 0001, "Ordering is not completeness",
+  // carries the argument and the alternative that was rejected for leaking
+  // per-object operation counts to the relay.
+  uint64_t prev = 0;
+
   // Delete only. The first character to remove; `count` consecutive ids from
   // `target` are removed. A deletion spanning several replicas' ids becomes
   // several operations, one per maximal group.
@@ -129,7 +140,7 @@ bool DecodeOp(const OpPayload& payload, Op* out);
 // The version byte every payload starts with. Bumping it is how a future
 // encoding change announces itself; a decoder that does not know a version
 // refuses the payload rather than misreading it.
-constexpr uint8_t kOpEncodingVersion = 1;
+constexpr uint8_t kOpEncodingVersion = 2;
 
 }  // namespace umbra
 

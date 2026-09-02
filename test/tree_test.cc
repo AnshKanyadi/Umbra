@@ -548,6 +548,50 @@ TEST(TreeCompaction, AClockIsNeverBelowTheMarksItReports) {
 
 // ------------------------------------------------------------------- codec
 
+TEST(Tree, OperationsChainToTheirPredecessor) {
+  TreeDoc t;
+  LamportClock c = ClockFor(1);
+  const ObjectId a = Obj(1);
+  const ObjectId b = Obj(2);
+  std::vector<TreeOp> ops;
+  ops.push_back(t.MakeMove(a, TreeRoot(), "a", true, &c));
+  ASSERT_EQ(t.Apply(ops.back()), TreeApply::kApplied);
+  ops.push_back(t.MakeMove(b, TreeRoot(), "b", true, &c));
+  ASSERT_EQ(t.Apply(ops.back()), TreeApply::kApplied);
+  ops.push_back(t.MakeMove(b, a, "b", true, &c));
+  ASSERT_EQ(t.Apply(ops.back()), TreeApply::kApplied);
+
+  EXPECT_EQ(ops[0].prev, 0u);
+  for (std::size_t i = 1; i < ops.size(); ++i) {
+    EXPECT_EQ(ops[i].prev, ops[i - 1].id.counter)
+        << "tree operation " << i << " does not point at its predecessor";
+  }
+}
+
+TEST(Tree, TheChainSurvivesLogCompaction) {
+  // The chain is verified against a CURSOR, never against the log, so dropping
+  // log entries below the cursor cannot break it. ADR 0001 states this; here it
+  // is asserted.
+  TreeDoc t;
+  LamportClock c = ClockFor(1);
+  const ObjectId a = Obj(1);
+  const ObjectId b = Obj(2);
+  std::vector<TreeOp> ops;
+  for (int i = 0; i < 4; ++i) {
+    ops.push_back(t.MakeMove(i % 2 == 0 ? a : b, TreeRoot(),
+                             "n" + std::to_string(i), true, &c));
+    ASSERT_EQ(t.Apply(ops.back()), TreeApply::kApplied);
+  }
+  ASSERT_EQ(t.CompactLog(ops[1].id.counter), 2u);
+
+  // The next operation still points at the real predecessor, whose log entry is
+  // gone.
+  const TreeOp next = t.MakeMove(a, b, "moved", true, &c);
+  EXPECT_EQ(next.prev, ops.back().id.counter);
+  EXPECT_LT(next.prev, next.id.counter);
+  EXPECT_EQ(t.Apply(next), TreeApply::kApplied);
+}
+
 TEST(TreeCodec, RoundTripsAndRefusesMalformed) {
   TreeOp op;
   op.id = OpId{5, ReplicaIdFromSeed(3)};

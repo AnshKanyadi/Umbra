@@ -97,6 +97,10 @@ struct TreeOp {
   // is what keeps names off the relay. See docs/threat-model.md section 3.
   std::string name;
 
+  // The back-pointer: the counter of the previous tree operation this replica
+  // made, or 0 for its first. See op.h and ADR 0001.
+  uint64_t prev = 0;
+
   // True when the node is a directory. Carried because the watcher knows and
   // the tree cannot tell from the shape alone -- an empty directory and a file
   // are both leaves.
@@ -132,9 +136,11 @@ class TreeDoc {
   TreeApply Apply(const TreeOp& op);
 
   // Build a move from this replica. Does not apply it.
+  // Not const: it reads and does not change the chain head, but taking a
+  // non-const reference makes it obvious that producing an operation is part of
+  // this document's history rather than a pure query.
   TreeOp MakeMove(const ObjectId& child, const ObjectId& parent,
-                  const std::string& name, bool is_dir,
-                  LamportClock* clock) const;
+                  const std::string& name, bool is_dir, LamportClock* clock);
 
   // ------------------------------------------------------------- queries
   bool Exists(const ObjectId& id) const;
@@ -223,6 +229,9 @@ class TreeDoc {
   void DoOp(const TreeOp& op, LogMove* record);
   void UndoOp(const LogMove& record);
 
+  // The highest counter seen from each replica, which is what a locally
+  // produced operation writes into its back-pointer. See op.h.
+  std::map<ReplicaId, uint64_t> last_counter_;
   std::map<ObjectId, Entry> nodes_;
   // Ordered by timestamp. A map rather than a vector because the common
   // operation is "everything after t", which is a range.
@@ -258,7 +267,7 @@ uint64_t CompactionWatermark(const std::vector<ReplicaId>& enrolled,
 OpPayload EncodeTreeOp(const TreeOp& op);
 bool DecodeTreeOp(const OpPayload& payload, TreeOp* out);
 
-constexpr uint8_t kTreeOpEncodingVersion = 1;
+constexpr uint8_t kTreeOpEncodingVersion = 2;
 
 }  // namespace umbra
 

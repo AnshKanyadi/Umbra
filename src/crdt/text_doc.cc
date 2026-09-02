@@ -165,6 +165,14 @@ bool TextDoc::AlreadyCompacted(const OpId& id) const {
 }
 
 ApplyResult TextDoc::Apply(const Op& op) {
+  // Track the chain head for this replica whatever the outcome below, so that
+  // an operation this replica produces next points at the right predecessor.
+  // Done before the early returns because a duplicate still tells us the chain
+  // reached here.
+  {
+    uint64_t& last = last_counter_[op.id.replica];
+    if (op.id.counter > last) last = op.id.counter;
+  }
   // AT OR BELOW THE COMPACTION MARK IS ALREADY SEEN. See Compact in the header:
   // the nodes this operation created may have been dropped, and the mark is
   // only ever set to a point every replica had already received, so there is
@@ -310,6 +318,7 @@ bool TextDoc::LocalInsert(std::size_t index, const std::string& utf8,
 
   Op op;
   op.kind = OpKind::kInsert;
+  op.prev = last_counter_[clock->replica()];
   op.id = clock->Tick(chars.size());
   op.parent = parent;
   op.side = side;
@@ -346,6 +355,7 @@ bool TextDoc::LocalDelete(std::size_t index, std::size_t count,
     }
     Op op;
     op.kind = OpKind::kDelete;
+    op.prev = last_counter_[clock->replica()];
     // Its own tick, so the operation has an identity distinct from the
     // characters it removes; see op.h.
     op.id = clock->Tick(1);
