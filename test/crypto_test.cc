@@ -182,9 +182,10 @@ TEST(Rotation, RemovesFutureReadsAndLeavesPastOnesAlone) {
 
   CryptoStatus st = CryptoStatus::kOk;
   VaultKeys device;
-  ASSERT_EQ(device.AcceptSealedEpoch(
-                0, vault.SealEpochToDevice(0, removed.public_key, &st), removed),
-            CryptoStatus::kOk);
+  ASSERT_EQ(
+      device.AcceptSealedEpoch(
+          0, vault.SealEpochToDevice(0, removed.public_key, &st), removed),
+      CryptoStatus::kOk);
 
   SealContext ctx;
   ctx.epoch = 0;
@@ -314,8 +315,43 @@ TEST(Aead, TheSamePlaintextSealsDifferentlyEachTime) {
   const std::string msg = "identical";
   const std::string a = Seal(k, ctx, msg);
   const std::string b = Seal(k, ctx, msg);
-  EXPECT_NE(a, b) << "the nonce is not random; two identical notes are linkable";
+  EXPECT_NE(a, b)
+      << "the nonce is not random; two identical notes are linkable";
   EXPECT_EQ(a.size(), b.size());
+}
+
+// OBJECT IDS ARE OPAQUE, which threat model section 3 requires: an id derived
+// from the path would let a relay confirm a guessed filename by computing its
+// id, which is the same leak as storing the name.
+TEST(ObjectIdentity, IsNotDerivedFromThePath) {
+  Vault a(ReplicaIdFromSeed(1));
+  Vault b(ReplicaIdFromSeed(2));
+  ChangeEvent e;
+  e.kind = ChangeKind::kCreated;
+  e.path = "notes/identical.md";
+  const ChangeOutcome ca = a.ApplyChange(e, "same bytes");
+  const ChangeOutcome cb = b.ApplyChange(e, "same bytes");
+  ASSERT_EQ(ca.status, VaultOutcome::kOk);
+  ASSERT_EQ(cb.status, VaultOutcome::kOk);
+  EXPECT_FALSE(ca.object == cb.object)
+      << "two vaults gave the same path the same id, so the id is a function "
+         "of the path";
+
+  // And the same vault gives two different paths different ids, so the id is
+  // not a constant either.
+  ChangeEvent e2 = e;
+  e2.path = "notes/other.md";
+  const ChangeOutcome c2 = a.ApplyChange(e2, "x");
+  ASSERT_EQ(c2.status, VaultOutcome::kOk);
+  EXPECT_FALSE(ca.object == c2.object);
+
+  // The id must not contain the name as a substring, which a naive "hash the
+  // path but keep a prefix" scheme would.
+  const std::string idbytes(
+      reinterpret_cast<const char*>(ca.object.bytes.data()),
+      ca.object.bytes.size());
+  EXPECT_FALSE(Contains(idbytes, "identical"));
+  EXPECT_FALSE(Contains(idbytes, "notes"));
 }
 
 // ------------------------------------------------- WHAT THE RELAY HOLDS
@@ -438,8 +474,8 @@ TEST_F(RelayView, HoldsExactlyWhatTheThreatModelSaysItDoes) {
 
   // 1. OBJECT IDS ARE VISIBLE, in the key. Conceded by section 3: they are
   // opaque and unrelated to the path, and the relay addresses blobs by them.
-  const std::string key = MakeOpLogKey(object_, text[0].id.replica,
-                                       text[0].id.counter);
+  const std::string key =
+      MakeOpLogKey(object_, text[0].id.replica, text[0].id.counter);
   const std::string obj(reinterpret_cast<const char*>(object_.bytes.data()),
                         object_.bytes.size());
   EXPECT_TRUE(Contains(key, obj)) << "the relay cannot address the object";
