@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstring>
 #include <thread>
 #include <vector>
 

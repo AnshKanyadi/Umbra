@@ -306,6 +306,11 @@ target_include_directories(umbra_relay PUBLIC relay)
 target_link_libraries(umbra_relay PUBLIC basalt::basalt)
 target_compile_options(umbra_relay PRIVATE ${UMBRA_CXX_FLAGS})
 
+add_executable(umbra_sync cmd/sync_main.cc)
+target_link_libraries(umbra_sync PRIVATE umbra)
+target_include_directories(umbra_sync PRIVATE src src/watcher src/crdt src/crypto src/sync)
+target_compile_options(umbra_sync PRIVATE ${UMBRA_CXX_FLAGS})
+
 add_executable(umbra_relay_bin cmd/relay_main.cc)
 set_target_properties(umbra_relay_bin PROPERTIES OUTPUT_NAME umbra_relay)
 target_link_libraries(umbra_relay_bin PRIVATE umbra_relay Threads::Threads)

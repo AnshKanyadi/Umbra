@@ -139,6 +139,11 @@ CryptoStatus VaultKeys::Create(const std::string& passphrase,
   return CryptoStatus::kOk;
 }
 
+void VaultKeys::OverwriteEpochForBootstrap(Epoch e, const SecretKey& k) {
+  epochs_[e] = k;
+  if (e > current_) current_ = e;
+}
+
 Epoch VaultKeys::Rotate() {
   EnsureSodium();
   SecretKey next;

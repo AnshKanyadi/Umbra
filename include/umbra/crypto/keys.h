@@ -208,6 +208,19 @@ class VaultKeys {
 
   const SecretKey& root() const { return root_; }
 
+  // FOR BOOTSTRAPPING A VAULT WITHOUT AN ENROLMENT CHANNEL, and for nothing
+  // else. Two directories that share a passphrase are the same vault, but
+  // Create draws a RANDOM epoch key, so they would not agree on one until a
+  // device enrolled another. This lets a caller substitute a key derived from
+  // the root instead.
+  //
+  // THAT IS EXACTLY WHAT keys.h ARGUES AGAINST for a real vault: a removed
+  // device knows the root and could therefore derive every future epoch, so
+  // revocation would protect nothing. It is here so that the end-to-end tool
+  // can drive two vaults without an enrolment channel, and its use is a
+  // statement that revocation is not in force.
+  void OverwriteEpochForBootstrap(Epoch e, const SecretKey& k);
+
  private:
   SecretKey root_;
   std::map<Epoch, SecretKey> epochs_;

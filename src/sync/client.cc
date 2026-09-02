@@ -1,5 +1,6 @@
 #include "umbra/sync/client.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include "check.h"
