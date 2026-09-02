@@ -478,6 +478,74 @@ TEST(TreeCompaction, ReportsFromUnenrolledDevicesAreIgnored) {
   EXPECT_EQ(CompactionWatermark(enrolled, {r1, rs}), 30u);
 }
 
+// C2 IN THE PHASE REPORT: THE CLOCK TERM IS REDUNDANT, AND THIS IS WHY.
+//
+// Removing the clock term from CompactionWatermark was run as a deliberate
+// defect and the sweep stayed green -- correctly, not through a gap in the
+// harness. The term cannot bind, given one invariant:
+//
+//     a device's Lamport clock is never below the counter of any operation it
+//     holds, because applying one Observes its id.
+//
+// Given that, for any source S with produced[S] > 0 the watermark satisfies
+//     w <= acked[S] <= have_D[S] <= clock_D
+// for every device D, so min(clock_D) is never the smaller term.
+//
+// The term is KEPT anyway, for the reason the ignored-undo guard in tree.cc is
+// kept: it is free, and it makes the condition survive a future change that
+// breaks the invariant -- a device that could hold operations without applying
+// them, say. What is not acceptable is leaving the invariant implicit, so this
+// asserts it directly.
+TEST(TreeCompaction, AClockIsNeverBelowTheMarksItReports) {
+  TreeDoc t;
+  const ReplicaId r = ReplicaIdFromSeed(1);
+  LamportClock c(r);
+  const ObjectId a = Obj(1);
+  const ObjectId b = Obj(2);
+
+  // A second replica whose operations this one receives.
+  const ReplicaId other = ReplicaIdFromSeed(2);
+  LamportClock oc(other);
+  TreeDoc source;
+  std::vector<TreeOp> theirs;
+  theirs.push_back(source.MakeMove(a, TreeRoot(), "a", true, &oc));
+  theirs.push_back(source.MakeMove(b, TreeRoot(), "b", true, &oc));
+  ApplyAll(&source, theirs);
+
+  for (const TreeOp& op : theirs) {
+    ASSERT_EQ(t.Apply(op), TreeApply::kApplied);
+    // This is what a real client must do on every applied operation, and the
+    // invariant above depends on it.
+    c.Observe(op.id);
+  }
+  const TreeOp mine = t.MakeMove(a, b, "a", true, &c);
+  ASSERT_EQ(t.Apply(mine), TreeApply::kApplied);
+
+  const std::map<ReplicaId, uint64_t> marks = t.HaveMarks();
+  for (const std::map<ReplicaId, uint64_t>::value_type& kv : marks) {
+    EXPECT_GE(c.counter(), kv.second)
+        << "the clock is behind a mark this device reports, which would make "
+           "the clock term in the watermark load-bearing";
+  }
+
+  // And the watermark computed for a single-device vault is exactly its marks,
+  // never capped by the clock.
+  DeviceReport rep;
+  rep.device = r;
+  rep.have = marks;
+  rep.clock = c.counter();
+  const uint64_t w = CompactionWatermark({r}, {rep});
+  uint64_t lowest_mark = UINT64_MAX;
+  for (const std::map<ReplicaId, uint64_t>::value_type& kv : marks) {
+    const std::map<ReplicaId, uint64_t>::const_iterator own =
+        marks.find(kv.first);
+    if (kv.first == r && own != marks.end() && own->second > 0) {
+      lowest_mark = std::min(lowest_mark, kv.second);
+    }
+  }
+  EXPECT_EQ(w, lowest_mark == UINT64_MAX ? c.counter() : lowest_mark);
+}
+
 // ------------------------------------------------------------------- codec
 
 TEST(TreeCodec, RoundTripsAndRefusesMalformed) {
