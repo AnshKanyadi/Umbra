@@ -273,10 +273,25 @@ enum class Adversarial : uint8_t {
   // operations. The schedule that asks whether truncating the log breaks the
   // undo the algorithm still needs.
   kTreeCompactThenMove,
+
+  // --------------------------------------------------------------- network
+  // These four are about the RELAY, not the link. See the block comment above
+  // their implementations in sim.cc.
+  //
+  // A relay drops one operation and keeps dropping it. The replica must not
+  // claim it, and must recover when it is finally served.
+  kRelayDropsPermanently,
+  // A relay serves ciphertext again after a compaction round has truncated the
+  // logs that produced it.
+  kRelayReplaysOldCiphertext,
+  // One replica's counter is a million ahead of the others.
+  kClockSkew,
+  // A relay serves a correct prefix and claims there is nothing newer.
+  kRelayStaleView,
 };
 
 const char* AdversarialName(Adversarial a);
-constexpr std::size_t kAdversarialCount = 14;
+constexpr std::size_t kAdversarialCount = 18;
 
 // True when a schedule never has a replica insert into text it received from
 // another, which is the condition under which every run must still be

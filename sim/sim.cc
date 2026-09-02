@@ -69,6 +69,14 @@ const char* AdversarialName(Adversarial a) {
       return "tree-move-into-deleted";
     case Adversarial::kTreeMoveIntoEachOther:
       return "tree-move-into-each-other";
+    case Adversarial::kRelayDropsPermanently:
+      return "relay-drops-permanently";
+    case Adversarial::kRelayReplaysOldCiphertext:
+      return "relay-replays-old-ciphertext";
+    case Adversarial::kClockSkew:
+      return "clock-skew";
+    case Adversarial::kRelayStaleView:
+      return "relay-stale-view";
     case Adversarial::kTreeRandom:
       return "tree-random";
   }
@@ -234,6 +242,10 @@ bool ScheduleRequiresContiguousRuns(Adversarial a) {
     case Adversarial::kTreeMoveWhileEditingInside:
     case Adversarial::kTreeRenameCycleThreeWay:
     case Adversarial::kTreeCompactThenMove:
+    case Adversarial::kRelayDropsPermanently:
+    case Adversarial::kRelayReplaysOldCiphertext:
+    case Adversarial::kClockSkew:
+    case Adversarial::kRelayStaleView:
       return false;
   }
   return false;
@@ -497,7 +509,58 @@ struct Sim {
     }
   }
 
+  // A RELAY THAT DROPS ONE OPERATION AND KEEPS DROPPING IT. Set by
+  // RunRelayDropsPermanently; honoured here so that Quiesce cannot quietly heal
+  // the gap the schedule exists to create.
+  std::size_t blocked_to = static_cast<std::size_t>(-1);
+  ReplicaId blocked_from;
+  uint64_t blocked_counter = 0;
+
+  bool Blocked(const Message& m) const {
+    if (blocked_counter == 0) return false;
+    if (m.to != blocked_to) return false;
+    const OpId& id = m.is_tree ? m.tree_op.id : m.op.id;
+    return id.replica == blocked_from && id.counter == blocked_counter;
+  }
+
+  // Re-offer every durable operation to every peer that has not been sent it.
+  // The same thing Quiesce does, without the delivery loop, so a schedule can
+  // put everything in flight and then choose how it is served.
+  void ReofferAll() {
+    for (std::size_t i = 0; i < replicas.size(); ++i) {
+      for (std::size_t j = 0; j < replicas.size(); ++j) {
+        if (i == j) continue;
+        for (const Op& op : replicas[i].durable) {
+          if (replicas[j].received.count(op.id) == 0) {
+            Message m;
+            m.to = j;
+            m.op = op;
+            in_flight.push_back(m);
+          }
+        }
+        for (const TreeOp& op : tree_log[i]) {
+          if (replicas[j].received.count(op.id) == 0) {
+            Message m;
+            m.to = j;
+            m.is_tree = true;
+            m.tree_op = op;
+            in_flight.push_back(m);
+          }
+        }
+      }
+    }
+  }
+
+  // Deliver everything currently in flight, once, to whoever is not isolated.
+  void FlushInFlight() {
+    std::vector<Message> batch;
+    batch.swap(in_flight);
+    for (const Message& m : batch) DeliverMessage(m);
+    for (std::size_t i = 0; i < replicas.size(); ++i) DrainPending(i);
+  }
+
   void DeliverMessage(const Message& m) {
+    if (Blocked(m)) return;
     if (m.is_tree) {
       DeliverTree(m.to, m.tree_op);
     } else {
@@ -1409,6 +1472,202 @@ void RunCrashAfterEveryApply(Sim* s) {
 
 }  // namespace
 
+// ---------------------------------------------------------------- network
+//
+// The four schedules below model the RELAY rather than the link. Everything
+// above assumes messages move between replicas; these ask what happens when
+// something in the middle chooses what to move.
+
+// A RELAY DROPS ONE OPERATION AND KEEPS DROPPING IT.
+//
+// The assertion is not convergence -- a replica that never receives an
+// operation cannot converge, and pretending otherwise would make the schedule
+// worthless. It is that the replica KNOWS: its prefix mark for that source must
+// stay below the gap, which is the claim the encrypted back-pointer chain makes
+// in docs/adr/0001-storage.md. A gap stops the cursor; it is not stepped over.
+//
+// The block is then lifted and the run converges, so the schedule also asserts
+// that the damage is a delay and not a corruption.
+void RunRelayDropsPermanently(Sim* s) {
+  const std::size_t n = s->replicas.size();
+  std::vector<ObjectId> dirs;
+  SeedTree(s, {"a", "b"}, &dirs);
+  // NOTHING IS DELIVERED YET. The block has to be in place before the operation
+  // it drops is served, or the victim already holds it and the schedule asserts
+  // nothing. The first version flushed here and failed on all 200 seeds with a
+  // prefix mark that was perfectly correct.
+  for (int round = 0; round < 6; ++round) {
+    for (std::size_t i = 0; i < n; ++i) {
+      (void)MakeFile(
+          s, i, dirs[0],
+          "f" + std::to_string(round) + "_" + std::to_string(i) + ".md");
+    }
+  }
+
+  const std::size_t victim = static_cast<std::size_t>(s->rng.Below(n));
+  std::size_t source = static_cast<std::size_t>(s->rng.Below(n));
+  if (source == victim) source = (source + 1) % n;
+  const ReplicaId source_id = s->replicas[source].id;
+  const std::vector<uint64_t>& made = s->produced_tree[source_id];
+  if (made.size() < 3) return;  // nothing to interrupt on this seed
+  const uint64_t dropped = made[made.size() / 2];
+  s->blocked_to = victim;
+  s->blocked_from = source_id;
+  s->blocked_counter = dropped;
+  s->FlushInFlight();
+
+  for (int round = 6; round < 10; ++round) {
+    for (std::size_t i = 0; i < n; ++i) {
+      (void)MakeFile(
+          s, i, dirs[1],
+          "g" + std::to_string(round) + "_" + std::to_string(i) + ".md");
+    }
+    s->FlushInFlight();
+  }
+  // Re-offer everything the victim has not been sent, still with the block on.
+  s->ReofferAll();
+  s->FlushInFlight();
+
+  const uint64_t mark = s->PrefixMark(victim, source_id);
+  if (mark >= dropped) {
+    s->result.failure = "a replica that never received tree op " +
+                        std::to_string(dropped) +
+                        " reported a prefix mark of " + std::to_string(mark) +
+                        ", claiming an operation it does not have";
+    return;
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    if (i == victim || i == source) continue;
+    if (s->PrefixMark(i, source_id) < dropped) {
+      s->result.failure =
+          "a replica the relay did not drop for is missing tree op " +
+          std::to_string(dropped);
+      return;
+    }
+  }
+  // Lift it: the operation was withheld, not destroyed.
+  s->blocked_counter = 0;
+}
+
+// A RELAY REPLAYS CIPHERTEXT IT SERVED BEFORE, after a compaction round. That
+// is the dangerous moment: the operations it re-serves are below the watermark
+// and the log no longer holds them, so Apply must refuse them as duplicates
+// rather than re-applying them into a tree that has forgotten they happened.
+void RunRelayReplaysOldCiphertext(Sim* s) {
+  const std::size_t n = s->replicas.size();
+  std::vector<ObjectId> dirs;
+  SeedTree(s, {"a", "b", "c"}, &dirs);
+  std::vector<ObjectId> files;
+  for (int round = 0; round < 8; ++round) {
+    for (std::size_t i = 0; i < n; ++i) {
+      files.push_back(MakeFile(
+          s, i, dirs[round % dirs.size()],
+          "f" + std::to_string(round) + "_" + std::to_string(i) + ".md"));
+      s->LocalEdit(i);
+    }
+    s->FlushInFlight();
+  }
+
+  std::vector<Message> replays;
+  for (std::size_t i = 0; i < n; ++i) {
+    for (const TreeOp& op : s->tree_log[i]) {
+      for (std::size_t j = 0; j < n; ++j) {
+        if (i == j) continue;
+        Message m;
+        m.to = j;
+        m.is_tree = true;
+        m.tree_op = op;
+        replays.push_back(m);
+      }
+    }
+  }
+
+  s->Quiesce();
+  if (!s->result.failure.empty()) return;
+  s->CompactTreeLogRound();
+  if (!s->result.failure.empty()) return;
+
+  // Served again, twice, after the logs were truncated.
+  for (const Message& m : replays) s->DeliverMessage(m);
+  for (const Message& m : replays) s->DeliverMessage(m);
+  for (std::size_t i = 0; i < n; ++i) s->DrainPending(i);
+}
+
+// TWO REPLICAS WHOSE COUNTERS ARE NOWHERE NEAR EACH OTHER.
+//
+// A Lamport counter is not a wall clock, so skew here means what it actually
+// means for this design: one device has made a million operations and another
+// has made three. The chain is per (object, replica) and must not care; the
+// marks must not care either.
+void RunClockSkew(Sim* s) {
+  const std::size_t n = s->replicas.size();
+  std::vector<ObjectId> dirs;
+  SeedTree(s, {"a", "b"}, &dirs);
+  const std::size_t ahead = static_cast<std::size_t>(s->rng.Below(n));
+  OpId far;
+  far.counter = 1000000;
+  far.replica = s->replicas[ahead].id;
+  s->replicas[ahead].clock.Observe(far);
+
+  for (int round = 0; round < 10; ++round) {
+    for (std::size_t i = 0; i < n; ++i) {
+      s->LocalEdit(i);
+      if (s->rng.Chance(50)) {
+        (void)MakeFile(
+            s, i, dirs[i % dirs.size()],
+            "s" + std::to_string(round) + "_" + std::to_string(i) + ".md");
+      }
+    }
+    if (s->rng.Chance(60)) s->FlushInFlight();
+  }
+}
+
+// A RELAY THAT IS CORRECT BUT BEHIND. It serves a prefix of what it holds and
+// says there is nothing newer. Nothing it says is false; it is out of date,
+// which a client cannot distinguish from a quiet vault.
+//
+// While it is behind, every mark must be justified by something that actually
+// arrived -- a mark is a claim about what this replica holds, and a stale view
+// must never inflate it.
+void RunRelayStaleView(Sim* s) {
+  const std::size_t n = s->replicas.size();
+  std::vector<ObjectId> dirs;
+  SeedTree(s, {"a", "b"}, &dirs);
+  for (int round = 0; round < 10; ++round) {
+    for (std::size_t i = 0; i < n; ++i) {
+      (void)MakeFile(
+          s, i, dirs[i % dirs.size()],
+          "t" + std::to_string(round) + "_" + std::to_string(i) + ".md");
+      s->LocalEdit(i);
+    }
+    // Only the OLDEST half: a correct prefix of the truth, and nothing newer.
+    const std::size_t half = s->in_flight.size() / 2;
+    std::vector<Message> serve(s->in_flight.begin(),
+                               s->in_flight.begin() + static_cast<long>(half));
+    s->in_flight.erase(s->in_flight.begin(),
+                       s->in_flight.begin() + static_cast<long>(half));
+    for (const Message& m : serve) s->DeliverMessage(m);
+    for (std::size_t i = 0; i < n; ++i) s->DrainPending(i);
+
+    for (std::size_t i = 0; i < n; ++i) {
+      for (std::size_t j = 0; j < n; ++j) {
+        if (i == j) continue;
+        const ReplicaId src = s->replicas[j].id;
+        const uint64_t mark = s->PrefixMark(i, src);
+        if (mark == 0) continue;
+        const std::map<ReplicaId, std::set<uint64_t>>::const_iterator g =
+            s->replicas[i].got_tree.find(src);
+        if (g == s->replicas[i].got_tree.end() || g->second.count(mark) == 0) {
+          s->result.failure = "a stale relay produced a mark of " +
+                              std::to_string(mark) +
+                              " for an operation that never arrived";
+          return;
+        }
+      }
+    }
+  }
+}
+
 Result RunSchedule(uint64_t seed, const Config& cfg, Adversarial adversarial) {
   Sim s(seed, cfg);
   s.require_contiguous_runs = ScheduleRequiresContiguousRuns(adversarial);
@@ -1454,6 +1713,18 @@ Result RunSchedule(uint64_t seed, const Config& cfg, Adversarial adversarial) {
       break;
     case Adversarial::kTreeCompactThenMove:
       RunTreeCompactThenMove(&s);
+      break;
+    case Adversarial::kRelayDropsPermanently:
+      RunRelayDropsPermanently(&s);
+      break;
+    case Adversarial::kRelayReplaysOldCiphertext:
+      RunRelayReplaysOldCiphertext(&s);
+      break;
+    case Adversarial::kClockSkew:
+      RunClockSkew(&s);
+      break;
+    case Adversarial::kRelayStaleView:
+      RunRelayStaleView(&s);
       break;
   }
   if (!s.result.failure.empty()) {
