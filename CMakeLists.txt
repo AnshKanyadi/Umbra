@@ -175,6 +175,9 @@ add_library(umbra STATIC
   src/crdt/vault.cc
   src/crypto/keys.cc
   src/crypto/aead.cc
+  src/sync/report.cc
+  src/sync/client.cc
+  src/sync/tcp_transport.cc
   src/watcher/content_hash.cc
   src/watcher/object_id.cc
   src/watcher/scan.cc
@@ -192,13 +195,14 @@ add_library(umbra::umbra ALIAS umbra)
 target_include_directories(umbra
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
          $<INSTALL_INTERFACE:include>
-  PRIVATE src src/watcher src/crdt src/crypto)
+  PRIVATE src src/watcher src/crdt src/crypto src/sync)
 target_compile_options(umbra PRIVATE ${UMBRA_CXX_FLAGS})
 # sodium is PRIVATE: BLAKE2b is how ContentHash is computed, which is an
 # implementation detail of this library. A consumer of <umbra/change_event.h>
 # gets a 32-byte digest and no libsodium headers.
 target_link_libraries(umbra PUBLIC basalt::basalt Threads::Threads)
 target_link_libraries(umbra PRIVATE umbra::sodium)
+target_link_libraries(umbra PUBLIC umbra_relay)
 
 # THE BACKEND IS CHOSEN HERE AND NOT WITH #ifdef INSIDE ONE FILE. Both backend
 # sources are compiled on both platforms; each is a no-op translation unit off
@@ -284,10 +288,27 @@ add_executable(umbra_test
 # match, which is not the claim being made.
 target_link_libraries(umbra_test PRIVATE umbra_testing umbra_sim umbra::sodium
                                          gtest_main)
-target_include_directories(umbra_test PRIVATE src src/watcher src/crdt src/crypto)
+target_include_directories(umbra_test PRIVATE src src/watcher src/crdt src/crypto src/sync)
 target_compile_options(umbra_test PRIVATE ${UMBRA_CXX_FLAGS})
 target_compile_definitions(umbra_test PRIVATE ${UMBRA_SANITIZER_DEFINE})
 add_test(NAME umbra_test COMMAND umbra_test)
+
+# ------------------------------------------------------------------- relay
+#
+# A SEPARATE ARCHIVE THAT DOES NOT LINK THE CRDTS OR THE CRYPTO, and the
+# separation is the design rather than tidiness: the relay must not be able to
+# understand an operation, so it must not be able to CALL anything that could.
+# If a future change makes relay/ need umbra::umbra, that is the moment to ask
+# why.
+add_library(umbra_relay STATIC relay/wire.cc relay/store.cc relay/server.cc)
+target_include_directories(umbra_relay PUBLIC relay)
+target_link_libraries(umbra_relay PUBLIC basalt::basalt)
+target_compile_options(umbra_relay PRIVATE ${UMBRA_CXX_FLAGS})
+
+add_executable(umbra_relay_bin cmd/relay_main.cc)
+set_target_properties(umbra_relay_bin PROPERTIES OUTPUT_NAME umbra_relay)
+target_link_libraries(umbra_relay_bin PRIVATE umbra_relay Threads::Threads)
+target_compile_options(umbra_relay_bin PRIVATE ${UMBRA_CXX_FLAGS})
 
 # ------------------------------------------------------ convergence harness
 #

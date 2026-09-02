@@ -107,6 +107,21 @@ struct LoggedOp {
 // vault rotated is not knowing anything about its contents.
 constexpr std::size_t kEnvelopeBytes = 4;
 
+// An operation exactly as it is stored: still sealed, with the epoch that
+// sealed it.
+//
+// PUSHED TO A RELAY VERBATIM, and that is not an optimization. Decrypting and
+// re-sealing would draw a fresh nonce, so the same operation would produce
+// different bytes on every push and the relay could not recognise a repeat. A
+// client that crashed mid-push would then store the operation twice under
+// different ciphertext, and idempotency -- the thing that makes a crashed push
+// safe to simply retry -- would be gone.
+struct StoredBlob {
+  OpId id;
+  uint32_t epoch = 0;
+  std::string sealed;
+};
+
 class OpLog {
  public:
   // Without keys: payloads are stored as-is. Used by tests that are about the
@@ -158,6 +173,26 @@ class OpLog {
   // The sync cursor: everything from one replica strictly after `after`.
   LogStatus ReadFrom(const ObjectId& object, const ReplicaId& replica,
                      uint64_t after, std::vector<Op>* out) const;
+
+  // Stored form, undecrypted, from one source after a counter. What push uses.
+  LogStatus ReadStoredFrom(const ObjectId& object, const ReplicaId& replica,
+                           uint64_t after, std::vector<StoredBlob>* out) const;
+
+  // Which replicas have written to this object, and how far one has got.
+  bool SourcesFor(const ObjectId& object, std::vector<ReplicaId>* out) const;
+  bool HighestFrom(const ObjectId& object, const ReplicaId& replica,
+                   uint64_t* out) const;
+
+  // ----------------------------------------------------------- cursors
+  //
+  // Durable, in the same store as the log, because a cursor that survived a
+  // crash differently from the operations it describes would be worse than no
+  // cursor at all. Keyed under a reserved prefix so they cannot collide with an
+  // operation.
+  bool GetCursor(const ObjectId& object, const ReplicaId& source,
+                 uint64_t* out) const;
+  bool SetCursor(const ObjectId& object, const ReplicaId& source,
+                 uint64_t value);
 
   // Basalt's Write never blocks on I/O; this is the durability point. An
   // operation is not published until this has returned for the batch that

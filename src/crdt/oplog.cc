@@ -387,6 +387,131 @@ LogStatus OpLog::Replay(const ObjectId& object, TextDoc* doc,
   return pending.empty() ? LogStatus::kOk : LogStatus::kNotClosed;
 }
 
+namespace {
+
+// Cursors live under a different first byte from operations, so the two key
+// spaces cannot overlap however the ids fall.
+std::string CursorKey(const ObjectId& object, const ReplicaId& source) {
+  std::string k(1, 'c');
+  k.append(reinterpret_cast<const char*>(object.bytes.data()),
+           object.bytes.size());
+  k.append(reinterpret_cast<const char*>(source.bytes.data()),
+           source.bytes.size());
+  return k;
+}
+
+}  // namespace
+
+LogStatus OpLog::ReadStoredFrom(const ObjectId& object,
+                                const ReplicaId& replica, uint64_t after,
+                                std::vector<StoredBlob>* out) const {
+  if (after == UINT64_MAX) return LogStatus::kReadFailed;
+  const std::string lo = MakeOpLogKey(object, replica, after + 1);
+  std::string hi = MakeOpLogKey(object, replica, UINT64_MAX);
+  hi.push_back('\0');
+
+  basalt::IterOptions o;
+  o.lower = basalt::Bound::At(basalt::Slice(lo));
+  o.upper = basalt::Bound::At(basalt::Slice(hi));
+  std::unique_ptr<basalt::Iterator> it = impl_->db->NewIter(o);
+  for (bool ok = it->First(); ok; ok = it->Next()) {
+    StoredBlob b;
+    ObjectId obj;
+    if (!ParseOpLogKey(it->Key().ToString(), &obj, &b.id.replica,
+                       &b.id.counter)) {
+      (void)it->Close();
+      return LogStatus::kCorrupt;
+    }
+    const std::string stored = it->Value().ToString();
+    if (impl_->keys == nullptr) {
+      b.epoch = 0;
+      b.sealed = stored;
+    } else {
+      if (!GetEnvelope(stored, &b.epoch)) {
+        (void)it->Close();
+        return LogStatus::kCorrupt;
+      }
+      b.sealed = stored.substr(kEnvelopeBytes);
+    }
+    out->push_back(b);
+  }
+  const basalt::Status err = it->Error();
+  (void)it->Close();
+  return err.ok() ? LogStatus::kOk : LogStatus::kReadFailed;
+}
+
+bool OpLog::SourcesFor(const ObjectId& object,
+                       std::vector<ReplicaId>* out) const {
+  const std::string lo = MakeOpLogKey(object, ReplicaId{}, 0);
+  ReplicaId max_replica;
+  for (std::size_t i = 0; i < max_replica.bytes.size(); ++i) {
+    max_replica.bytes[i] = 0xFF;
+  }
+  std::string hi = MakeOpLogKey(object, max_replica, UINT64_MAX);
+  hi.push_back('\0');
+
+  basalt::IterOptions o;
+  o.lower = basalt::Bound::At(basalt::Slice(lo));
+  o.upper = basalt::Bound::At(basalt::Slice(hi));
+  std::unique_ptr<basalt::Iterator> it = impl_->db->NewIter(o);
+  ReplicaId last;
+  bool have_last = false;
+  for (bool ok = it->First(); ok; ok = it->Next()) {
+    ObjectId obj;
+    ReplicaId rep;
+    uint64_t counter = 0;
+    if (!ParseOpLogKey(it->Key().ToString(), &obj, &rep, &counter)) continue;
+    if (!have_last || !(rep == last)) {
+      out->push_back(rep);
+      last = rep;
+      have_last = true;
+    }
+  }
+  const basalt::Status err = it->Error();
+  (void)it->Close();
+  return err.ok();
+}
+
+bool OpLog::HighestFrom(const ObjectId& object, const ReplicaId& replica,
+                        uint64_t* out) const {
+  std::vector<StoredBlob> blobs;
+  if (ReadStoredFrom(object, replica, 0, &blobs) != LogStatus::kOk)
+    return false;
+  if (blobs.empty()) return false;
+  *out = blobs.back().id.counter;
+  return true;
+}
+
+bool OpLog::GetCursor(const ObjectId& object, const ReplicaId& source,
+                      uint64_t* out) const {
+  std::string value;
+  // The key must outlive the Slice: basalt::Slice does not own its bytes, so a
+  // temporary here would be a dangling read.
+  const std::string key = CursorKey(object, source);
+  const basalt::Status s = impl_->db->Get(basalt::Slice(key), &value);
+  if (!s.ok() || value.size() != 8) return false;
+  *out = 0;
+  for (int i = 0; i < 8; ++i) {
+    *out |= static_cast<uint64_t>(
+                static_cast<unsigned char>(value[static_cast<std::size_t>(i)]))
+            << (8 * i);
+  }
+  return true;
+}
+
+bool OpLog::SetCursor(const ObjectId& object, const ReplicaId& source,
+                      uint64_t value) {
+  std::string v;
+  for (int i = 0; i < 8; ++i) {
+    v.push_back(static_cast<char>((value >> (8 * i)) & 0xFF));
+  }
+  basalt::WriteBatch batch;
+  const std::string key = CursorKey(object, source);
+  batch.Set(basalt::Slice(key), basalt::Slice(v));
+  basalt::wal::SeqNum seq = 0;
+  return impl_->db->Write(batch, &seq).ok();
+}
+
 LogStatus OpLog::Sync() {
   basalt::wal::SeqNum watermark = 0;
   const basalt::Status s = impl_->db->Sync(&watermark);
