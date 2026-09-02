@@ -170,6 +170,7 @@ add_library(umbra STATIC
   src/crdt/op.cc
   src/crdt/utf8.cc
   src/crdt/text_doc.cc
+  src/crdt/tree.cc
   src/crdt/oplog.cc
   src/crdt/vault.cc
   src/watcher/content_hash.cc
@@ -268,6 +269,7 @@ add_executable(umbra_test
   test/sanitizer_lane_test.cc
   test/watcher_test.cc
   test/crdt_test.cc
+  test/tree_test.cc
   test/oplog_test.cc
   test/converge_test.cc
 )
