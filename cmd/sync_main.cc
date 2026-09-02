@@ -241,6 +241,39 @@ bool SaveEpochWrap(const std::string& dir, const VaultKeys& keys, Epoch e) {
   return true;
 }
 
+// WHO THIS DEVICE HAS LET IN, kept locally.
+//
+// The obvious place to look is the relay: every grant envelope names the device
+// it was sealed to. But the relay controls that list. It can hide a grant, and
+// worse, it can REPLAY one -- so a revocation that reads its device list from
+// the relay can be made to seal the new epoch key to the very device the user
+// just removed. The list has to come from somewhere the relay cannot write.
+//
+// This device approved these devices, so this device knows. The file is a
+// sequence of 32-byte public keys.
+std::vector<std::array<uint8_t, kPublicKeyBytes>> LoadRoster(
+    const std::string& dir) {
+  std::vector<std::array<uint8_t, kPublicKeyBytes>> out;
+  std::string bytes;
+  if (!ReadWholeFile(dir + "/.umbra/enrolled", &bytes)) return out;
+  for (std::size_t off = 0; off + kPublicKeyBytes <= bytes.size();
+       off += kPublicKeyBytes) {
+    std::array<uint8_t, kPublicKeyBytes> k{};
+    std::memcpy(k.data(), bytes.data() + off, kPublicKeyBytes);
+    out.push_back(k);
+  }
+  return out;
+}
+
+bool SaveRoster(const std::string& dir,
+                const std::vector<std::array<uint8_t, kPublicKeyBytes>>& r) {
+  std::string bytes;
+  for (const std::array<uint8_t, kPublicKeyBytes>& k : r) {
+    bytes.append(reinterpret_cast<const char*>(k.data()), k.size());
+  }
+  return WriteWholeFile(dir + "/.umbra/enrolled", bytes);
+}
+
 // The tag an envelope is filed under. A request is filed under the joining
 // device's public key; a grant under the same key with the high bit of the
 // first byte flipped, so the two never collide and the relay still sees only
@@ -615,6 +648,19 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "cannot reach the relay\n");
         return 1;
       }
+      {
+        std::vector<std::array<uint8_t, kPublicKeyBytes>> roster =
+            LoadRoster(root);
+        bool known = false;
+        for (const std::array<uint8_t, kPublicKeyBytes>& k : roster) {
+          if (k == g.to) known = true;
+        }
+        if (!known) roster.push_back(g.to);
+        if (!SaveRoster(root, roster)) {
+          std::fprintf(stderr, "cannot record the enrolled device\n");
+          return 1;
+        }
+      }
       std::printf(
           "approved %s at epoch %u.\n"
           "  pairing code %s\n"
@@ -633,35 +679,33 @@ int main(int argc, char** argv) {
 
   if (mode == Mode::kRevoke) {
     // Rotation is the whole mechanism: a new random epoch key, sealed to the
-    // devices that remain and not to the one being removed.
-    std::vector<relay::Envelope> envelopes;
-    if (client.CollectEnvelopes(&envelopes) != sync::SyncStatus::kOk) {
-      std::fprintf(stderr, "cannot reach the relay\n");
-      return 1;
-    }
+    // devices that remain and not to the one being removed. The list of who
+    // remains comes from this device's own record, never from the relay -- see
+    // LoadRoster.
     std::vector<std::array<uint8_t, kPublicKeyBytes>> keep;
     bool found = false;
-    for (const relay::Envelope& e : envelopes) {
-      sync::EnrollGrant g;
-      if (!sync::DecodeEnrollGrant(e.body, &g)) continue;
-      ReplicaId who;
-      {
-        DeviceKeyPair probe;
-        probe.public_key = g.to;
-        who = probe.Replica();
-      }
-      if (sync::DeviceLabel(who) == target) {
+    for (const std::array<uint8_t, kPublicKeyBytes>& pub : LoadRoster(root)) {
+      DeviceKeyPair probe;
+      probe.public_key = pub;
+      if (sync::DeviceLabel(probe.Replica()) == target) {
         found = true;
         continue;
       }
-      keep.push_back(g.to);
+      keep.push_back(pub);
     }
     if (!found) {
-      std::fprintf(stderr, "no enrolled device %s\n", target.c_str());
+      std::fprintf(stderr,
+                   "this device did not enrol %s, so it cannot remove it.\n"
+                   "Run --revoke on the device that approved it.\n",
+                   target.c_str());
       return 1;
     }
     const Epoch next = keys.Rotate();
     if (!SaveEpochWrap(root, keys, next)) return 1;
+    if (!SaveRoster(root, keep)) {
+      std::fprintf(stderr, "cannot record the remaining devices\n");
+      return 1;
+    }
     for (const std::array<uint8_t, kPublicKeyBytes>& pub : keep) {
       CryptoStatus st = CryptoStatus::kOk;
       sync::EnrollGrant g;

@@ -91,6 +91,28 @@ of its own that nobody else is in.
 This is not a leak. The relay sees the vault id on every request ever made
 against that vault.
 
+## The enrolled set does not come from the relay
+
+Revocation seals the new epoch key to the devices that remain. The obvious place
+to get that list is the relay -- every grant envelope names the device it was
+sealed to -- and it is the wrong place, because the relay controls it.
+
+Hiding a grant would be survivable: a device simply does not get the new key and
+stops syncing, which is visible. **Replaying one is not.** A relay that re-serves
+a grant it saw before puts the removed device back in the list, and the very
+command the user ran to remove it seals the new epoch key to it. The revocation
+would report success and do the opposite of what it said.
+
+So the list is kept locally, in `.umbra/enrolled`: this device approved these
+devices, so this device knows. The relay is never consulted.
+
+The residual limit, stated: **a device can only revoke devices it approved
+itself.** If two devices have each let others in, neither holds the whole list,
+and `--revoke` says so and names the device to run it on rather than rotating
+against a list it knows is partial. A shared authenticated roster -- sealed
+under the epoch key the way device reports are, so the relay can carry it
+without being able to write it -- is the way to close that, and is not built.
+
 ## Consequences
 
 **The residual risk is stated, not defaulted away.** If the user does not

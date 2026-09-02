@@ -306,6 +306,13 @@ epoch key.
 
 ## 7. Revocation, and what it cannot do
 
+**The list of devices to re-key is local, never the relay's.** A relay that
+replayed an old grant envelope could otherwise put a removed device back into
+the set that gets the new epoch key, and the command the user ran to remove it
+would seal the key to it. See [ADR 0004](adr/0004-enrolment.md). The cost is
+that a device can only revoke devices it approved itself; it says so rather than
+rotating against a list it knows is partial.
+
 Removing a device rotates keys so that **writes made after the rotation cannot
 be read by the removed device**. That is the whole of the guarantee.
 
