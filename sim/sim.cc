@@ -1599,6 +1599,24 @@ void RunRelayReplaysOldCiphertext(Sim* s) {
 // means for this design: one device has made a million operations and another
 // has made three. The chain is per (object, replica) and must not care; the
 // marks must not care either.
+//
+// WHAT THIS SCHEDULE CATCHES, MEASURED RATHER THAN ASSUMED. Deliberate breakage
+// found the line:
+//
+//   - Observe() made a complete no-op, so a replica never advances its clock
+//     for anything it RECEIVES: every schedule still converges. Cross-replica
+//     observation turns out not to be load-bearing here, because every
+//     operation carries its own id and ties break by replica id, so causally
+//     inconsistent timestamps still order identically on every replica.
+//   - Tick() made not to advance for single-id operations, so a replica reuses
+//     its OWN counters: this schedule fails, and so do tree-random and
+//     relay-stale-view, while the plain random schedule still passes because
+//     its text inserts are runs and runs still advance.
+//
+// So the property is uniqueness within a replica, not agreement between them.
+// That is worth having written down: it is the same property the Vault violated
+// when ApplyTreeOp did not advance the clock, and a reader who assumes the
+// clock is about ordering will not see why that mattered.
 void RunClockSkew(Sim* s) {
   const std::size_t n = s->replicas.size();
   std::vector<ObjectId> dirs;
