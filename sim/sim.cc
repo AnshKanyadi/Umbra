@@ -694,7 +694,14 @@ struct Sim {
       DeviceReport rep;
       rep.device = r.id;
       for (const Replica& source : replicas) {
-        rep.have[source.id] = PrefixMark(i, source.id);
+        const uint64_t m = PrefixMark(i, source.id);
+        // A ZERO MARK IS OMITTED, not sent as a zero, because that is what a
+        // wire format does -- there is no reason to spend bytes saying "I have
+        // nothing from this device". It also means the watermark must read a
+        // MISSING entry as "has nothing" rather than "no constraint", which is
+        // deliberate defect C3 and was unreachable while this loop wrote a zero
+        // for every source.
+        if (m > 0) rep.have[source.id] = m;
       }
       rep.clock = r.clock.counter();
       reports.push_back(rep);
