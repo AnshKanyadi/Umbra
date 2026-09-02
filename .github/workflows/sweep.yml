@@ -1,0 +1,93 @@
+# The wide convergence sweep, under sanitizers, on a schedule.
+#
+# WHY THIS IS NOT ON EVERY PUSH. Measured on an M-series laptop over 1000 seeds
+# and 13 schedule shapes -- 13000 schedules:
+#
+#     uninstrumented   ~50s   (this one IS on every push, in ci.yml)
+#     UBSan            518s
+#     ASan             566s
+#
+# Nine to ten minutes each, and slower on a runner. Adding twenty minutes to
+# every push is how a lane becomes something people work around, so the split
+# is: a narrow range on every push where the cost is invisible, and a wide range
+# here where the width is the point.
+#
+# A CRDT THAT HAS NEVER SEEN ASan OVER RARE SCHEDULES IS A GAP, NOT A DECISION,
+# which is why this exists rather than the sweep simply staying uninstrumented.
+# The rare schedules are where the interesting memory bugs would be: the
+# undo/redo path in the tree only runs deeply when operations arrive far out of
+# order, and that is a tail event.
+#
+# THE SEED RANGE IS FIXED, not randomised per run. A lane that runs different
+# seeds every night produces failures nobody can reproduce from the log. When
+# this range has been clean for long enough to be boring, move it -- as a
+# commit, so the change is visible.
+name: sweep
+
+on:
+  schedule:
+    # 04:00 UTC daily. Nothing depends on the hour; it is outside the working
+    # day for the author's timezone so a red result is waiting rather than
+    # interrupting.
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      from:
+        description: 'first seed'
+        default: '0'
+      to:
+        description: 'last seed, exclusive'
+        default: '1000'
+
+permissions:
+  contents: read
+
+jobs:
+  wide:
+    name: sweep ${{ matrix.sanitizer }} (seeds 0..1000)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, undefined]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: configure
+        run: cmake -S . -B build -DUMBRA_SANITIZER=${{ matrix.sanitizer }}
+
+      - name: build
+        run: cmake --build build --target umbra_converge -j "$(nproc)"
+
+      - name: sweep
+        env:
+          # detect_leaks is off for the same reason the asan lane in ci.yml has
+          # it off: the sweep allocates and abandons whole replica states by
+          # design when it crashes one, and leak-checking that reports the
+          # simulation's own bookkeeping rather than a defect.
+          ASAN_OPTIONS: abort_on_error=0:detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: |
+          FROM="${{ github.event.inputs.from }}"
+          TO="${{ github.event.inputs.to }}"
+          ./build/umbra_converge --from "${FROM:-0}" --to "${TO:-1000}"
+
+  # The tree's undo/redo is O(k) in how far out of order an operation arrives,
+  # so a schedule with more replicas and more steps reaches deeper redo chains
+  # than the default. Cheap enough to run beside the wide one.
+  deep:
+    name: sweep deep (6 replicas, 800 steps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: cmake -S . -B build -DUMBRA_SANITIZER=address
+      - run: cmake --build build --target umbra_converge -j "$(nproc)"
+      - env:
+          ASAN_OPTIONS: abort_on_error=0:detect_leaks=0
+        run: ./build/umbra_converge --from 0 --to 120 --replicas 6 --steps 800
