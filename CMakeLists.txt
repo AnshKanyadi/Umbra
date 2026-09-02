@@ -165,6 +165,21 @@ endif()
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
+# THE WIRE FORMAT IS NOT THE RELAY. A client has to speak the protocol, so it
+# needs these types; it must not therefore link the relay's store and its TCP
+# server. The library used to link the whole umbra_relay archive to reach
+# wire.h, which put a listening server inside libumbra.a and made the public
+# header include/umbra/sync/client.h depend on the relay's include path -- the
+# library-only CI job caught it as a missing wire.h.
+#
+# umbra_wire depends on nothing. Not on basalt, not on sodium, not on umbra.
+# It is defined HERE, above its first consumer, because a target named in
+# target_link_libraries before it exists does not propagate its include path
+# and the failure looks like a missing header rather than a missing target.
+add_library(umbra_wire STATIC relay/wire.cc)
+target_include_directories(umbra_wire PUBLIC relay)
+target_compile_options(umbra_wire PRIVATE ${UMBRA_CXX_FLAGS})
+
 add_library(umbra STATIC
   src/crdt/op_id.cc
   src/crdt/op.cc
@@ -202,7 +217,7 @@ target_compile_options(umbra PRIVATE ${UMBRA_CXX_FLAGS})
 # gets a 32-byte digest and no libsodium headers.
 target_link_libraries(umbra PUBLIC basalt::basalt Threads::Threads)
 target_link_libraries(umbra PRIVATE umbra::sodium)
-target_link_libraries(umbra PUBLIC umbra_relay)
+target_link_libraries(umbra PUBLIC umbra_wire)
 
 # THE BACKEND IS CHOSEN HERE AND NOT WITH #ifdef INSIDE ONE FILE. Both backend
 # sources are compiled on both platforms; each is a no-op translation unit off
@@ -287,8 +302,10 @@ add_executable(umbra_test
 # libsodium's own MODERATE constants, which means it has to see them. Asserting
 # against numbers copied into the test would assert that two copies of a number
 # match, which is not the claim being made.
-target_link_libraries(umbra_test PRIVATE umbra_testing umbra_sim umbra::sodium
-                                         gtest_main)
+# umbra_relay explicitly: relay_test.cc runs a real store and a real server, so
+# the test binary needs the half the client does not.
+target_link_libraries(umbra_test PRIVATE umbra_testing umbra_sim umbra_relay
+                                         umbra::sodium gtest_main)
 target_include_directories(umbra_test PRIVATE src src/watcher src/crdt src/crypto src/sync)
 target_compile_options(umbra_test PRIVATE ${UMBRA_CXX_FLAGS})
 target_compile_definitions(umbra_test PRIVATE ${UMBRA_SANITIZER_DEFINE})
@@ -301,9 +318,9 @@ add_test(NAME umbra_test COMMAND umbra_test)
 # understand an operation, so it must not be able to CALL anything that could.
 # If a future change makes relay/ need umbra::umbra, that is the moment to ask
 # why.
-add_library(umbra_relay STATIC relay/wire.cc relay/store.cc relay/server.cc)
+add_library(umbra_relay STATIC relay/store.cc relay/server.cc)
 target_include_directories(umbra_relay PUBLIC relay)
-target_link_libraries(umbra_relay PUBLIC basalt::basalt)
+target_link_libraries(umbra_relay PUBLIC umbra_wire basalt::basalt)
 target_compile_options(umbra_relay PRIVATE ${UMBRA_CXX_FLAGS})
 
 add_executable(umbra_sync cmd/sync_main.cc)
