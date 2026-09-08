@@ -1,6 +1,6 @@
 // A vault client.
 //
-//     umbra_sync --dir ~/notes --relay 127.0.0.1:9000 --pass "..." --once
+//     umbra_sync --dir ~/notes --relay 127.0.0.1:9000 --pass-file ~/.umbra-pass --once
 //
 // Scans a folder of markdown files, turns what changed into operations, pushes
 // them to a relay, pulls what other devices pushed, and writes the merged result
@@ -13,6 +13,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <array>
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <string>
@@ -162,6 +164,94 @@ void RebuildFromLog(OpLog* log, Vault* v) {
   }
 }
 
+// READING THE PASSPHRASE.
+//
+// It used to come from --pass, which puts the key to the whole vault in the
+// shell history, in `ps` output for every other user on the machine, and in any
+// shell tracing that happens to be on. That is a security defect in a security
+// product, and the fact that it was convenient for driving tests is not a
+// reason to ship it.
+//
+// Three sources, in the order a person would expect:
+//
+//   --pass-file PATH   read it from a file, first line, newline stripped
+//   UMBRA_PASSPHRASE   read it from the environment
+//   (neither)          prompt on the terminal with echo off
+//
+// A file is the one that scripts should use: it has an owner and a mode, unlike
+// an argument vector. The environment variable is there because containers and
+// service managers have no other sane channel; it is still visible to anything
+// that can read /proc/<pid>/environ on Linux, so it is documented as the weaker
+// option rather than presented as equivalent.
+//
+// THE PROMPT TURNS ECHO OFF AND PUTS IT BACK, including when it is interrupted.
+// A prompt that leaves a terminal with echo disabled after a Ctrl-C is a bug
+// people remember.
+bool ReadPassphraseFromFile(const std::string& path, std::string* out) {
+  std::string bytes;
+  if (!ReadWholeFile(path, &bytes)) {
+    std::fprintf(stderr, "cannot read the passphrase file %s\n", path.c_str());
+    return false;
+  }
+  const std::string::size_type nl = bytes.find('\n');
+  *out = (nl == std::string::npos) ? bytes : bytes.substr(0, nl);
+  if (!out->empty() && out->back() == '\r') out->pop_back();
+  if (out->empty()) {
+    std::fprintf(stderr, "the passphrase file %s is empty\n", path.c_str());
+    return false;
+  }
+  return true;
+}
+
+// Restores the terminal on the way out however the scope is left.
+class EchoOff {
+ public:
+  explicit EchoOff(int fd) : fd_(fd) {
+    if (::tcgetattr(fd_, &saved_) != 0) return;
+    ok_ = true;
+    struct termios quiet = saved_;
+    quiet.c_lflag = static_cast<tcflag_t>(quiet.c_lflag & ~ECHO);
+    (void)::tcsetattr(fd_, TCSAFLUSH, &quiet);
+  }
+  ~EchoOff() {
+    if (ok_) (void)::tcsetattr(fd_, TCSAFLUSH, &saved_);
+  }
+  EchoOff(const EchoOff&) = delete;
+  EchoOff& operator=(const EchoOff&) = delete;
+
+ private:
+  int fd_;
+  bool ok_ = false;
+  struct termios saved_{};
+};
+
+bool PromptForPassphrase(const std::string& label, std::string* out) {
+  if (::isatty(STDIN_FILENO) == 0) {
+    std::fprintf(stderr,
+                 "no terminal to prompt on. Use --pass-file PATH or set "
+                 "UMBRA_PASSPHRASE.\n");
+    return false;
+  }
+  std::fprintf(stderr, "%s", label.c_str());
+  std::fflush(stderr);
+  std::string line;
+  {
+    EchoOff quiet(STDIN_FILENO);
+    if (!std::getline(std::cin, line)) {
+      std::fprintf(stderr, "\n");
+      return false;
+    }
+  }
+  std::fprintf(stderr, "\n");
+  if (!line.empty() && line.back() == '\r') line.pop_back();
+  if (line.empty()) {
+    std::fprintf(stderr, "empty passphrase\n");
+    return false;
+  }
+  out->swap(line);
+  return true;
+}
+
 // What the user asked this run to do.
 enum class Mode { kSync, kCreate, kEnrol, kApprove, kRevoke };
 
@@ -301,7 +391,7 @@ double SecondsSince(const std::chrono::steady_clock::time_point& t) {
 void Usage() {
   std::fprintf(
       stderr,
-      "umbra_sync --dir PATH --relay HOST:PORT --pass PASSPHRASE\n"
+      "umbra_sync --dir PATH --relay HOST:PORT [--pass-file PATH]\n"
       "           [--create | --enrol | --approve DEVICE | --revoke DEVICE]\n"
       "           [--vault HEX] [--code NNNNNN] [--once | --watch]\n"
       "           [--interval SECONDS] [-v]\n"
@@ -318,8 +408,10 @@ void Usage() {
       "joining device showed. If they do not match, something is between\n"
       "you and the relay: do not approve.\n"
       "\n"
-      "--pass on the command line is for driving tests. A real client\n"
-      "prompts or reads a keychain; this lands in shell history.\n");
+      "The passphrase comes from --pass-file PATH, or the environment\n"
+      "variable UMBRA_PASSPHRASE, or a prompt with echo off. It is never\n"
+      "taken from the command line: an argument vector is visible in shell\n"
+      "history and in ps.\n");
 }
 
 }  // namespace
@@ -332,6 +424,7 @@ int main(int argc, char** argv) {
   std::string target;
   std::string typed_code;
   std::string vault_hex;
+  std::string pass_file;
   bool watch = false;
   int interval = 2;
   bool verbose = false;
@@ -345,9 +438,15 @@ int main(int argc, char** argv) {
     } else if (a == "--relay" && next) {
       relay = next;
       ++i;
-    } else if (a == "--pass" && next) {
-      pass = next;
+    } else if (a == "--pass-file" && next) {
+      pass_file = next;
       ++i;
+    } else if (a == "--pass" && next) {
+      std::fprintf(stderr,
+                   "--pass is gone. It put the vault passphrase in your shell "
+                   "history and in ps output.\nUse --pass-file PATH, set "
+                   "UMBRA_PASSPHRASE, or let it prompt.\n");
+      return 2;
     } else if (a == "--create") {
       mode = Mode::kCreate;
     } else if (a == "--enrol" || a == "--enroll") {
@@ -380,9 +479,21 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
-  if (dir.empty() || pass.empty()) {
+  if (dir.empty()) {
     Usage();
     return 2;
+  }
+  // File, then environment, then prompt. See the note above
+  // ReadPassphraseFromFile for why --pass is no longer among them.
+  if (!pass_file.empty()) {
+    if (!ReadPassphraseFromFile(pass_file, &pass)) return 1;
+  } else {
+    const char* from_env = std::getenv("UMBRA_PASSPHRASE");
+    if (from_env != nullptr && *from_env != '\0') {
+      pass = from_env;
+    } else if (!PromptForPassphrase("vault passphrase: ", &pass)) {
+      return 1;
+    }
   }
 
   const std::size_t colon = relay.rfind(':');
@@ -595,7 +706,7 @@ int main(int argc, char** argv) {
         "  this device %s\n"
         "\n"
         "On a device that is already in the vault, run:\n"
-        "  umbra_sync --dir PATH --relay %s --pass ... --approve %s\n"
+        "  umbra_sync --dir PATH --relay %s --pass-file F --approve %s\n"
         "\n"
         "It will print a six digit code. Come back here with\n"
         "  --enrol --vault %s --code NNNNNN\n"
@@ -666,7 +777,7 @@ int main(int argc, char** argv) {
           "  pairing code %s\n"
           "\n"
           "On that device run:\n"
-          "  umbra_sync --dir PATH --relay %s --pass ... --enrol --code %s\n"
+          "  umbra_sync --dir PATH --relay %s --pass-file F --enrol --code %s\n"
           "It will show the same six digits. If it shows different ones, do\n"
           "not enrol it.\n",
           target.c_str(), g.epoch, code.c_str(), relay.c_str(),
