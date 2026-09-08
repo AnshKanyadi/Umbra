@@ -1,0 +1,16 @@
+# LINE ENDINGS ARE CONTENT HERE, NOT FORMATTING.
+#
+# Chunking is a pure function of a document's bytes and Phase 5 shares one index
+# between devices, so a fixture that arrives as CRLF on one machine and LF on
+# another is not the same fixture -- it chunks differently, hashes differently,
+# and the determinism test fails for a reason that has nothing to do with the
+# chunker. Git's autocrlf would do exactly that, silently, on a Windows
+# checkout.
+#
+# So: no translation, anywhere, for anything.
+* -text
+
+# The chunking fixtures are the case this file exists for. One of them contains
+# deliberate CRLF line endings BECAUSE that is a real thing to find in a vault,
+# and it must survive a round trip through a clone.
+test/fixtures/** -text -diff

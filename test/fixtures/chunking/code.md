@@ -1,0 +1,132 @@
+# Code
+
+Some prose before the block.
+
+```cpp
+  int value_000 = compute(0, 0);  // a line of real length to push the block over budget
+  int value_001 = compute(1, 7);  // a line of real length to push the block over budget
+  int value_002 = compute(2, 14);  // a line of real length to push the block over budget
+  int value_003 = compute(3, 21);  // a line of real length to push the block over budget
+  int value_004 = compute(4, 28);  // a line of real length to push the block over budget
+  int value_005 = compute(5, 35);  // a line of real length to push the block over budget
+  int value_006 = compute(6, 42);  // a line of real length to push the block over budget
+  int value_007 = compute(7, 49);  // a line of real length to push the block over budget
+  int value_008 = compute(8, 56);  // a line of real length to push the block over budget
+  int value_009 = compute(9, 63);  // a line of real length to push the block over budget
+  int value_010 = compute(10, 70);  // a line of real length to push the block over budget
+  int value_011 = compute(11, 77);  // a line of real length to push the block over budget
+  int value_012 = compute(12, 84);  // a line of real length to push the block over budget
+  int value_013 = compute(13, 91);  // a line of real length to push the block over budget
+  int value_014 = compute(14, 98);  // a line of real length to push the block over budget
+  int value_015 = compute(15, 105);  // a line of real length to push the block over budget
+  int value_016 = compute(16, 112);  // a line of real length to push the block over budget
+  int value_017 = compute(17, 119);  // a line of real length to push the block over budget
+  int value_018 = compute(18, 126);  // a line of real length to push the block over budget
+  int value_019 = compute(19, 133);  // a line of real length to push the block over budget
+  int value_020 = compute(20, 140);  // a line of real length to push the block over budget
+  int value_021 = compute(21, 147);  // a line of real length to push the block over budget
+  int value_022 = compute(22, 154);  // a line of real length to push the block over budget
+  int value_023 = compute(23, 161);  // a line of real length to push the block over budget
+  int value_024 = compute(24, 168);  // a line of real length to push the block over budget
+  int value_025 = compute(25, 175);  // a line of real length to push the block over budget
+  int value_026 = compute(26, 182);  // a line of real length to push the block over budget
+  int value_027 = compute(27, 189);  // a line of real length to push the block over budget
+  int value_028 = compute(28, 196);  // a line of real length to push the block over budget
+  int value_029 = compute(29, 203);  // a line of real length to push the block over budget
+  int value_030 = compute(30, 210);  // a line of real length to push the block over budget
+  int value_031 = compute(31, 217);  // a line of real length to push the block over budget
+  int value_032 = compute(32, 224);  // a line of real length to push the block over budget
+  int value_033 = compute(33, 231);  // a line of real length to push the block over budget
+  int value_034 = compute(34, 238);  // a line of real length to push the block over budget
+  int value_035 = compute(35, 245);  // a line of real length to push the block over budget
+  int value_036 = compute(36, 252);  // a line of real length to push the block over budget
+  int value_037 = compute(37, 259);  // a line of real length to push the block over budget
+  int value_038 = compute(38, 266);  // a line of real length to push the block over budget
+  int value_039 = compute(39, 273);  // a line of real length to push the block over budget
+  int value_040 = compute(40, 280);  // a line of real length to push the block over budget
+  int value_041 = compute(41, 287);  // a line of real length to push the block over budget
+  int value_042 = compute(42, 294);  // a line of real length to push the block over budget
+  int value_043 = compute(43, 301);  // a line of real length to push the block over budget
+  int value_044 = compute(44, 308);  // a line of real length to push the block over budget
+  int value_045 = compute(45, 315);  // a line of real length to push the block over budget
+  int value_046 = compute(46, 322);  // a line of real length to push the block over budget
+  int value_047 = compute(47, 329);  // a line of real length to push the block over budget
+  int value_048 = compute(48, 336);  // a line of real length to push the block over budget
+  int value_049 = compute(49, 343);  // a line of real length to push the block over budget
+  int value_050 = compute(50, 350);  // a line of real length to push the block over budget
+  int value_051 = compute(51, 357);  // a line of real length to push the block over budget
+  int value_052 = compute(52, 364);  // a line of real length to push the block over budget
+  int value_053 = compute(53, 371);  // a line of real length to push the block over budget
+  int value_054 = compute(54, 378);  // a line of real length to push the block over budget
+  int value_055 = compute(55, 385);  // a line of real length to push the block over budget
+  int value_056 = compute(56, 392);  // a line of real length to push the block over budget
+  int value_057 = compute(57, 399);  // a line of real length to push the block over budget
+  int value_058 = compute(58, 406);  // a line of real length to push the block over budget
+  int value_059 = compute(59, 413);  // a line of real length to push the block over budget
+  int value_060 = compute(60, 420);  // a line of real length to push the block over budget
+  int value_061 = compute(61, 427);  // a line of real length to push the block over budget
+  int value_062 = compute(62, 434);  // a line of real length to push the block over budget
+  int value_063 = compute(63, 441);  // a line of real length to push the block over budget
+  int value_064 = compute(64, 448);  // a line of real length to push the block over budget
+  int value_065 = compute(65, 455);  // a line of real length to push the block over budget
+  int value_066 = compute(66, 462);  // a line of real length to push the block over budget
+  int value_067 = compute(67, 469);  // a line of real length to push the block over budget
+  int value_068 = compute(68, 476);  // a line of real length to push the block over budget
+  int value_069 = compute(69, 483);  // a line of real length to push the block over budget
+  int value_070 = compute(70, 490);  // a line of real length to push the block over budget
+  int value_071 = compute(71, 497);  // a line of real length to push the block over budget
+  int value_072 = compute(72, 504);  // a line of real length to push the block over budget
+  int value_073 = compute(73, 511);  // a line of real length to push the block over budget
+  int value_074 = compute(74, 518);  // a line of real length to push the block over budget
+  int value_075 = compute(75, 525);  // a line of real length to push the block over budget
+  int value_076 = compute(76, 532);  // a line of real length to push the block over budget
+  int value_077 = compute(77, 539);  // a line of real length to push the block over budget
+  int value_078 = compute(78, 546);  // a line of real length to push the block over budget
+  int value_079 = compute(79, 553);  // a line of real length to push the block over budget
+  int value_080 = compute(80, 560);  // a line of real length to push the block over budget
+  int value_081 = compute(81, 567);  // a line of real length to push the block over budget
+  int value_082 = compute(82, 574);  // a line of real length to push the block over budget
+  int value_083 = compute(83, 581);  // a line of real length to push the block over budget
+  int value_084 = compute(84, 588);  // a line of real length to push the block over budget
+  int value_085 = compute(85, 595);  // a line of real length to push the block over budget
+  int value_086 = compute(86, 602);  // a line of real length to push the block over budget
+  int value_087 = compute(87, 609);  // a line of real length to push the block over budget
+  int value_088 = compute(88, 616);  // a line of real length to push the block over budget
+  int value_089 = compute(89, 623);  // a line of real length to push the block over budget
+  int value_090 = compute(90, 630);  // a line of real length to push the block over budget
+  int value_091 = compute(91, 637);  // a line of real length to push the block over budget
+  int value_092 = compute(92, 644);  // a line of real length to push the block over budget
+  int value_093 = compute(93, 651);  // a line of real length to push the block over budget
+  int value_094 = compute(94, 658);  // a line of real length to push the block over budget
+  int value_095 = compute(95, 665);  // a line of real length to push the block over budget
+  int value_096 = compute(96, 672);  // a line of real length to push the block over budget
+  int value_097 = compute(97, 679);  // a line of real length to push the block over budget
+  int value_098 = compute(98, 686);  // a line of real length to push the block over budget
+  int value_099 = compute(99, 693);  // a line of real length to push the block over budget
+  int value_100 = compute(100, 700);  // a line of real length to push the block over budget
+  int value_101 = compute(101, 707);  // a line of real length to push the block over budget
+  int value_102 = compute(102, 714);  // a line of real length to push the block over budget
+  int value_103 = compute(103, 721);  // a line of real length to push the block over budget
+  int value_104 = compute(104, 728);  // a line of real length to push the block over budget
+  int value_105 = compute(105, 735);  // a line of real length to push the block over budget
+  int value_106 = compute(106, 742);  // a line of real length to push the block over budget
+  int value_107 = compute(107, 749);  // a line of real length to push the block over budget
+  int value_108 = compute(108, 756);  // a line of real length to push the block over budget
+  int value_109 = compute(109, 763);  // a line of real length to push the block over budget
+  int value_110 = compute(110, 770);  // a line of real length to push the block over budget
+  int value_111 = compute(111, 777);  // a line of real length to push the block over budget
+  int value_112 = compute(112, 784);  // a line of real length to push the block over budget
+  int value_113 = compute(113, 791);  // a line of real length to push the block over budget
+  int value_114 = compute(114, 798);  // a line of real length to push the block over budget
+  int value_115 = compute(115, 805);  // a line of real length to push the block over budget
+  int value_116 = compute(116, 812);  // a line of real length to push the block over budget
+  int value_117 = compute(117, 819);  // a line of real length to push the block over budget
+  int value_118 = compute(118, 826);  // a line of real length to push the block over budget
+  int value_119 = compute(119, 833);  // a line of real length to push the block over budget
+```
+
+Prose after the block.
+
+```
+unterminated fence runs to the end
+and keeps going

@@ -294,6 +294,7 @@ add_executable(umbra_test
   test/crdt_test.cc
   test/tree_test.cc
   test/crypto_test.cc
+  test/chunk_test.cc
   test/enroll_test.cc
   test/relay_test.cc
   test/oplog_test.cc
@@ -312,6 +313,10 @@ target_link_libraries(umbra_test PRIVATE umbra_testing umbra_sim umbra_relay
 target_include_directories(umbra_test PRIVATE src src/watcher src/crdt src/crypto src/sync src/ai)
 target_compile_options(umbra_test PRIVATE ${UMBRA_CXX_FLAGS})
 target_compile_definitions(umbra_test PRIVATE ${UMBRA_SANITIZER_DEFINE})
+# The chunking fixtures are read at run time rather than embedded, so a person
+# can add one without touching the build. UMBRA_FIXTURES overrides it.
+target_compile_definitions(umbra_test PRIVATE
+  UMBRA_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/chunking")
 add_test(NAME umbra_test COMMAND umbra_test)
 
 # ------------------------------------------------------------------- relay
