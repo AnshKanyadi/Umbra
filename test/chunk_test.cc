@@ -44,13 +44,48 @@ bool ReadFile(const std::string& path, std::string* out) {
   return true;
 }
 
-// Every fixture, in a fixed order. Sorted by name so the corpus digest does not
-// depend on how a filesystem happens to enumerate a directory -- readdir order
-// is not specified and differs between APFS and ext4, which would make the
-// cross-platform test fail for a reason that has nothing to do with chunking.
-const char* const kFixtures[] = {
-    "basic.md",    "code.md",  "crlf.md",      "frontmatter.md", "links.md",
-    "longline.md", "mixed.md", "onlytable.md", "table.md",       "tiny.md",
+// EVERY FIXTURE AND ITS GOLDEN BOUNDARY DIGEST, IN ONE TABLE.
+//
+// This used to be two lists -- one of fixtures to exercise, one of expected
+// digests -- and a fixture was added to the first and not the second, so the
+// file that found a real splitting bug was not itself covered by the
+// determinism test. One table cannot drift against itself.
+//
+// Sorted by name so the corpus does not depend on directory enumeration order,
+// which is unspecified and differs between APFS and ext4.
+//
+// Regenerate with UMBRA_PRINT_DIGESTS=1 after a deliberate change to the
+// chunker, and update these in the SAME commit as the change. A mismatch on one
+// platform and not another is a portability bug and the fix belongs in the
+// chunker, not here.
+struct Golden {
+  const char* name;
+  const char* digest;
+};
+
+const Golden kCorpus[] = {
+    {"basic.md",
+     "f9298e19450b5e533e4d6e23bf1dab17a8702068a41cd477b496fb1bc68725ef"},
+    {"code.md",
+     "3d42b0420ffec355d7837c9d3cb427bc95f6265c0c9284d4180ad0945b253234"},
+    {"crlf.md",
+     "34973c45803a340e552330cdd9619fd33a3670d9dc3df43db90052f9a2b6d100"},
+    {"frontmatter.md",
+     "64a0922a9ff14d9f6992c24037bd3f35b975eeaeb0c9e4fe45456b03d4603071"},
+    {"links.md",
+     "fadab0e714f3468f4d372c21e31bfa13f6ea521c8364de2b5243890f095d8f44"},
+    {"listcode.md",
+     "e765288983bd0d8381940d7c6509d7d95d348066280c0f1bd11d70ebfbeedb7b"},
+    {"longline.md",
+     "109f2b2fa0718730fb306d17b835d61289ed501a01cabf2dcf7e4feffdf418d8"},
+    {"mixed.md",
+     "7abefdddcc516d01b4b1913f0821d427de3c23c9c8ea1a4903fb50ba1ada0b1e"},
+    {"onlytable.md",
+     "c61ff7950f830bd8193d87fce603273b5018176e77abb343c543d85d1cf0acc5"},
+    {"table.md",
+     "6b88c0fad7cc0bba2faf77b119aef62e261500afcbd67205052797185b0c42b6"},
+    {"tiny.md",
+     "d6a0d6d54dd4e301e0cbaae45ac0dd251f09c45c3036742c44a18a615316c398"},
 };
 
 std::string LoadFixture(const std::string& name) {
@@ -82,42 +117,12 @@ std::vector<Chunk> ChunkFixture(const std::string& name) {
 // updated in the same commit. If it fails on ONE platform and not another, the
 // chunker has a portability bug and the digest must not be touched.
 TEST(Chunking, TheCorpusDigestIsTheSameEverywhere) {
-  // Regenerate with UMBRA_PRINT_DIGESTS=1 after a deliberate change to the
-  // chunker, and update these in the SAME commit as the change. A mismatch on
-  // one platform and not another is a portability bug, and the fix is in the
-  // chunker rather than here.
-  static const struct {
-    const char* name;
-    const char* digest;
-  } kGolden[] = {
-      {"basic.md",
-       "f9298e19450b5e533e4d6e23bf1dab17a8702068a41cd477b496fb1bc68725ef"},
-      {"code.md",
-       "3d42b0420ffec355d7837c9d3cb427bc95f6265c0c9284d4180ad0945b253234"},
-      {"crlf.md",
-       "34973c45803a340e552330cdd9619fd33a3670d9dc3df43db90052f9a2b6d100"},
-      {"frontmatter.md",
-       "64a0922a9ff14d9f6992c24037bd3f35b975eeaeb0c9e4fe45456b03d4603071"},
-      {"links.md",
-       "fadab0e714f3468f4d372c21e31bfa13f6ea521c8364de2b5243890f095d8f44"},
-      {"longline.md",
-       "109f2b2fa0718730fb306d17b835d61289ed501a01cabf2dcf7e4feffdf418d8"},
-      {"mixed.md",
-       "7abefdddcc516d01b4b1913f0821d427de3c23c9c8ea1a4903fb50ba1ada0b1e"},
-      {"onlytable.md",
-       "c61ff7950f830bd8193d87fce603273b5018176e77abb343c543d85d1cf0acc5"},
-      {"table.md",
-       "6b88c0fad7cc0bba2faf77b119aef62e261500afcbd67205052797185b0c42b6"},
-      {"tiny.md",
-       "d6a0d6d54dd4e301e0cbaae45ac0dd251f09c45c3036742c44a18a615316c398"},
-  };
-
   const bool print = std::getenv("UMBRA_PRINT_DIGESTS") != nullptr;
-  for (const auto& g : kGolden) {
+  for (const Golden& g : kCorpus) {
     const std::vector<Chunk> chunks = ChunkFixture(g.name);
     const std::string got = ChunkingDigest(chunks);
     if (print) {
-      std::printf("      {\"%s\", \"%s\"},\n", g.name, got.c_str());
+      std::printf("    {\"%s\",\n     \"%s\"},\n", g.name, got.c_str());
       continue;
     }
     EXPECT_EQ(got, g.digest)
@@ -130,7 +135,8 @@ TEST(Chunking, TheCorpusDigestIsTheSameEverywhere) {
 // iteration-order dependence but NOT the cross-platform hazards. It is here
 // because it is cheap, not because it is sufficient.
 TEST(Chunking, RepeatedRunsAgree) {
-  for (const char* name : kFixtures) {
+  for (const Golden& g : kCorpus) {
+    const char* name = g.name;
     const std::string body = LoadFixture(name);
     std::vector<Chunk> first;
     ASSERT_EQ(ChunkMarkdown(ObjectFromSeed(2), body, &first), ChunkStatus::kOk);
@@ -153,7 +159,8 @@ TEST(Chunking, RepeatedRunsAgree) {
 // document under the same object id, but a test that passed only because the id
 // happened to match would hide a real dependency.
 TEST(Chunking, TheObjectIdDoesNotMoveABoundary) {
-  for (const char* name : kFixtures) {
+  for (const Golden& g : kCorpus) {
+    const char* name = g.name;
     const std::string body = LoadFixture(name);
     std::vector<Chunk> a;
     std::vector<Chunk> b;
@@ -187,7 +194,8 @@ TEST(Chunking, HighBytesAreContentNotStructure) {
 // ------------------------------------------------------------------ structure
 
 TEST(Chunking, ByteRangesAreContiguousAndInsideTheDocument) {
-  for (const char* name : kFixtures) {
+  for (const Golden& g : kCorpus) {
+    const char* name = g.name;
     const std::string body = LoadFixture(name);
     std::vector<Chunk> out;
     ASSERT_EQ(ChunkMarkdown(ObjectFromSeed(5), body, &out), ChunkStatus::kOk);
@@ -421,6 +429,34 @@ TEST(Chunking, AnEmptyDocumentProducesNothing) {
   std::vector<Chunk> out;
   EXPECT_EQ(ChunkMarkdown(ObjectFromSeed(18), "", &out), ChunkStatus::kOk);
   EXPECT_TRUE(out.empty());
+}
+
+// A FENCED BLOCK INSIDE A LIST ITEM IS STILL A FENCED BLOCK.
+//
+// The block scanner treats a run of list items as one block, so a fence inside
+// an item never reaches the fence branch. That is fine while the list fits. It
+// is NOT fine when the list is over the ceiling and gets split at line
+// boundaries, because the cut can land between ``` and ```, which is exactly
+// the failure the whole design is meant to prevent -- and it is easy to miss,
+// because the code block is not where you would look for it.
+TEST(Chunking, AFenceInsideAListIsNotSplit) {
+  const std::string body = LoadFixture("listcode.md");
+  std::vector<Chunk> out;
+  ASSERT_EQ(ChunkMarkdown(ObjectFromSeed(19), body, &out), ChunkStatus::kOk);
+  ASSERT_GT(out.size(), 1u)
+      << "the fixture no longer exceeds the ceiling, so this proves nothing";
+  for (const Chunk& c : out) {
+    const std::string cited = body.substr(c.start, c.bytes());
+    std::size_t fences = 0;
+    std::size_t at = 0;
+    while ((at = cited.find("```", at)) != std::string::npos) {
+      ++fences;
+      at += 3;
+    }
+    EXPECT_EQ(fences % 2, 0u)
+        << "chunk " << c.ordinal << " holds " << fences
+        << " fence markers, so a code block was cut in half";
+  }
 }
 
 }  // namespace ai

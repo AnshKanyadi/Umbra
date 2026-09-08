@@ -775,16 +775,53 @@ ChunkStatus ChunkMarkdown(const ObjectId& object, const std::string& text,
         }
         // One block over the ceiling. Split at line boundaries, and only if a
         // single line is itself over the ceiling, at a code point boundary.
+        //
+        // A FENCE INSIDE A LIST ITEM IS STILL A FENCE. The block scanner treats
+        // a run of list items as one block, so a ```sh inside item three never
+        // reached the fence branch above -- which is harmless while the list
+        // fits and is the exact failure this design exists to prevent once it
+        // does not. Cutting between ``` and ``` produces two chunks that each
+        // look like code and neither of which is. So the split tracks fence
+        // state and refuses to cut inside one.
         const std::vector<Line> ls = SplitLines(text);
         uint32_t piece_start = b.start;
         uint32_t cursor = b.start;
+        bool in_fence = false;
+        uint8_t fence_char = 0;
+        uint32_t fence_width = 0;
         for (std::size_t li = 0; li < ls.size(); ++li) {
           const Line& r = ls[li];
           if (r.start < b.start) continue;
           if (r.start >= b.end) break;
+          // THE BOUNDARY IS JUDGED BEFORE THIS LINE IS CONSUMED. The cut
+          // being considered sits between the previous line and this one, so
+          // the fence state that matters is the state as of the previous line.
+          // Updating first and then deciding let a CLOSING fence clear the
+          // flag and permit a cut immediately before itself, which put the
+          // closer at the head of the next chunk and left the opener stranded
+          // in the one before -- five fence markers in a chunk, which is how
+          // the test found it.
+          const bool may_cut_here = !in_fence;
+          {
+            uint8_t fc = 0;
+            uint32_t fl = 0;
+            // The indent is ignored on purpose: a fence inside a list item is
+            // indented by the item's marker, and FenceAt refuses anything at
+            // four or more. Inside a list that indent is structure, not code.
+            Line probe = r;
+            probe.start = FirstNonSpace(text, r);
+            if (!in_fence && FenceAt(text, probe, &fc, &fl)) {
+              in_fence = true;
+              fence_char = fc;
+              fence_width = fl;
+            } else if (in_fence &&
+                       ClosesFence(text, probe, fence_char, fence_width)) {
+              in_fence = false;
+            }
+          }
           uint32_t line_end = r.next;
           while (line_end - piece_start > options.max_bytes &&
-                 cursor == piece_start) {
+                 cursor == piece_start && may_cut_here) {
             // A single line longer than the ceiling.
             const uint32_t cut =
                 BackToCodePointBoundary(text, piece_start + options.max_bytes);
@@ -794,7 +831,7 @@ ChunkStatus ChunkMarkdown(const ObjectId& object, const std::string& text,
             cursor = cut;
           }
           if (line_end - piece_start > options.max_bytes &&
-              cursor > piece_start) {
+              cursor > piece_start && may_cut_here) {
             emit(piece_start, cursor, kind, headings.Path(), std::string());
             piece_start = cursor;
           }

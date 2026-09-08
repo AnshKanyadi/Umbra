@@ -139,6 +139,70 @@ jobs:
       - run: cmake --build build-lib -j "$(nproc)"
       - run: test -f build-lib/libumbra.a
 
+  # CHUNK BOUNDARIES MUST NOT DEPEND ON THE SIGN OF `char`.
+  #
+  # It is signed on x86 and unsigned on ARM, and Phase 5 shares one index
+  # between devices, so a comparison on a plain char would give two machines
+  # different chunks for the same note. The symptom would be search that is
+  # quietly worse on one of them, with nothing to attribute it to.
+  #
+  # The lane matrix already spans macOS/arm64 and Linux/x86-64, which covers
+  # this in practice. This builds BOTH ways on ONE machine so the property is
+  # tested directly rather than as a side effect of where the runners happen to
+  # live, and so it keeps being tested if the matrix ever changes.
+  #
+  # Verified sharp: planting `if (s[i] < 0) return true;` in IsListItemStart
+  # makes the two digests differ on the CJK fixture.
+  char-signedness:
+    name: chunking does not depend on char signedness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: build both ways and compare the corpus digest
+        run: |
+          set -euo pipefail
+          for flag in -fsigned-char -funsigned-char; do
+            d="build${flag}"
+            cmake -S . -B "$d" -DCMAKE_BUILD_TYPE=Release \
+                  -DCMAKE_CXX_FLAGS="$flag" > /dev/null
+            cmake --build "$d" --target umbra_test -j "$(nproc)" > /dev/null
+            UMBRA_PRINT_DIGESTS=1 "$d/umbra_test" \
+              --gtest_filter='Chunking.TheCorpusDigest*' \
+              | grep -E '^\s+\{"' > "digests${flag}.txt"
+          done
+          echo "--- signed ---";   cat digests-fsigned-char.txt
+          echo "--- unsigned ---"; cat digests-funsigned-char.txt
+          if ! diff -u digests-fsigned-char.txt digests-funsigned-char.txt; then
+            echo "::error::chunk boundaries depend on the sign of char"
+            exit 1
+          fi
+          echo "chunk boundaries agree under both char signedness settings"
+
+  # THE GOLDEN DIGESTS MUST HOLD IN A LOCALE THAT IS NOT C.
+  #
+  # std::isspace and friends are locale-sensitive. The chunker uses hand-written
+  # classifiers for exactly this reason; this is the check that says so.
+  locale-independence:
+    name: chunking does not depend on the locale
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: sudo locale-gen tr_TR.UTF-8 de_DE.UTF-8 && sudo update-locale
+      - run: cmake -S . -B build-loc -DCMAKE_BUILD_TYPE=Release > /dev/null
+      - run: cmake --build build-loc --target umbra_test -j "$(nproc)" > /dev/null
+      - name: run the chunking suite under three locales
+        run: |
+          set -euo pipefail
+          for loc in C tr_TR.UTF-8 de_DE.UTF-8; do
+            echo "== LC_ALL=$loc =="
+            LC_ALL="$loc" ./build-loc/umbra_test --gtest_filter='Chunking.*' \
+              | tail -2
+          done
+
   # FORMAT IS CHECKED ON THE LINES A CHANGE TOUCHES, NEVER ON THE FILE.
   #
   # See .clang-format for why this stays a changed-lines check even though the
