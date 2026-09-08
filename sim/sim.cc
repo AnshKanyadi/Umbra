@@ -77,6 +77,8 @@ const char* AdversarialName(Adversarial a) {
       return "clock-skew";
     case Adversarial::kRelayStaleView:
       return "relay-stale-view";
+    case Adversarial::kRestartFromLog:
+      return "restart-from-log";
     case Adversarial::kTreeRandom:
       return "tree-random";
   }
@@ -246,6 +248,7 @@ bool ScheduleRequiresContiguousRuns(Adversarial a) {
     case Adversarial::kRelayReplaysOldCiphertext:
     case Adversarial::kClockSkew:
     case Adversarial::kRelayStaleView:
+    case Adversarial::kRestartFromLog:
       return false;
   }
   return false;
@@ -365,6 +368,14 @@ struct Sim {
   std::vector<ObjectId> dirs;
   // What each replica has produced, so the final flush can re-offer it.
   std::vector<std::vector<TreeOp>> tree_log;
+  // WHAT EACH REPLICA HAS ON DISK, which is a different thing: everything it
+  // accepted, whether it made the operation or received it. tree_log holds only
+  // what a replica ORIGINATED, which is the right set to re-offer to peers and
+  // the wrong set to rebuild from -- a real client persists what it fetches
+  // (OpLog::AppendStored) and replays all of it on start. Restarting from
+  // tree_log alone would rebuild a replica that had forgotten every operation
+  // anyone else ever sent it.
+  std::vector<std::vector<TreeOp>> tree_durable;
   // Per source, the counters of every tree operation it has produced, in order.
   std::map<ReplicaId, std::vector<uint64_t>> produced_tree;
   // partition[i] is the step at which replica i rejoins. Steps below it mean
@@ -379,6 +390,7 @@ struct Sim {
     replicas.resize(cfg.replicas);
     isolated_until.assign(cfg.replicas, 0);
     tree_log.resize(cfg.replicas);
+    tree_durable.resize(cfg.replicas);
     for (std::size_t i = 0; i < cfg.replicas; ++i) {
       // Derived from the seed AND the index, so a seed fixes the whole replica
       // set and two runs of the same seed use the same ids -- which is what
@@ -445,6 +457,7 @@ struct Sim {
   void OriginateTree(std::size_t i, const TreeOp& op) {
     tree_oracle.Record(op);
     tree_log[i].push_back(op);
+    tree_durable[i].push_back(op);
     produced_tree[op.id.replica].push_back(op.id.counter);
     replicas[i].got_tree[op.id.replica].insert(op.id.counter);
     ++result.tree_ops;
@@ -492,8 +505,13 @@ struct Sim {
       case TreeApply::kApplied:
       case TreeApply::kDuplicate:
         r.clock.Observe(op.id);
+        tree_durable[to].push_back(op);
         break;
       case TreeApply::kIgnoredCycle:
+        // Persisted even though it changed nothing: a refused move is still an
+        // operation this replica holds, and a replica that dropped it would
+        // ask for it again forever.
+        tree_durable[to].push_back(op);
         // NOT AN ERROR. It is the defined outcome for a move that would make a
         // node its own ancestor, and both replicas must reach it for the same
         // operation. Counted so the report can say the schedules actually
@@ -634,6 +652,62 @@ struct Sim {
   // The operations it lost are still held by its peers, which is why the
   // schedule can lose them here and still expect convergence -- the final
   // flush re-delivers everything to everyone.
+  // A PROCESS RESTART, NOT A CRASH. Crash() models losing what was not
+  // persisted; this models losing EVERYTHING that was not persisted, which
+  // includes the in-memory tree. Crash() never rebuilt r.tree at all -- the
+  // TreeDoc survived in memory across every simulated crash the harness has
+  // ever run -- so the path a real client takes on every single start had
+  // never been exercised here. Vault::ApplyTreeOp's clock bug lived in exactly
+  // that path and it took an end-to-end run on real files to find it.
+  //
+  // Everything comes back from the two durable logs and nothing from memory:
+  // the documents, the tree, the clock, the cursor, and the set of tree
+  // operations this replica can honestly claim to hold.
+  void RestartFromLog(std::size_t i) {
+    Replica& r = replicas[i];
+    r.uncommitted.clear();
+    r.pending.clear();
+    r.doc = TextDoc();
+    r.tree = TreeDoc();
+    r.clock = LamportClock(r.id);
+    r.received.clear();
+    r.got_tree.clear();
+
+    for (const Op& op : r.durable) {
+      const ApplyResult res = r.doc.Apply(op);
+      // LastId, not op.id: a run owns a range of counters. See op.h.
+      r.clock.Observe(LastId(op));
+      r.received.insert(op.id);
+      if (res == ApplyResult::kNotReady) {
+        result.failure =
+            "restart: durable text log hit a not-ready operation "
+            "at " +
+            op.ToString() + " on replica " + std::to_string(i);
+        return;
+      }
+    }
+    for (const TreeOp& op : tree_durable[i]) {
+      const TreeApply res = r.tree.Apply(op);
+      if (res == TreeApply::kMalformed) {
+        result.failure =
+            "restart: durable tree log holds a malformed "
+            "operation on replica " +
+            std::to_string(i);
+        return;
+      }
+      // THE CLOCK MUST MOVE FOR TREE OPERATIONS TOO. A replica rebuilt from a
+      // log that observed only its text operations comes back with a clock
+      // below tree operations it has already issued, and its next tree
+      // operation reuses a counter. The oplog is keyed
+      // object||replica||counter, so that is a lost write rather than a
+      // conflict. This is the defect Vault::ApplyTreeOp had.
+      r.clock.Observe(op.id);
+      r.received.insert(op.id);
+      r.got_tree[op.id.replica].insert(op.id.counter);
+    }
+    ++result.restarts;
+  }
+
   void Crash(std::size_t i) {
     Replica& r = replicas[i];
     r.uncommitted.clear();
@@ -1142,7 +1216,12 @@ std::vector<TreeOp> SeedTree(Sim* s, const std::vector<std::string>& dir_names,
     if (s->replicas[0].tree.Apply(op) != TreeApply::kApplied) continue;
     s->tree_oracle.Record(op);
     s->tree_log[0].push_back(op);
+    // Durable too, or a replica rebuilt from its log comes back without the
+    // directories the whole schedule hangs off. DeliverTree persists for
+    // replicas 1..n below; replica 0 originated these, so it persists here.
+    s->tree_durable[0].push_back(op);
     s->replicas[0].received.insert(op.id);
+    s->replicas[0].got_tree[op.id.replica].insert(op.id.counter);
     ++s->result.tree_ops;
     ops.push_back(op);
     dirs->push_back(id);
@@ -1701,6 +1780,71 @@ void RunRelayStaleView(Sim* s) {
   }
 }
 
+// TEAR A REPLICA DOWN AND REBUILD IT FROM ITS OWN LOG, MID RUN.
+//
+// The schedule that was missing. Every other schedule keeps a TreeDoc alive in
+// memory for the whole run, including the crash ones, so the thing a real
+// client does on every start -- construct an empty vault and replay a log into
+// it -- had never been simulated. That is where Vault::ApplyTreeOp's clock bug
+// lived, and only running the real binary on real files found it.
+//
+// Restarts happen while operations are still in flight, so a rebuilt replica
+// has to keep accepting deliveries that were sent to the process that died.
+void RunRestartFromLog(Sim* s) {
+  const std::size_t n = s->replicas.size();
+  std::vector<ObjectId> dirs;
+  SeedTree(s, {"a", "b", "c"}, &dirs);
+  std::vector<ObjectId> files;
+
+  for (int round = 0; round < 12; ++round) {
+    for (std::size_t i = 0; i < n; ++i) {
+      s->LocalEdit(i);
+      if (s->rng.Chance(60)) {
+        files.push_back(MakeFile(
+            s, i, dirs[(round + i) % dirs.size()],
+            "r" + std::to_string(round) + "_" + std::to_string(i) + ".md"));
+      }
+      if (s->rng.Chance(40) && !files.empty()) {
+        const ObjectId child = files[static_cast<std::size_t>(
+            s->rng.Below(static_cast<uint64_t>(files.size())))];
+        MoveNode(s, i, child,
+                 dirs[static_cast<std::size_t>(
+                     s->rng.Below(static_cast<uint64_t>(dirs.size())))],
+                 "m" + std::to_string(round) + "_" + std::to_string(i) + ".md",
+                 false);
+      }
+    }
+
+    // Deliver some of it, so a restart lands with work still in flight.
+    if (s->rng.Chance(70)) {
+      const std::size_t half = s->in_flight.size() / 2;
+      std::vector<Message> serve(
+          s->in_flight.begin(), s->in_flight.begin() + static_cast<long>(half));
+      s->in_flight.erase(s->in_flight.begin(),
+                         s->in_flight.begin() + static_cast<long>(half));
+      for (const Message& m : serve) s->DeliverMessage(m);
+      for (std::size_t i = 0; i < n; ++i) s->DrainPending(i);
+    }
+
+    // Commit, then restart somebody. Committing first is what makes this a
+    // restart rather than a crash: the question is whether a replica can be
+    // rebuilt from what it persisted, not whether it loses what it did not.
+    for (std::size_t i = 0; i < n; ++i) s->Commit(i);
+    if (s->rng.Chance(50)) {
+      const std::size_t who = static_cast<std::size_t>(s->rng.Below(n));
+      s->RestartFromLog(who);
+      if (!s->result.failure.empty()) return;
+
+      // AND THEN IT KEEPS WORKING. A rebuilt replica that cannot produce a new
+      // operation without colliding with one of its own is the failure this
+      // schedule exists to catch, so it must edit again immediately.
+      s->LocalEdit(who);
+      files.push_back(
+          MakeFile(s, who, dirs[0], "after" + std::to_string(round) + ".md"));
+    }
+  }
+}
+
 Result RunSchedule(uint64_t seed, const Config& cfg, Adversarial adversarial) {
   Sim s(seed, cfg);
   s.require_contiguous_runs = ScheduleRequiresContiguousRuns(adversarial);
@@ -1758,6 +1902,9 @@ Result RunSchedule(uint64_t seed, const Config& cfg, Adversarial adversarial) {
       break;
     case Adversarial::kRelayStaleView:
       RunRelayStaleView(&s);
+      break;
+    case Adversarial::kRestartFromLog:
+      RunRestartFromLog(&s);
       break;
   }
   if (!s.result.failure.empty()) {

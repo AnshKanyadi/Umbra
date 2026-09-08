@@ -228,6 +228,7 @@ struct Result {
   std::size_t ops = 0;
   std::size_t deliveries = 0;
   std::size_t crashes = 0;
+  std::size_t restarts = 0;
   std::size_t max_partition_steps = 0;
   std::size_t tombstones_dropped = 0;
   std::size_t tree_ops = 0;
@@ -288,10 +289,14 @@ enum class Adversarial : uint8_t {
   kClockSkew,
   // A relay serves a correct prefix and claims there is nothing newer.
   kRelayStaleView,
+
+  // A replica is torn down mid run and rebuilt from its own durable logs, then
+  // keeps working. The path a real client takes on every start.
+  kRestartFromLog,
 };
 
 const char* AdversarialName(Adversarial a);
-constexpr std::size_t kAdversarialCount = 18;
+constexpr std::size_t kAdversarialCount = 19;
 
 // True when a schedule never has a replica insert into text it received from
 // another, which is the condition under which every run must still be
