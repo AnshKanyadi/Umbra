@@ -833,14 +833,43 @@ int main(int argc, char** argv) {
     // had and every epoch key it was given; what it cannot do is read anything
     // written from now on. Claiming more here would be the easiest place in
     // the whole program to lie.
+    //
+    // THE COUNT IS SPELLED OUT RATHER THAN PRINTED. "0 device(s) hold it" is
+    // both alarming and wrong -- this device holds it -- and "1 device(s)" is
+    // the kind of thing that makes a person doubt the rest of the message. In
+    // a security flow the sentence a user reads at the moment they remove
+    // someone is worth writing out.
+    std::printf("revoked %s. The vault is now at epoch %u.\n\n", target.c_str(),
+                next);
+    if (keep.empty()) {
+      std::printf(
+          "This device is now the only one that can read new writes.\n");
+    } else if (keep.size() == 1) {
+      std::printf(
+          "This device and one other can read new writes. The other has the\n"
+          "new key waiting for it and will pick it up on its next sync.\n");
+    } else {
+      std::printf(
+          "This device and %zu others can read new writes. They have the new\n"
+          "key waiting for them and will pick it up on their next sync.\n",
+          keep.size());
+    }
     std::printf(
-        "revoked %s. The vault is now at epoch %u and %zu device(s) hold it.\n"
         "\n"
-        "That device can no longer read anything written from now on.\n"
+        "%s can no longer read anything written from now on.\n"
         "It still has the files it already had, and can still read what was\n"
         "written before this point. Revocation moves writes forward; it does\n"
         "not reach backwards.\n",
-        target.c_str(), next, keep.size());
+        target.c_str());
+    // THE ROSTER IS THIS DEVICE'S OWN, so this is the honest place to say what
+    // that costs. A device enrolled by some other device is not in this list
+    // and has NOT been given the new key: it will stop being able to read new
+    // writes without anyone having asked for that. See ADR 0004.
+    std::printf(
+        "\n"
+        "This used the list of devices this one enrolled. Any device enrolled\n"
+        "from elsewhere was not given the new key and will stop reading new\n"
+        "writes until it is enrolled again.\n");
     return 0;
   }
 

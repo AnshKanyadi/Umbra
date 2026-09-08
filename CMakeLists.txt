@@ -192,6 +192,7 @@ add_library(umbra STATIC
   src/crypto/aead.cc
   src/sync/report.cc
   src/sync/client.cc
+  src/ai/chunk.cc
   src/sync/enroll.cc
   src/sync/tcp_transport.cc
   src/watcher/content_hash.cc
@@ -211,7 +212,7 @@ add_library(umbra::umbra ALIAS umbra)
 target_include_directories(umbra
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
          $<INSTALL_INTERFACE:include>
-  PRIVATE src src/watcher src/crdt src/crypto src/sync)
+  PRIVATE src src/watcher src/crdt src/crypto src/sync src/ai)
 target_compile_options(umbra PRIVATE ${UMBRA_CXX_FLAGS})
 # sodium is PRIVATE: BLAKE2b is how ContentHash is computed, which is an
 # implementation detail of this library. A consumer of <umbra/change_event.h>
@@ -308,7 +309,7 @@ add_executable(umbra_test
 # the test binary needs the half the client does not.
 target_link_libraries(umbra_test PRIVATE umbra_testing umbra_sim umbra_relay
                                          umbra::sodium gtest_main)
-target_include_directories(umbra_test PRIVATE src src/watcher src/crdt src/crypto src/sync)
+target_include_directories(umbra_test PRIVATE src src/watcher src/crdt src/crypto src/sync src/ai)
 target_compile_options(umbra_test PRIVATE ${UMBRA_CXX_FLAGS})
 target_compile_definitions(umbra_test PRIVATE ${UMBRA_SANITIZER_DEFINE})
 add_test(NAME umbra_test COMMAND umbra_test)
@@ -327,7 +328,7 @@ target_compile_options(umbra_relay PRIVATE ${UMBRA_CXX_FLAGS})
 
 add_executable(umbra_sync cmd/sync_main.cc)
 target_link_libraries(umbra_sync PRIVATE umbra)
-target_include_directories(umbra_sync PRIVATE src src/watcher src/crdt src/crypto src/sync)
+target_include_directories(umbra_sync PRIVATE src src/watcher src/crdt src/crypto src/sync src/ai)
 target_compile_options(umbra_sync PRIVATE ${UMBRA_CXX_FLAGS})
 
 add_executable(umbra_relay_bin cmd/relay_main.cc)
