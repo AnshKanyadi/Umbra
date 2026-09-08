@@ -193,6 +193,9 @@ add_library(umbra STATIC
   src/sync/report.cc
   src/sync/client.cc
   src/ai/chunk.cc
+  src/ai/embed.cc
+  src/ai/embed_hashing.cc
+  src/ai/embed_ollama.cc
   src/sync/enroll.cc
   src/sync/tcp_transport.cc
   src/watcher/content_hash.cc
@@ -295,6 +298,7 @@ add_executable(umbra_test
   test/tree_test.cc
   test/crypto_test.cc
   test/chunk_test.cc
+  test/embed_test.cc
   test/enroll_test.cc
   test/relay_test.cc
   test/oplog_test.cc

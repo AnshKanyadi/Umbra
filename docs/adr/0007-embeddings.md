@@ -20,27 +20,68 @@ distance means nothing and search degrades in a way no test would flag.
 So the version is designed into the identity now, before anything syncs,
 because retrofitting it means rewriting the store.
 
+## Vectors do not have to be bit-identical across devices
+
+This is worth settling before the model choice, because it decides how much the
+choice has to carry.
+
+Chunking is bit-deterministic (ADR 0006) and floating-point inference is not:
+the same model on two machines can differ in the last bits from SIMD width,
+fused multiply-add, or thread count in a reduction. If devices had to agree on
+vectors, that would be a serious constraint.
+
+They do not, because **Phase 5 shares segments as sealed bytes rather than
+recomputing them**. A segment is built once, by one device, and copied. Two
+devices never independently embed the same chunk and compare results. What has
+to match is the *model*, so that vectors built by one device sit in the same
+space as vectors built by another -- which is what the model id is for.
+
+So: chunk boundaries must be identical, vectors need only be compatible. Those
+are different requirements and conflating them would have cost either
+determinism theatre around inference or a real correctness hole.
+
 ## The model
 
-**`bge-small-en-v1.5`**, 384 dimensions, GGUF Q8_0, via the inference interface
-in ADR 0008.
+The design is one pinned model whose identity is part of the index. Which model
+is a quality question, answered by measurement in item 5 rather than by
+reputation here.
 
-| | dims | disk (Q8_0) | why it was or was not chosen |
+**Available and measured on this machine** (via the ADR 0008 interface):
+
+| | dims | disk | status |
 |---|---|---|---|
-| **bge-small-en-v1.5** | 384 | ~34 MB | Chosen. Best quality per byte at this size; 512-token window matches the chunk ceiling. |
-| bge-base-en-v1.5 | 768 | ~110 MB | Rejected: twice the vector, ~3x the encode time, for a few points of retrieval quality on a personal corpus. |
-| all-MiniLM-L6-v2 | 384 | ~23 MB | Rejected: same dimension, measurably weaker on retrieval benchmarks, and its 256-token window would force the chunk ceiling down. |
-| nomic-embed-text-v1.5 | 768 | ~140 MB | Rejected for now: 8192-token context is the wrong shape for chunks capped at 1536 bytes, and it is heavier than the corpus needs. Worth revisiting for whole-note embedding. |
-| e5-large-v2 | 1024 | ~330 MB | Rejected: laptop-hostile. A cold index of a few thousand notes becomes a coffee break, and the store triples. |
-| OpenAI text-embedding-3 | 1536 | n/a | Rejected on the threat model. Sending note text to a third party is the thing this project exists not to do. |
+| `all-minilm` (all-MiniLM-L6-v2) | 384 | ~46 MB | Present. 256-token window. |
+| `nomic-embed-text-v1.5` | 768 | ~274 MB | Present. 8192-token window. |
 
-**The tradeoff, stated plainly.** 384 dimensions is the smallest that still
-retrieves well. It costs a little accuracy against 768-dimension models on hard
-queries and it halves the index, halves the distance arithmetic, and keeps a
-cold index of a few thousand notes to minutes rather than an afternoon. For a
-personal vault searched by its author, who can rephrase a query in two seconds,
-that is the right side of the trade. For a corpus where a missed result is
-expensive, it would not be.
+**Wanted and not obtainable here.** `bge-small-en-v1.5` is the model this would
+otherwise default to -- 384 dimensions with a 512-token window that matches the
+chunk ceiling, and stronger retrieval than all-MiniLM at the same width. It is
+not in the Ollama registry under a name that resolves, so it is **not** named as
+the default: a default nobody in this repository can run is a claim, not a
+decision. The interface takes a model name, so adopting it later is
+configuration rather than a change.
+
+The candidates that were rejected outright, with reasons:
+
+| | dims | disk | why not |
+|---|---|---|---|
+| bge-base-en-v1.5 | 768 | ~110 MB | Twice the vector and roughly three times the encode time for a few points on a personal corpus. |
+| e5-large-v2 | 1024 | ~330 MB | Laptop-hostile. A cold index of a few thousand notes becomes an afternoon and the store triples. |
+| OpenAI text-embedding-3 | 1536 | n/a | Rejected on the threat model. Sending note text to a third party is the thing this project exists not to do. There is no configuration flag for this. |
+
+**The tradeoff, stated plainly.** 384 dimensions is the smallest width that
+still retrieves usefully. Against 768 it costs accuracy on hard queries, and it
+halves the index, halves the distance arithmetic, and keeps a cold index to
+minutes rather than an afternoon. For a personal vault searched by its author,
+who can rephrase in two seconds, that is the right side of the trade. For a
+corpus where a missed result is expensive it would not be. The measurement in
+item 5 is what decides between the two available widths, and its numbers are
+reported whichever way they fall.
+
+**The 256-token window on all-MiniLM is a real mismatch** with a 1536-byte chunk
+ceiling: a chunk at the ceiling will be truncated by the model, silently. That
+is a point against it that the benchmark numbers alone will not show, and it is
+recorded here so the decision is not made on recall@k in isolation.
 
 A note on the asymmetry: BGE models want a query prefix (`Represent this
 sentence for searching relevant passages: `) on the query side and nothing on
