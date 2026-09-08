@@ -1,13 +1,16 @@
 # The wide convergence sweep, under sanitizers, on a schedule.
 #
 # WHY THIS IS NOT ON EVERY PUSH. Measured on an M-series laptop over 1000 seeds
-# and 13 schedule shapes -- 13000 schedules:
+# and, when this was written, 13 schedule shapes -- 13000 schedules:
 #
 #     uninstrumented   ~50s   (this one IS on every push, in ci.yml)
 #     UBSan            518s
 #     ASan             566s
 #
-# Nine to ten minutes each, and slower on a runner. Adding twenty minutes to
+# There are 19 shapes now, and the measured cost on the runner has followed:
+# the scheduled run of 2026-09-08 took 12m10s for UBSan, 18m45s for ASan, and
+# 26m34s for the deep job, 26m39s wall. Nine to ten minutes each locally, and
+# slower on a runner. Adding twenty minutes to
 # every push is how a lane becomes something people work around, so the split
 # is: a narrow range on every push where the cost is invisible, and a wide range
 # here where the width is the point.

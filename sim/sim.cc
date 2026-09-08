@@ -1790,6 +1790,20 @@ void RunRelayStaleView(Sim* s) {
 //
 // Restarts happen while operations are still in flight, so a rebuilt replica
 // has to keep accepting deliveries that were sent to the process that died.
+//
+// WHAT DELIBERATE BREAKAGE SAYS THIS CATCHES. Dropping the clock observation
+// for tree operations in the rebuild fails here and does NOT fail the crash
+// schedule, which is the measurement that says this schedule was missing
+// rather than redundant. Observing op.id instead of LastId in the text rebuild
+// fails here too.
+//
+// What it does NOT catch on its own: rebuilding the tree from what the replica
+// ORIGINATED rather than what it PERSISTED still converges, because the cursor
+// is rebuilt from the same log and a replica that forgets an operation also
+// forgets that it has it, so peers send it again. Breaking that coupling --
+// content from one log, cursor from the other -- does fail, and that is the
+// shape of the Phase 3 defect where FetchObject advanced a cursor across
+// operations it had not yet persisted.
 void RunRestartFromLog(Sim* s) {
   const std::size_t n = s->replicas.size();
   std::vector<ObjectId> dirs;
