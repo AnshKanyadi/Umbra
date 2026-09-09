@@ -41,19 +41,23 @@ Homebrew, if you do not have it:
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 ```
 
-CMake, to build, and Ollama, to embed:
+CMake, to build:
 
 ```sh
 brew install cmake
-brew install ollama
 ```
 
-Start Ollama and leave it running. It serves on `127.0.0.1:11434`, which is
-where Umbra looks:
+Ollama, to embed. Two ways, and they start differently — pick one:
 
-```sh
-brew services start ollama
-```
+- **The app**, from <https://ollama.com/download>. Open it once; it runs a
+  server in the background and puts `ollama` on your `PATH` at
+  `/usr/local/bin/ollama`. This is what ollama.com gives you and what this page
+  was tested against.
+- **The formula**, `brew install ollama`, then `brew services start ollama`.
+
+Either way it serves on `127.0.0.1:11434`, which is where Umbra looks. The two
+are not interchangeable once installed: `brew services start ollama` does
+nothing for an app install, and vice versa.
 
 Pull the embedding model. `nomic-embed-text` is the one Umbra's own evaluation
 chose; it is 274 MB and runs on the CPU:
@@ -137,8 +141,10 @@ exits non-zero when it cannot reach a relay, because a sync that reached nobody
 is a failed sync; `--create` is the exception, because it was asked for a vault
 and made one.
 
-Key derivation is Argon2id and runs on every invocation. On an M-series Mac in a
-Release build it is about 0.7s. A debug build is ten times slower.
+Key derivation is Argon2id and runs on every invocation. On an idle M-series Mac
+in a Release build it is about 0.5s; on a busy one it was 3.2s in the same
+binary, so do not read a slow first run as a problem. A debug build is far
+slower again.
 
 You do not need a relay to index and search. It is needed only to sync a second
 device, which is not this page.
@@ -278,8 +284,9 @@ written notes; unchanged notes cost a re-embed but do not duplicate anything.
 ## If something goes wrong
 
 **`cannot reach a local Ollama for nomic-embed-text`** — Ollama is not running,
-or not on 11434. `brew services start ollama`, then check
-`curl -s http://127.0.0.1:11434/api/tags`.
+or not on 11434. Open Ollama.app, or `brew services start ollama` for a formula
+install, then check `curl -s http://127.0.0.1:11434/api/tags`. If that lists
+models but not `nomic-embed-text`, `ollama pull nomic-embed-text`.
 
 **`third_party/basalt is empty`** at configure time — the submodules are not
 checked out. `git submodule update --init --recursive`.
@@ -290,6 +297,7 @@ checked out. `git submodule update --init --recursive`.
 **`cannot reach the relay`** from `umbra_sync` — expected on one machine with no
 relay. Nothing on this page needs one.
 
-**A model mismatch after changing `--model`** — an index is bound to the model
-that built it, because vectors from two models are not comparable. Build a new
-index directory rather than mixing them.
+**`cannot open the index at <dir>: model-mismatch`** — you changed `--model`.
+An index is bound to the model that built it, because vectors from two models
+are not comparable, and it refuses to open rather than mixing them. Use a
+separate `--index` directory per model.
