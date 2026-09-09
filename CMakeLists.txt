@@ -192,6 +192,7 @@ add_library(umbra STATIC
   src/crypto/aead.cc
   src/sync/report.cc
   src/sync/client.cc
+  src/ai/answer.cc
   src/ai/chunk.cc
   src/ai/embed.cc
   src/ai/embed_hashing.cc
@@ -300,6 +301,7 @@ add_executable(umbra_test
   test/crdt_test.cc
   test/tree_test.cc
   test/crypto_test.cc
+  test/answer_test.cc
   test/chunk_test.cc
   test/embed_test.cc
   test/index_test.cc
