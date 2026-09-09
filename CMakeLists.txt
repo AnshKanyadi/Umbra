@@ -344,13 +344,21 @@ target_include_directories(umbra_relay PUBLIC relay)
 target_link_libraries(umbra_relay PUBLIC umbra_wire basalt::basalt)
 target_compile_options(umbra_relay PRIVATE ${UMBRA_CXX_FLAGS})
 
+# The vault state both binaries read: salt, epoch wraps, device key, passphrase.
+# One copy, because umbra_ai deriving its own keys from a constant is exactly
+# the bug this library exists to make impossible.
+add_library(umbra_cmd_state STATIC cmd/vault_state.cc)
+target_include_directories(umbra_cmd_state PUBLIC cmd)
+target_link_libraries(umbra_cmd_state PUBLIC umbra)
+target_compile_options(umbra_cmd_state PRIVATE ${UMBRA_CXX_FLAGS})
+
 add_executable(umbra_sync cmd/sync_main.cc)
-target_link_libraries(umbra_sync PRIVATE umbra)
+target_link_libraries(umbra_sync PRIVATE umbra umbra_cmd_state)
 target_include_directories(umbra_sync PRIVATE src src/watcher src/crdt src/crypto src/sync src/ai)
 target_compile_options(umbra_sync PRIVATE ${UMBRA_CXX_FLAGS})
 
 add_executable(umbra_ai cmd/ai_main.cc)
-target_link_libraries(umbra_ai PRIVATE umbra umbra::sodium)
+target_link_libraries(umbra_ai PRIVATE umbra umbra::sodium umbra_cmd_state)
 target_include_directories(umbra_ai PRIVATE src src/watcher src/crdt src/crypto src/sync src/ai)
 target_compile_options(umbra_ai PRIVATE ${UMBRA_CXX_FLAGS})
 

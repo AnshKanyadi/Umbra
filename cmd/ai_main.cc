@@ -36,6 +36,7 @@
 #include "umbra/crdt/oplog.h"
 #include "umbra/crypto/keys.h"
 #include "umbra/sync/client.h"
+#include "vault_state.h"
 
 namespace {
 
@@ -53,38 +54,6 @@ bool ReadWholeFile(const std::string& path, std::string* out) {
   std::stringstream ss;
   ss << f.rdbuf();
   *out = ss.str();
-  return true;
-}
-
-bool WriteWholeFile(const std::string& path, const std::string& body) {
-  const std::string tmp = path + ".tmp";
-  std::FILE* f = std::fopen(tmp.c_str(), "wb");
-  if (f == nullptr) return false;
-  const bool ok = std::fwrite(body.data(), 1, body.size(), f) == body.size();
-  std::fclose(f);
-  if (!ok) {
-    ::unlink(tmp.c_str());
-    return false;
-  }
-  return ::rename(tmp.c_str(), path.c_str()) == 0;
-}
-
-bool MakeDirs(const std::string& path) {
-  if (path.empty()) return false;
-  std::string built;
-  std::size_t i = 0;
-  if (path[0] == '/') {
-    built = "/";
-    i = 1;
-  }
-  while (i < path.size()) {
-    std::size_t j = path.find('/', i);
-    if (j == std::string::npos) j = path.size();
-    built += path.substr(i, j - i);
-    if (::mkdir(built.c_str(), 0700) != 0 && errno != EEXIST) return false;
-    built += "/";
-    i = j + 1;
-  }
   return true;
 }
 
@@ -150,80 +119,34 @@ uint64_t DirectoryBytes(const std::string& dir) {
   return total;
 }
 
-VaultKeys KeysFor(const std::string& passphrase) {
-  std::array<uint8_t, kSaltBytes> salt{};
-  salt.fill(0x5A);
-  Argon2idParams p = Argon2idParams::Default();
-  // A DRIVER, NOT A VAULT. These parameters are deliberately weak because this
-  // tool measures indexing rather than key derivation, and nine seconds of
-  // Argon2id per invocation would drown the numbers it exists to report. A real
-  // client uses the defaults.
-  p.opslimit = 1;
-  p.memlimit = 8u * 1024 * 1024;
-  VaultKeys k;
-  if (VaultKeys::Create(passphrase, salt, p, &k) != CryptoStatus::kOk) {
-    std::fprintf(stderr, "cannot derive keys\n");
-    std::exit(1);
-  }
-  // CREATE DRAWS A RANDOM EPOCH KEY, so a second invocation of this tool would
-  // derive the same root and a different content key, and every segment written
-  // by the first run would fail to open. That is exactly what happened: the
-  // index reported segment-lost on a manifest that was perfectly correct.
-  //
-  // A real client stores its epoch keys wrapped under the root and recovers
-  // them (cmd/sync_main.cc). This driver has no vault to store them in, so it
-  // derives one -- which keys.h says NOT to do for a real vault, because a
-  // removed device knows the root and could compute it. There is nothing to
-  // revoke here; there would be in a client.
-  const SecretKey e0 = DeriveSubkey(k.root(), 0, "umbAiDrv");
-  k.OverwriteEpochForBootstrap(0, e0);
-  return k;
-}
-
-// THIS DEVICE'S IDENTITY, WHICH IS NOT WHERE ITS INDEX LIVES.
+// THE VAULT'S KEYS, NOT THIS TOOL'S OWN.
 //
-// The first version hashed the index directory, and it was wrong in both
-// directions: two index directories on one machine looked like two devices, and
-// the same device at a different path looked like a stranger. It made the
-// two-device end-to-end a fiction -- the "devices" were two folders sharing a
-// kernel, a clock and a filesystem.
+// This used to derive a root from a passphrase constant in this file with a
+// fixed salt and weak Argon2id parameters, and then derive the epoch key from
+// that root. Two deliberate compromises, both of them defensible for what this
+// once was and neither survivable now that it is pointed at real notes:
 //
-// Identity comes from the device keypair, exactly as cmd/sync_main.cc derives
-// it, and lives beside the VAULT rather than the index: one device, one
-// identity, shared by both tools for a given vault. `DeviceKeyPair::Replica()`
-// hashes the public key, so the id is derived from the thing that makes the
-// device a device.
+//  - The constant passphrase and fixed salt made an index at rest openable by
+//    anyone holding this binary. The sealing was real, the format was real, and
+//    the key was not a secret -- against the project's one headline claim.
+//  - The DERIVED epoch key was worse in a quieter way. keys.h says an epoch key
+//    must be random precisely so a removed device, which knows the root, cannot
+//    compute future ones. A derived epoch key means revocation buys nothing:
+//    the removed device recomputes the next content key and reads every segment
+//    written after it was removed.
 //
-// THE INVARIANT THIS ASSUMES: one device keeps one index per vault. Two index
-// directories for one vault on one machine would now share a replica id and
-// each keep its own manifest counter, and the oplog is keyed by
-// (object, replica, counter) -- so the second index's operations would overwrite
-// the first's rather than conflict with them. That configuration was previously
-// meaningful and is now a mistake; it is stated here rather than defended
-// against, because the defence is a second identity and a second identity is
-// what this replaced.
-DeviceKeyPair LoadOrCreateDeviceKeys(const std::string& vault) {
-  const std::string path = vault + "/.umbra/device";
-  std::string existing;
-  DeviceKeyPair d;
-  if (ReadWholeFile(path, &existing) &&
-      existing.size() == kPublicKeyBytes + SecretKey::size()) {
-    std::memcpy(d.public_key.data(), existing.data(), kPublicKeyBytes);
-    std::memcpy(d.secret_key.data(), existing.data() + kPublicKeyBytes,
-                SecretKey::size());
-    return d;
-  }
-  d = NewDeviceKeyPair();
-  (void)MakeDirs(vault + "/.umbra");
-  std::string bytes;
-  bytes.append(reinterpret_cast<const char*>(d.public_key.data()),
-               kPublicKeyBytes);
-  bytes.append(reinterpret_cast<const char*>(d.secret_key.data()),
-               SecretKey::size());
-  (void)WriteWholeFile(path, bytes);
-  (void)::chmod(path.c_str(), 0600);
-  return d;
-}
+// The reason for both was the same: the driver had no vault to read keys from,
+// and it wanted its measurements not to be drowned by nine seconds of Argon2id
+// per run. It has a vault now -- the one whose notes it is indexing -- so it
+// reads the salt and the wrapped epoch keys from `<vault>/.umbra`, exactly as
+// cmd/sync_main.cc does, through the same code (cmd/vault_state.h).
+//
+// The cost is a real one and worth stating: every invocation pays Argon2id at
+// the default parameters, about half a second, and an index built by the old
+// binary cannot be opened by this one. There is no migration and there should
+// not be: those indexes were sealed under a key that was never secret.
+struct Options;
+VaultKeys VaultKeysFor(const Options& o);
 
 struct Options;
 ReplicaId ReplicaFor(const Options& o);
@@ -243,24 +166,27 @@ std::unique_ptr<Embedder> MakeEmbedder(const std::string& model,
 }
 
 void Usage() {
-  std::fprintf(stderr,
-               "umbra_ai --vault DIR --index DIR [--model NAME] COMMAND\n"
-               "\n"
-               "  --build              chunk, embed and index the vault\n"
-               "                       add --compact to merge segments after\n"
-               "  --ask QUESTION       retrieve and answer\n"
-               "  --eval FILE          run a question set and report\n"
-               "  --stats              what the index holds\n"
-               "  --compact            merge segments and drop tombstones\n"
-               "  --push               publish this index to the relay\n"
-               "  --pull               fetch the index from the relay\n"
-               "\n"
-               "  --relay HOST:PORT    where the vault's relay is\n"
-               "\n"
-               "  --model NAME         all-minilm, nomic-embed-text, or\n"
-               "                       hashing for the deterministic stand-in\n"
-               "  --generator NAME     an Ollama chat model for --ask\n"
-               "  --floor F            the relevance floor, cosine\n");
+  std::fprintf(
+      stderr,
+      "umbra_ai --vault DIR --index DIR [--model NAME] COMMAND\n"
+      "\n"
+      "  --build              chunk, embed and index the vault\n"
+      "                       add --compact to merge segments after\n"
+      "  --ask QUESTION       retrieve and answer\n"
+      "  --eval FILE          run a question set and report\n"
+      "  --stats              what the index holds\n"
+      "  --compact            merge segments and drop tombstones\n"
+      "  --push               publish this index to the relay\n"
+      "  --pull               fetch the index from the relay\n"
+      "\n"
+      "  --relay HOST:PORT    where the vault's relay is\n"
+      "  --pass-file PATH     the vault passphrase, or UMBRA_PASSPHRASE,\n"
+      "                       or a prompt. Never an argument.\n"
+      "\n"
+      "  --model NAME         all-minilm, nomic-embed-text, or\n"
+      "                       hashing for the deterministic stand-in\n"
+      "  --generator NAME     an Ollama chat model for --ask\n"
+      "  --floor F            the relevance floor, cosine\n");
 }
 
 struct Options {
@@ -277,19 +203,35 @@ struct Options {
   bool build = false;
   bool stats = false;
   bool compact = false;
+  // Never a --pass flag: an argument vector is visible in `ps`.
+  std::string pass_file;
 };
 
+VaultKeys VaultKeysFor(const Options& o) {
+  std::string pass;
+  if (!cmdstate::ResolvePassphrase(o.pass_file, &pass)) std::exit(2);
+  VaultKeys keys;
+  const cmdstate::OpenVaultStatus st =
+      cmdstate::OpenVaultKeys(o.vault, pass, &keys);
+  if (st == cmdstate::OpenVaultStatus::kNotAVault) {
+    std::fprintf(stderr,
+                 "%s is not a vault yet. Create it first:\n"
+                 "  umbra_sync --dir %s --pass-file FILE --create\n",
+                 o.vault.c_str(), o.vault.c_str());
+    std::exit(1);
+  }
+  if (st != cmdstate::OpenVaultStatus::kOk) {
+    std::fprintf(stderr, "cannot open this vault with that passphrase\n");
+    std::exit(1);
+  }
+  return keys;
+}
+
 ReplicaId ReplicaFor(const Options& o) {
-  // Falls back to the index directory only for --stats, which reads and
-  // publishes nothing, so the id it uses never reaches another device.
-  //
-  // --compact used to be on that list and did not belong there: compaction
-  // emits kAdd and kRetire operations (src/ai/index.cc:843), so a compaction
-  // run without --vault would sign them as a device that exists nowhere else,
-  // mint a second keypair under the index directory, and publish under an
-  // identity the vault has never enrolled. main() now refuses that.
-  const std::string anchor = o.vault.empty() ? o.index_dir : o.vault;
-  return LoadOrCreateDeviceKeys(anchor).Replica();
+  // No fallback any more: main() refuses every command without a --vault, so
+  // there is always a vault to anchor to. The fallback used to be for --stats,
+  // which now needs the vault anyway to decrypt what it is reporting on.
+  return cmdstate::LoadOrCreateDeviceKeys(o.vault).Replica();
 }
 
 int Build(const Options& o) {
@@ -299,11 +241,11 @@ int Build(const Options& o) {
     std::fprintf(stderr, "no markdown under %s\n", o.vault.c_str());
     return 1;
   }
-  VaultKeys keys = KeysFor("umbra ai driver");
+  VaultKeys keys = VaultKeysFor(o);
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
-  if (Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), ReplicaFor(o),
-                  &index) != IndexStatus::kOk) {
+  if (Index::Open(o.index_dir, &keys, keys.current(), e->id(), e->dimension(),
+                  ReplicaFor(o), &index) != IndexStatus::kOk) {
     std::fprintf(stderr, "cannot open the index at %s\n", o.index_dir.c_str());
     return 1;
   }
@@ -448,12 +390,13 @@ std::string PathOf(const std::string& root,
 int Ask(const Options& o) {
   std::vector<std::string> files;
   ListMarkdown(o.vault, "", &files);
-  VaultKeys keys = KeysFor("umbra ai driver");
+  VaultKeys keys = VaultKeysFor(o);
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
   {
-    const IndexStatus s = Index::Open(o.index_dir, &keys, 0, e->id(),
-                                      e->dimension(), ReplicaFor(o), &index);
+    const IndexStatus s =
+        Index::Open(o.index_dir, &keys, keys.current(), e->id(), e->dimension(),
+                    ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));
@@ -516,12 +459,13 @@ int Eval(const Options& o) {
   }
   std::vector<std::string> files;
   ListMarkdown(o.vault, "", &files);
-  VaultKeys keys = KeysFor("umbra ai driver");
+  VaultKeys keys = VaultKeysFor(o);
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
   {
-    const IndexStatus s = Index::Open(o.index_dir, &keys, 0, e->id(),
-                                      e->dimension(), ReplicaFor(o), &index);
+    const IndexStatus s =
+        Index::Open(o.index_dir, &keys, keys.current(), e->id(), e->dimension(),
+                    ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));
@@ -663,12 +607,13 @@ bool OpenRelay(const Options& o, VaultKeys keys, RelayHandle* h) {
 }
 
 int Push(const Options& o) {
-  VaultKeys keys = KeysFor("umbra ai driver");
+  VaultKeys keys = VaultKeysFor(o);
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
   {
-    const IndexStatus s = Index::Open(o.index_dir, &keys, 0, e->id(),
-                                      e->dimension(), ReplicaFor(o), &index);
+    const IndexStatus s =
+        Index::Open(o.index_dir, &keys, keys.current(), e->id(), e->dimension(),
+                    ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index: %s\n", IndexStatusName(s));
       return 1;
@@ -757,12 +702,13 @@ int Push(const Options& o) {
 }
 
 int Pull(const Options& o) {
-  VaultKeys keys = KeysFor("umbra ai driver");
+  VaultKeys keys = VaultKeysFor(o);
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
   {
-    const IndexStatus s = Index::Open(o.index_dir, &keys, 0, e->id(),
-                                      e->dimension(), ReplicaFor(o), &index);
+    const IndexStatus s =
+        Index::Open(o.index_dir, &keys, keys.current(), e->id(), e->dimension(),
+                    ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index: %s\n", IndexStatusName(s));
       return 1;
@@ -902,10 +848,10 @@ int Pull(const Options& o) {
 }
 
 int Stats(const Options& o) {
-  VaultKeys keys = KeysFor("umbra ai driver");
+  VaultKeys keys = VaultKeysFor(o);
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
-  const IndexStatus s = Index::Open(o.index_dir, &keys, 0, e->id(),
+  const IndexStatus s = Index::Open(o.index_dir, &keys, keys.current(), e->id(),
                                     e->dimension(), ReplicaFor(o), &index);
   if (s != IndexStatus::kOk) {
     std::fprintf(stderr, "cannot open the index: %s\n", IndexStatusName(s));
@@ -925,12 +871,13 @@ int Stats(const Options& o) {
 }
 
 int CompactCommand(const Options& o) {
-  VaultKeys keys = KeysFor("umbra ai driver");
+  VaultKeys keys = VaultKeysFor(o);
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
   {
-    const IndexStatus s = Index::Open(o.index_dir, &keys, 0, e->id(),
-                                      e->dimension(), ReplicaFor(o), &index);
+    const IndexStatus s =
+        Index::Open(o.index_dir, &keys, keys.current(), e->id(), e->dimension(),
+                    ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));
@@ -961,7 +908,10 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     const char* next = (i + 1 < argc) ? argv[i + 1] : nullptr;
-    if (a == "--vault" && next) {
+    if (a == "--pass-file" && next) {
+      o.pass_file = next;
+      ++i;
+    } else if (a == "--vault" && next) {
       o.vault = next;
       ++i;
     } else if (a == "--index" && next) {
@@ -1004,12 +954,14 @@ int main(int argc, char** argv) {
     Usage();
     return 2;
   }
-  // EVERY COMMAND THAT PUBLISHES NEEDS A VAULT, because the vault is where this
-  // device's identity lives. --stats is the one that does not publish.
-  if (o.vault.empty() && !o.stats) {
+  // EVERY COMMAND NEEDS A VAULT, because the vault is where both this device's
+  // identity and the keys that open the index live. --stats used to be exempt;
+  // it is not any more, because reading an index means decrypting it.
+  if (o.vault.empty()) {
     std::fprintf(stderr,
-                 "--vault is required: the device identity that signs manifest "
-                 "operations lives beside the vault, not beside the index\n");
+                 "--vault is required: the keys that open an index, and the "
+                 "device identity that signs its operations, both live beside "
+                 "the vault rather than beside the index\n");
     return 2;
   }
   if (o.build) return Build(o);  // --compact modifies it rather than replacing

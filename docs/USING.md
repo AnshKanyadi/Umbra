@@ -8,24 +8,23 @@ Written for macOS. Nothing is assumed to be installed.
 
 ## Read this before you point it at real notes
 
-Two things are true today and neither is obvious from the commands.
+One thing is worth knowing before you start, and one is worth knowing about
+where the keys live.
 
-**Umbra writes one file into your vault folder.** Indexing creates
+**Umbra writes into your vault folder.** Indexing creates
 `<vault>/.umbra/device`, a keypair that is this device's identity, mode 0600.
 Creating a vault also writes `<vault>/.umbra/salt` and `<vault>/.umbra/epochs`.
 If the folder is an Obsidian vault that something else syncs, that hidden folder
 syncs with it.
 
-**The AI index is not meaningfully encrypted at rest.** `umbra_ai` is a driver
-for measuring the index, not a finished product, and it derives its keys from a
-passphrase constant in the source with a fixed salt (`cmd/ai_main.cc`, `KeysFor`).
-Anyone with the binary can open an index it wrote. The sealing is real and the
-format is the real one; the *key* is not a secret. Point it at a copy of your
-notes, keep the `--index` directory somewhere you would be comfortable leaving
-plaintext, and do not treat it as protected storage yet.
+**The index is sealed with your vault's keys.** `umbra_ai` reads the salt and
+the wrapped epoch keys from `<vault>/.umbra`, exactly as `umbra_sync` does, so
+an index is worth what the passphrase is worth. That means two things in
+practice: you must create the vault before you can index it, and every
+`umbra_ai` command takes a passphrase the same way `umbra_sync` does —
+`--pass-file`, `UMBRA_PASSPHRASE`, or a prompt.
 
-Vaults made by `umbra_sync` are different: those keys come from a passphrase you
-choose, and that path is the real one.
+It also means every invocation pays Argon2id, about half a second.
 
 ## 1. Prerequisites
 
@@ -151,11 +150,15 @@ device, which is not this page.
 
 ## 4. Index it
 
+Step 3 is not optional any more: the index is sealed with the vault's keys, so
+there has to be a vault first.
+
 ```sh
 ./build/umbra_ai \
   --vault ~/Desktop/umbra-test-vault \
   --index ~/Desktop/umbra-index \
   --model nomic-embed-text \
+  --pass-file ~/.umbra-pass \
   --build
 ```
 
@@ -191,6 +194,7 @@ To merge the many small segments a first build produces into fewer large ones:
   --vault ~/Desktop/umbra-test-vault \
   --index ~/Desktop/umbra-index \
   --model nomic-embed-text \
+  --pass-file ~/.umbra-pass \
   --compact
 ```
 
@@ -207,6 +211,7 @@ compact.
   --vault ~/Desktop/umbra-test-vault \
   --index ~/Desktop/umbra-index \
   --model nomic-embed-text \
+  --pass-file ~/.umbra-pass \
   --ask 'what did I decide about the budget'
 ```
 
@@ -245,6 +250,7 @@ for a score to stand out against. Lower it:
   --vault ~/Desktop/umbra-test-vault \
   --index ~/Desktop/umbra-index \
   --model nomic-embed-text \
+  --pass-file ~/.umbra-pass \
   --floor 0.45 \
   --ask 'distributed systems'
 ```
@@ -258,6 +264,7 @@ ollama pull llama3.2:3b
   --vault ~/Desktop/umbra-test-vault \
   --index ~/Desktop/umbra-index \
   --model nomic-embed-text \
+  --pass-file ~/.umbra-pass \
   --generator llama3.2:3b \
   --ask 'what is this vault about'
 ```
@@ -273,6 +280,7 @@ What the index holds, at any point:
   --vault ~/Desktop/umbra-test-vault \
   --index ~/Desktop/umbra-index \
   --model nomic-embed-text \
+  --pass-file ~/.umbra-pass \
   --stats
 ```
 
@@ -296,6 +304,18 @@ checked out. `git submodule update --init --recursive`.
 
 **`cannot reach the relay`** from `umbra_sync` — expected on one machine with no
 relay. Nothing on this page needs one.
+
+**`<dir> is not a vault yet`** from `umbra_ai` — run `umbra_sync --create` on
+the vault first. The keys that seal an index live in `<vault>/.umbra`.
+
+**`cannot open this vault with that passphrase`** — the passphrase does not
+match the one the vault was created with. There is no recovery for a forgotten
+passphrase; that is the point of it.
+
+**`cannot open the index: segment-lost`** on an index that used to work — it was
+built by a version of `umbra_ai` that derived its own keys rather than the
+vault's. Those segments were sealed under a key that was never secret. Delete
+the index directory and rebuild it.
 
 **`cannot open the index at <dir>: model-mismatch`** — you changed `--model`.
 An index is bound to the model that built it, because vectors from two models
