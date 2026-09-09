@@ -196,6 +196,7 @@ add_library(umbra STATIC
   src/ai/embed.cc
   src/ai/embed_hashing.cc
   src/ai/embed_ollama.cc
+  src/ai/hnsw.cc
   src/sync/enroll.cc
   src/sync/tcp_transport.cc
   src/watcher/content_hash.cc
