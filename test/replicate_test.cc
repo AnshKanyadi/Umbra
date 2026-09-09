@@ -1256,11 +1256,30 @@ TEST(Replication, WhatCompactionRetiredIsNotWantedOnceItsReplacementIsHeld) {
   EXPECT_GT(want.size(), retired)
       << "nothing here supersedes anything, so the ordering has no work to do";
 
+  // The fetch order puts every one of those retired segments last.
+  const std::vector<SegmentId> order = b.index->MissingInFetchOrder();
+  ASSERT_EQ(order.size(), want.size());
+  std::size_t head = 0;
+  while (head < order.size()) {
+    const SegmentState* st = b.index->manifest().Get(order[head]);
+    if (st != nullptr && !st->superseded_by.empty()) break;
+    ++head;
+  }
+  EXPECT_EQ(head, want.size() - retired)
+      << "a retired segment sorted ahead of a replacement";
+  for (std::size_t i = head; i < order.size(); ++i) {
+    const SegmentState* st = b.index->manifest().Get(order[i]);
+    ASSERT_NE(st, nullptr);
+    EXPECT_FALSE(st->superseded_by.empty())
+        << "a replacement sorted behind a retired segment";
+  }
+
   // The replacement is what A actually still has. Adopt only that.
   std::size_t adopted = 0;
-  for (const SegmentId& id : want) {
+  for (const SegmentId& id : order) {
     const SegmentState* st = b.index->manifest().Get(id);
     if (st != nullptr && !st->superseded_by.empty()) continue;
+    EXPECT_TRUE(b.index->Wants(id));
     const std::string sealed = a.SealedBytes(id);
     ASSERT_FALSE(sealed.empty()) << "a segment nobody deferred is not held";
     ASSERT_EQ(b.index->AdoptSegment(sealed), IndexStatus::kOk);
@@ -1274,6 +1293,10 @@ TEST(Replication, WhatCompactionRetiredIsNotWantedOnceItsReplacementIsHeld) {
       << b.index->Missing().size() << " segment(s) still wanted after the "
       << "replacement arrived";
   EXPECT_TRUE(b.index->Complete());
+  // Which is what a puller walking the earlier list re-asks and gets: every
+  // retired segment it had not reached yet is now unwanted, so no round trip
+  // is spent on it.
+  for (const SegmentId& id : order) EXPECT_FALSE(b.index->Wants(id));
 }
 
 }  // namespace ai

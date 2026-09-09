@@ -1,0 +1,6 @@
+# The build directories are the developer's, not the image's. Copying a macOS
+# CMake cache into a Linux build wastes minutes and then fails confusingly.
+b-*
+build*
+.git
+docs

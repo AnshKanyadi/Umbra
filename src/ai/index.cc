@@ -1107,6 +1107,36 @@ std::vector<SegmentId> Index::Missing() const {
       [&im](const SegmentId& id) { return im.Present(id); });
 }
 
+std::vector<SegmentId> Index::MissingInFetchOrder() const {
+  const Impl& im = *impl_;
+  std::vector<SegmentId> first;
+  std::vector<SegmentId> last;
+  for (const SegmentId& id : Missing()) {
+    const SegmentState* st = im.manifest->Get(id);
+    if (st != nullptr && !st->superseded_by.empty()) {
+      last.push_back(id);
+    } else {
+      first.push_back(id);
+    }
+  }
+  first.insert(first.end(), last.begin(), last.end());
+  return first;
+}
+
+bool Index::Wants(const SegmentId& id) const {
+  const Impl& im = *impl_;
+  if (im.Present(id)) return false;
+  const SegmentState* st = im.manifest->Get(id);
+  if (st == nullptr) return false;
+  // Superseded by something already held is not wanted, which is the whole
+  // point of re-asking: the replacement may have landed since the list was
+  // taken.
+  for (const SegmentId& by : st->superseded_by) {
+    if (im.Present(by)) return false;
+  }
+  return true;
+}
+
 std::vector<SegmentId> Index::AwaitingReplacement() const {
   const Impl& im = *impl_;
   const auto present = [&im](const SegmentId& id) { return im.Present(id); };

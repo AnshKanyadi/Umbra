@@ -844,49 +844,34 @@ int Pull(const Options& o) {
   std::size_t pulled = 0;
   uint64_t pulled_bytes = 0;
   std::size_t failed = 0;
-  // REPLACEMENTS FIRST, THE SEGMENTS THEY RETIRE SECOND.
+  // REPLACEMENTS FIRST, AND RE-ASKED PER SEGMENT.
   //
-  // A segment that a retirement is waiting on is genuinely still live -- the
-  // safety condition says so, and MissingFrom lists it -- but it stops being
-  // wanted the instant its replacement arrives. Fetching in manifest order
-  // therefore spends a round trip on each of them for nothing.
+  // A segment a retirement is waiting on is genuinely still live -- the safety
+  // condition says so, and MissingFrom lists it -- but it stops being wanted
+  // the instant its replacement arrives, so fetching in manifest order spends a
+  // round trip on each of them for nothing. Invisible on localhost and glaring
+  // on a network: a cold pull of a compacted 2000-note index made 2000 doomed
+  // fetches, half a second at a sub-millisecond round trip and about seven
+  // minutes at 200ms.
   //
-  // This was invisible on localhost and glaring on a network: a cold pull of a
-  // compacted 2000-note index made 2000 doomed fetches, 0.5 seconds at a
-  // sub-millisecond round trip and about seven minutes at 200ms. The second
-  // pass re-reads Missing(), which by then excludes every one of them.
-  std::set<std::string> tried;
-  for (int pass = 0; pass < 2; ++pass) {
-    for (const SegmentId& id : index->Missing()) {
-      const std::string key(reinterpret_cast<const char*>(id.bytes.data()),
-                            id.bytes.size());
-      if (pass == 0) {
-        // Retired in favour of something else, so its replacement is in this
-        // same list and fetching that one first makes this one unwanted.
-        //
-        // Not Index::AwaitingReplacement, which answers a different question:
-        // it reports what THIS DEVICE HOLDS and has not yet been able to drop,
-        // so a cold puller -- the case that matters -- gets an empty list from
-        // it and defers nothing.
-        const SegmentState* st = index->manifest().Get(id);
-        if (st != nullptr && !st->superseded_by.empty()) continue;
-      }
-      if (!tried.insert(key).second) continue;
-      if (!tried.insert(key).second) continue;
-      std::string sealed;
-      if (h.client->PullSegment(id.bytes, &sealed) != sync::SyncStatus::kOk) {
-        ++failed;
-        continue;
-      }
-      const IndexStatus s = index->AdoptSegment(sealed);
-      if (s == IndexStatus::kOk) {
-        ++pulled;
-        pulled_bytes += sealed.size();
-      } else {
-        ++failed;
-        std::printf("  segment %s refused: %s\n", id.Short().c_str(),
-                    IndexStatusName(s));
-      }
+  // Both halves are on Index (include/umbra/ai/index.h) rather than here. They
+  // were here first, and a duplicated line disabled the entire fetch loop with
+  // the whole suite still green, because nothing tests this binary.
+  for (const SegmentId& id : index->MissingInFetchOrder()) {
+    if (!index->Wants(id)) continue;
+    std::string sealed;
+    if (h.client->PullSegment(id.bytes, &sealed) != sync::SyncStatus::kOk) {
+      ++failed;
+      continue;
+    }
+    const IndexStatus s = index->AdoptSegment(sealed);
+    if (s == IndexStatus::kOk) {
+      ++pulled;
+      pulled_bytes += sealed.size();
+    } else {
+      ++failed;
+      std::printf("  segment %s refused: %s\n", id.Short().c_str(),
+                  IndexStatusName(s));
     }
   }
   const double byte_seconds = Since(b0);

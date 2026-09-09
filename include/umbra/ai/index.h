@@ -165,6 +165,23 @@ class Index {
   // asks the relay for.
   std::vector<SegmentId> Missing() const;
 
+  // The same segments, ordered so a puller spends no round trip on bytes it is
+  // about to stop wanting: everything not retired first, then what compaction
+  // retired. A retired segment is genuinely still wanted -- the safety
+  // condition keeps it live until its replacement is present -- so it cannot be
+  // dropped from the list, only moved to the end of it, where re-checking
+  // Missing() will have removed it.
+  //
+  // Ordering rather than filtering, and here rather than in the caller, because
+  // the caller that had it was a binary with no test around it: a duplicated
+  // line disabled the whole fetch loop and the suite stayed green.
+  std::vector<SegmentId> MissingInFetchOrder() const;
+
+  // Whether this segment is still one of the missing. A puller walking the list
+  // above re-asks per segment, because adopting a replacement makes everything
+  // it retired unwanted mid-loop.
+  bool Wants(const SegmentId& id) const;
+
   // Segments this device holds that the manifest says are retired but which are
   // still live because their replacement has not arrived. Exists so a client
   // can explain why its index is larger than the manifest implies.
