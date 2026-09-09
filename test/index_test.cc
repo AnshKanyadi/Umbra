@@ -552,5 +552,64 @@ TEST(Index, ReportsAMissingSegmentRatherThanSearchingWithoutIt) {
             IndexStatus::kSegmentLost);
 }
 
+// REOPENING AS A NEW PROCESS WOULD, with keys derived again rather than kept
+// alive across the close. Every other test here holds one VaultKeys for the
+// whole test, so none of them could catch a store whose contents depend on
+// something Create draws at random -- and the driver tool hit exactly that:
+// VaultKeys::Create makes a NEW random epoch key each call, so a second run
+// derived the same root, a different content key, and reported segment-lost on
+// a manifest that was perfectly correct.
+//
+// The fix belongs to whoever holds the keys (a client stores its epoch wraps),
+// but the test belongs here, because "the index survives a restart" is a claim
+// about the index.
+TEST(Index, SurvivesAReopenWithSeparatelyDerivedKeys) {
+  TempDir dir;
+  std::unique_ptr<Embedder> e = NewHashingEmbedder(96);
+  const Corpus c = BuildCorpus(e.get(), 10);
+
+  // Two independently derived key sets that agree, the way a client's do after
+  // it recovers its epoch wraps from disk.
+  const auto derive = []() {
+    std::array<uint8_t, kSaltBytes> salt{};
+    salt.fill(9);
+    VaultKeys k;
+    EXPECT_EQ(VaultKeys::Create("index test", salt, Fast(), &k),
+              CryptoStatus::kOk);
+    const SecretKey e0 = DeriveSubkey(k.root(), 0, "umbIdxTs");
+    k.OverwriteEpochForBootstrap(0, e0);
+    return k;
+  };
+
+  {
+    VaultKeys writing = derive();
+    std::unique_ptr<Index> idx;
+    ASSERT_EQ(
+        Index::Open(dir.path(), &writing, 0, e->id(), e->dimension(), &idx),
+        IndexStatus::kOk);
+    for (std::size_t i = 0; i < c.objects.size(); ++i) {
+      ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
+                IndexStatus::kOk);
+    }
+    uint32_t merged = 0;
+    uint32_t reclaimed = 0;
+    ASSERT_EQ(idx->Compact(2, 10, &merged, &reclaimed), IndexStatus::kOk);
+    EXPECT_GT(merged, 1u)
+        << "the reopen after a COMPACTION is the untested path";
+  }
+
+  VaultKeys reading = derive();
+  std::unique_ptr<Index> idx;
+  ASSERT_EQ(Index::Open(dir.path(), &reading, 0, e->id(), e->dimension(), &idx),
+            IndexStatus::kOk);
+  EXPECT_EQ(idx->Stats().objects, 10u);
+  Vector q;
+  ASSERT_EQ(e->EmbedQuery("segments are immutable and sealed", &q),
+            EmbedStatus::kOk);
+  std::vector<SearchHit> hits;
+  ASSERT_EQ(idx->Search(q, 5, 64, &hits), IndexStatus::kOk);
+  EXPECT_FALSE(hits.empty());
+}
+
 }  // namespace ai
 }  // namespace umbra

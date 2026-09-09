@@ -346,6 +346,11 @@ target_link_libraries(umbra_sync PRIVATE umbra)
 target_include_directories(umbra_sync PRIVATE src src/watcher src/crdt src/crypto src/sync src/ai)
 target_compile_options(umbra_sync PRIVATE ${UMBRA_CXX_FLAGS})
 
+add_executable(umbra_ai cmd/ai_main.cc)
+target_link_libraries(umbra_ai PRIVATE umbra umbra::sodium)
+target_include_directories(umbra_ai PRIVATE src src/watcher src/crdt src/crypto src/sync src/ai)
+target_compile_options(umbra_ai PRIVATE ${UMBRA_CXX_FLAGS})
+
 add_executable(umbra_relay_bin cmd/relay_main.cc)
 set_target_properties(umbra_relay_bin PROPERTIES OUTPUT_NAME umbra_relay)
 target_link_libraries(umbra_relay_bin PRIVATE umbra_relay Threads::Threads)

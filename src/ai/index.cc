@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <set>
 
@@ -323,6 +324,11 @@ IndexStatus Index::PutObject(const ObjectId& object,
   }
 
   basalt::WriteBatch batch;
+  // Declared BEFORE anything that adds to the batch. Every key and value handed
+  // to a Slice has to outlive the Write, and the first version scoped the
+  // segment key and its value to the if-block below -- they were destroyed
+  // before Write ran, so the batch stored a segment entry from freed memory.
+  std::deque<std::string> keep_alive;
   SegmentId new_id;
   std::string sealed;
   bool have_new = false;
@@ -357,15 +363,20 @@ IndexStatus Index::PutObject(const ObjectId& object,
     if (!WriteFileAtomically(im.PathFor(new_id), sealed)) {
       return IndexStatus::kStoreFailed;
     }
-    std::string value;
+    keep_alive.push_back(std::string());
+    std::string& value = keep_alive.back();
     PutU32(&value, static_cast<uint32_t>(chunks.size()));
     PutU32(&value, static_cast<uint32_t>(sealed.size()));
-    const std::string skey = SegmentKey(new_id);
-    batch.Set(basalt::Slice(skey), basalt::Slice(value));
+    keep_alive.push_back(SegmentKey(new_id));
+    batch.Set(basalt::Slice(keep_alive.back()), basalt::Slice(value));
     have_new = true;
   }
 
-  std::vector<std::string> keep_alive;
+  // A DEQUE, NOT A VECTOR, for the same reason: basalt::Slice does not own its
+  // bytes, and a vector's push_back reallocates, which moves every string
+  // already in it and leaves every Slice built from one pointing at freed
+  // memory. The batch then writes and deletes whatever those addresses now
+  // hold. A deque never invalidates references to elements already in it.
   for (const std::pair<SegmentId, uint32_t>& p : previous) {
     keep_alive.push_back(TombstoneKey(p.first, p.second));
     batch.Set(basalt::Slice(keep_alive.back()), basalt::Slice(""));
@@ -534,7 +545,9 @@ IndexStatus Index::Compact(uint32_t min_segments,
   }
 
   basalt::WriteBatch batch;
-  std::vector<std::string> keep_alive;
+  // See the note in PutObject: a vector here dangles every Slice it has already
+  // handed to the batch.
+  std::deque<std::string> keep_alive;
   SegmentId new_id;
   std::string sealed;
   const bool have_new = !entries.empty();
@@ -559,7 +572,8 @@ IndexStatus Index::Compact(uint32_t min_segments,
     if (!WriteFileAtomically(im.PathFor(new_id), sealed)) {
       return IndexStatus::kStoreFailed;
     }
-    std::string value;
+    keep_alive.push_back(std::string());
+    std::string& value = keep_alive.back();
     PutU32(&value, static_cast<uint32_t>(entries.size()));
     PutU32(&value, static_cast<uint32_t>(sealed.size()));
     keep_alive.push_back(SegmentKey(new_id));

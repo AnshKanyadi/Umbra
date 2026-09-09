@@ -1,0 +1,18 @@
+# question	a substring that must appear in a cited passage, or NONE
+why is an epoch key random instead of derived	computable by a
+what does a revoked device keep	files are on its disk in plaintext
+what does the pairing code protect against	does not say who sealed it
+why is a code block never split	looks like code and compiles as nothing
+what happens to a table that is too big	carries the header row
+why are deletes tombstones	strands whatever was reachable only
+what does editing one note cost	tombstones the old ones
+what can the relay learn	Ciphertext sizes, message timing
+why fugue instead of rga	backward interleaving
+what happens to a move that would make a cycle	ignored, not repaired
+what runs in the nightly sweep	AddressSanitizer
+why check both char signedness settings	signed on x86 and unsigned on ARM
+what is tested by the restart schedule	rebuilt from its own durable logs
+how many CI lanes are there	Twelve lanes
+what is the capital of France	NONE
+what did I have for breakfast	NONE
+how do I configure a kubernetes ingress	NONE
