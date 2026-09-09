@@ -142,6 +142,21 @@ VaultKeys KeysFor(const std::string& passphrase) {
   return k;
 }
 
+// A DRIVER'S IDENTITY, DERIVED FROM ITS INDEX DIRECTORY. A real client uses the
+// device id it enrolled with (cmd/sync_main.cc); this tool has no enrolment, so
+// it takes a stable id from the path it was pointed at -- stable across runs,
+// different between two index directories on one machine, which is what makes
+// two --index dirs behave as two devices for testing.
+ReplicaId ReplicaForIndex(const std::string& dir) {
+  ReplicaId r;
+  uint8_t digest[16];
+  crypto_generichash(digest, sizeof(digest),
+                     reinterpret_cast<const unsigned char*>(dir.data()),
+                     dir.size(), nullptr, 0);
+  std::memcpy(r.bytes.data(), digest, r.bytes.size());
+  return r;
+}
+
 std::unique_ptr<Embedder> MakeEmbedder(const std::string& model,
                                        uint32_t hashing_dim) {
   if (model == "hashing") return NewHashingEmbedder(hashing_dim);
@@ -196,7 +211,7 @@ int Build(const Options& o) {
   VaultKeys keys = KeysFor("umbra ai driver");
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
-  if (Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), &index) !=
+  if (Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), ReplicaForIndex(o.index_dir), &index) !=
       IndexStatus::kOk) {
     std::fprintf(stderr, "cannot open the index at %s\n", o.index_dir.c_str());
     return 1;
@@ -347,7 +362,7 @@ int Ask(const Options& o) {
   std::unique_ptr<Index> index;
   {
     const IndexStatus s =
-        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), &index);
+        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), ReplicaForIndex(o.index_dir), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));
@@ -415,7 +430,7 @@ int Eval(const Options& o) {
   std::unique_ptr<Index> index;
   {
     const IndexStatus s =
-        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), &index);
+        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), ReplicaForIndex(o.index_dir), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));
@@ -512,7 +527,7 @@ int Stats(const Options& o) {
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
   const IndexStatus s =
-      Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), &index);
+      Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), ReplicaForIndex(o.index_dir), &index);
   if (s != IndexStatus::kOk) {
     std::fprintf(stderr, "cannot open the index: %s\n", IndexStatusName(s));
     return 1;
@@ -536,7 +551,7 @@ int CompactCommand(const Options& o) {
   std::unique_ptr<Index> index;
   {
     const IndexStatus s =
-        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), &index);
+        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), ReplicaForIndex(o.index_dir), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));

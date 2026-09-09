@@ -77,6 +77,13 @@ struct Vault {
   }
 };
 
+ReplicaId TestReplicaFor(uint8_t seed) {
+  ReplicaId r;
+  r.bytes.fill(seed);
+  return r;
+}
+const ReplicaId kTestReplica = TestReplicaFor(0xC3);
+
 ObjectId ObjectFromSeed(uint8_t seed) {
   ObjectId id;
   id.bytes.fill(seed);
@@ -99,7 +106,7 @@ void Build(Fixture* f, const std::vector<std::string>& docs) {
   f->embedder = NewHashingEmbedder(128);
   ASSERT_NE(f->embedder, nullptr);
   ASSERT_EQ(Index::Open(f->dir.path(), &f->keys, 0, f->embedder->id(),
-                        f->embedder->dimension(), &f->index),
+                        f->embedder->dimension(), kTestReplica, &f->index),
             IndexStatus::kOk);
   for (std::size_t i = 0; i < docs.size(); ++i) {
     const ObjectId object = ObjectFromSeed(static_cast<uint8_t>(i + 1));

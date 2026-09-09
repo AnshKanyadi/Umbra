@@ -31,6 +31,7 @@
 #ifndef UMBRA_SYNC_CLIENT_H_
 #define UMBRA_SYNC_CLIENT_H_
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -93,6 +94,11 @@ class Transport {
   virtual bool PutEnvelope(const relay::PutEnvelopeRequest& req) = 0;
   virtual bool GetEnvelopes(const relay::GetEnvelopesRequest& req,
                             relay::EnvelopesResponse* out) = 0;
+  virtual bool PutSegment(const relay::PutSegmentRequest& req) = 0;
+  virtual bool GetSegment(const relay::GetSegmentRequest& req,
+                          relay::SegmentResponse* out) = 0;
+  virtual bool ListSegments(const relay::ListSegmentsRequest& req,
+                            relay::SegmentListResponse* out) = 0;
 };
 
 // A real one, over TCP.
@@ -137,6 +143,21 @@ class Client {
   SyncStatus PublishEnvelope(const std::array<uint8_t, 32>& tag,
                              const std::string& body);
   SyncStatus CollectEnvelopes(std::vector<relay::Envelope>* out);
+
+  // SEALED INDEX SEGMENTS, PUSHED AND PULLED IN PIECES. The client stitches;
+  // the relay never holds a whole one in memory and never sees inside it. A
+  // pull that stops partway resumes from the offset it reached rather than
+  // starting again, which matters when a segment is tens of megabytes over a
+  // link that drops.
+  // The id is raw bytes here rather than ai::SegmentId ON PURPOSE: the sync
+  // layer moves opaque blobs and must not depend on the layer that gives them
+  // meaning. Phase 3's relay does not link the CRDTs for the same reason.
+  SyncStatus PushSegment(const std::array<uint8_t, 32>& id,
+                         const std::string& sealed);
+  SyncStatus PullSegment(const std::array<uint8_t, 32>& id,
+                         std::string* sealed);
+  SyncStatus ListSegments(std::vector<std::array<uint8_t, 32>>* ids,
+                          std::vector<uint64_t>* sizes);
 
   SyncStatus PublishReport(uint64_t clock, const std::vector<ObjectId>& objects,
                            const ReplicaId& tree_object_source_hint);

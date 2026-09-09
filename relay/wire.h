@@ -54,6 +54,30 @@ constexpr uint32_t kMaxFrameBytes = 8u * 1024 * 1024;
 // allocate on its say-so.
 constexpr uint32_t kMaxEnvelopes = 256;
 
+// How many segment names one listing may carry. A vault's index is tens of
+// segments, not thousands, and a relay claiming otherwise must not be able to
+// make a client allocate for it.
+constexpr uint32_t kMaxSegmentsListed = 4096;
+
+// A SEGMENT IS LARGER THAN A FRAME, SO IT TRAVELS IN PIECES.
+//
+// Phase 4 measured a compacted 13,838-vector segment at 25 MB against an 8 MB
+// frame. The obvious fix -- raise kMaxFrameBytes -- is the wrong one: that
+// limit is what stops a hostile relay making a client reserve memory on ANY
+// response, and relaxing it everywhere to accommodate one message type spends
+// the guarantee on all of them.
+//
+// So a segment is pushed and fetched in pieces at a fixed offset. One frame
+// bound covers everything, a partial transfer resumes from where it stopped
+// rather than starting again, and a relay that lies about a segment's size can
+// waste a client's bandwidth but not its address space.
+constexpr uint32_t kSegmentChunkBytes = 4u * 1024 * 1024;
+
+// The largest segment this will move at all. Not a memory bound -- the chunking
+// above is that -- but a sanity bound, so a relay claiming a terabyte segment
+// is refused rather than politely downloaded.
+constexpr uint64_t kMaxSegmentBytes = 8ull * 1024 * 1024 * 1024;
+
 // A vault is identified by an opaque 16-byte id, like everything else the relay
 // sees. It is NOT derived from the passphrase or from any key: a relay hosting
 // several vaults must be able to tell them apart without that telling it
@@ -62,17 +86,22 @@ using VaultId = Id16;
 
 // Closed; -Werror=switch applies.
 enum class Op : uint8_t {
-  kPush = 1,          // client -> relay: store these blobs
-  kFetch = 2,         // client -> relay: give me blobs after a cursor
-  kPutReport = 3,     // client -> relay: store my sealed compaction report
-  kGetReports = 4,    // client -> relay: give me every device's sealed report
-  kPutEnvelope = 5,   // client -> relay: hold this enrolment envelope
-  kGetEnvelopes = 6,  // client -> relay: give me every envelope in this vault
-  kOk = 100,          // relay -> client
-  kBlobs = 101,       // relay -> client
-  kReports = 102,     // relay -> client
-  kEnvelopes = 104,   // relay -> client
-  kError = 103,       // relay -> client
+  kPush = 1,           // client -> relay: store these blobs
+  kFetch = 2,          // client -> relay: give me blobs after a cursor
+  kPutReport = 3,      // client -> relay: store my sealed compaction report
+  kGetReports = 4,     // client -> relay: give me every device's sealed report
+  kPutEnvelope = 5,    // client -> relay: hold this enrolment envelope
+  kGetEnvelopes = 6,   // client -> relay: give me every envelope in this vault
+  kPutSegment = 7,     // client -> relay: hold this sealed index segment
+  kGetSegment = 8,     // client -> relay: give me one segment by its id
+  kListSegments = 9,   // client -> relay: which segments do you hold
+  kOk = 100,           // relay -> client
+  kBlobs = 101,        // relay -> client
+  kReports = 102,      // relay -> client
+  kEnvelopes = 104,    // relay -> client
+  kSegment = 105,      // relay -> client
+  kSegmentList = 106,  // relay -> client
+  kError = 103,        // relay -> client
 };
 
 const char* OpName(Op o);
@@ -156,6 +185,57 @@ struct ReportsResponse {
   std::vector<SealedReport> reports;
 };
 
+// A SEALED INDEX SEGMENT, WHICH THE RELAY HOLDS AND CANNOT READ.
+//
+// Segments are content addressed, so the id is the hash of the bytes and the
+// relay could verify it -- and deliberately does not, because verifying would
+// mean the relay has an opinion about what a segment is. It stores bytes under
+// a name. The client checks the hash, which is the only place the check is
+// worth anything.
+//
+// LISTING IS SEPARATE FROM FETCHING because a client needs to know what exists
+// before deciding what to spend bandwidth on, and a vault's segments are far
+// too large to return in one response.
+struct PutSegmentRequest {
+  VaultId vault;
+  std::array<uint8_t, 32> segment{};
+  // Where this piece belongs, and how large the whole segment is. The total is
+  // repeated on every piece so a relay never has to guess and a client can
+  // verify it did not change under it mid transfer.
+  uint64_t offset = 0;
+  uint64_t total = 0;
+  std::string chunk;
+};
+
+struct GetSegmentRequest {
+  VaultId vault;
+  std::array<uint8_t, 32> segment{};
+  uint64_t offset = 0;
+};
+
+struct SegmentResponse {
+  bool found = false;
+  uint64_t offset = 0;
+  uint64_t total = 0;
+  std::string chunk;
+};
+
+struct ListSegmentsRequest {
+  VaultId vault;
+  // Exclusive lower bound, for paging. All zero starts from the beginning.
+  std::array<uint8_t, 32> after{};
+  uint32_t limit = 0;
+};
+
+struct SegmentEntryWire {
+  std::array<uint8_t, 32> segment{};
+  uint64_t bytes = 0;
+};
+
+struct SegmentListResponse {
+  std::vector<SegmentEntryWire> segments;
+};
+
 // Encoding. Every Encode produces a complete frame including its length prefix.
 std::string EncodePush(const PushRequest& r);
 std::string EncodeFetch(const FetchRequest& r);
@@ -164,6 +244,11 @@ std::string EncodeGetReports(const GetReportsRequest& r);
 std::string EncodePutEnvelope(const PutEnvelopeRequest& r);
 std::string EncodeGetEnvelopes(const GetEnvelopesRequest& r);
 std::string EncodeEnvelopes(const EnvelopesResponse& r);
+std::string EncodePutSegment(const PutSegmentRequest& r);
+std::string EncodeGetSegment(const GetSegmentRequest& r);
+std::string EncodeSegment(const SegmentResponse& r);
+std::string EncodeListSegments(const ListSegmentsRequest& r);
+std::string EncodeSegmentList(const SegmentListResponse& r);
 std::string EncodeOk();
 std::string EncodeBlobs(const BlobsResponse& r);
 std::string EncodeReports(const ReportsResponse& r);
@@ -181,6 +266,11 @@ bool DecodeReports(const std::string& body, ReportsResponse* out);
 bool DecodePutEnvelope(const std::string& body, PutEnvelopeRequest* out);
 bool DecodeGetEnvelopes(const std::string& body, GetEnvelopesRequest* out);
 bool DecodeEnvelopes(const std::string& body, EnvelopesResponse* out);
+bool DecodePutSegment(const std::string& body, PutSegmentRequest* out);
+bool DecodeGetSegment(const std::string& body, GetSegmentRequest* out);
+bool DecodeSegment(const std::string& body, SegmentResponse* out);
+bool DecodeListSegments(const std::string& body, ListSegmentsRequest* out);
+bool DecodeSegmentList(const std::string& body, SegmentListResponse* out);
 bool DecodeError(const std::string& body, std::string* message);
 
 }  // namespace relay

@@ -113,6 +113,12 @@ const char* OpName(Op o) {
       return "put-envelope";
     case Op::kGetEnvelopes:
       return "get-envelopes";
+    case Op::kPutSegment:
+      return "put-segment";
+    case Op::kGetSegment:
+      return "get-segment";
+    case Op::kListSegments:
+      return "list-segments";
     case Op::kOk:
       return "ok";
     case Op::kBlobs:
@@ -121,6 +127,10 @@ const char* OpName(Op o) {
       return "reports";
     case Op::kEnvelopes:
       return "envelopes";
+    case Op::kSegment:
+      return "segment";
+    case Op::kSegmentList:
+      return "segment-list";
     case Op::kError:
       return "error";
   }
@@ -231,10 +241,15 @@ bool PeekOp(const std::string& body, Op* out) {
     case Op::kGetReports:
     case Op::kPutEnvelope:
     case Op::kGetEnvelopes:
+    case Op::kPutSegment:
+    case Op::kGetSegment:
+    case Op::kListSegments:
     case Op::kOk:
     case Op::kBlobs:
     case Op::kReports:
     case Op::kEnvelopes:
+    case Op::kSegment:
+    case Op::kSegmentList:
     case Op::kError:
       *out = static_cast<Op>(v);
       return true;
@@ -400,6 +415,130 @@ bool DecodeEnvelopes(const std::string& body, EnvelopesResponse* out) {
     if (!r.Bytes(e.tag.data(), e.tag.size())) return false;
     if (!r.Str(&e.body)) return false;
     out->envelopes.push_back(e);
+  }
+  return r.Done();
+}
+
+std::string EncodePutSegment(const PutSegmentRequest& r) {
+  std::string b;
+  PutU8(static_cast<uint8_t>(Op::kPutSegment), &b);
+  PutBytes(r.vault.bytes.data(), r.vault.bytes.size(), &b);
+  PutBytes(r.segment.data(), r.segment.size(), &b);
+  PutU64(r.offset, &b);
+  PutU64(r.total, &b);
+  PutString(r.chunk, &b);
+  return Frame(b);
+}
+
+bool DecodePutSegment(const std::string& body, PutSegmentRequest* out) {
+  Reader r{&body, 0};
+  uint8_t op = 0;
+  if (!r.U8(&op) || static_cast<Op>(op) != Op::kPutSegment) return false;
+  if (!r.Bytes(out->vault.bytes.data(), out->vault.bytes.size())) return false;
+  if (!r.Bytes(out->segment.data(), out->segment.size())) return false;
+  if (!r.U64(&out->offset) || !r.U64(&out->total)) return false;
+  if (!r.Str(&out->chunk)) return false;
+  // BOUNDS BEFORE ANYTHING ELSE. A piece that claims to sit past the end of the
+  // segment it belongs to, or a segment larger than this will ever move, is
+  // refused rather than stored and puzzled over later.
+  if (out->total > kMaxSegmentBytes) return false;
+  if (out->offset > out->total) return false;
+  if (out->chunk.size() > kSegmentChunkBytes) return false;
+  if (out->offset + out->chunk.size() > out->total) return false;
+  return r.Done();
+}
+
+std::string EncodeGetSegment(const GetSegmentRequest& r) {
+  std::string b;
+  PutU8(static_cast<uint8_t>(Op::kGetSegment), &b);
+  PutBytes(r.vault.bytes.data(), r.vault.bytes.size(), &b);
+  PutBytes(r.segment.data(), r.segment.size(), &b);
+  PutU64(r.offset, &b);
+  return Frame(b);
+}
+
+bool DecodeGetSegment(const std::string& body, GetSegmentRequest* out) {
+  Reader r{&body, 0};
+  uint8_t op = 0;
+  if (!r.U8(&op) || static_cast<Op>(op) != Op::kGetSegment) return false;
+  if (!r.Bytes(out->vault.bytes.data(), out->vault.bytes.size())) return false;
+  if (!r.Bytes(out->segment.data(), out->segment.size())) return false;
+  if (!r.U64(&out->offset)) return false;
+  return r.Done();
+}
+
+std::string EncodeSegment(const SegmentResponse& r) {
+  std::string b;
+  PutU8(static_cast<uint8_t>(Op::kSegment), &b);
+  PutU8(r.found ? 1u : 0u, &b);
+  PutU64(r.offset, &b);
+  PutU64(r.total, &b);
+  PutString(r.chunk, &b);
+  return Frame(b);
+}
+
+bool DecodeSegment(const std::string& body, SegmentResponse* out) {
+  Reader r{&body, 0};
+  uint8_t op = 0;
+  if (!r.U8(&op) || static_cast<Op>(op) != Op::kSegment) return false;
+  uint8_t found = 0;
+  if (!r.U8(&found)) return false;
+  out->found = found != 0;
+  if (!r.U64(&out->offset) || !r.U64(&out->total)) return false;
+  if (!r.Str(&out->chunk)) return false;
+  if (out->total > kMaxSegmentBytes) return false;
+  if (out->chunk.size() > kSegmentChunkBytes) return false;
+  if (out->offset + out->chunk.size() > out->total) return false;
+  return r.Done();
+}
+
+std::string EncodeListSegments(const ListSegmentsRequest& r) {
+  std::string b;
+  PutU8(static_cast<uint8_t>(Op::kListSegments), &b);
+  PutBytes(r.vault.bytes.data(), r.vault.bytes.size(), &b);
+  PutBytes(r.after.data(), r.after.size(), &b);
+  PutU32(r.limit, &b);
+  return Frame(b);
+}
+
+bool DecodeListSegments(const std::string& body, ListSegmentsRequest* out) {
+  Reader r{&body, 0};
+  uint8_t op = 0;
+  if (!r.U8(&op) || static_cast<Op>(op) != Op::kListSegments) return false;
+  if (!r.Bytes(out->vault.bytes.data(), out->vault.bytes.size())) return false;
+  if (!r.Bytes(out->after.data(), out->after.size())) return false;
+  if (!r.U32(&out->limit)) return false;
+  return r.Done();
+}
+
+std::string EncodeSegmentList(const SegmentListResponse& r) {
+  std::string b;
+  PutU8(static_cast<uint8_t>(Op::kSegmentList), &b);
+  PutU32(static_cast<uint32_t>(r.segments.size()), &b);
+  for (const SegmentEntryWire& e : r.segments) {
+    PutBytes(e.segment.data(), e.segment.size(), &b);
+    PutU64(e.bytes, &b);
+  }
+  return Frame(b);
+}
+
+bool DecodeSegmentList(const std::string& body, SegmentListResponse* out) {
+  Reader r{&body, 0};
+  uint8_t op = 0;
+  if (!r.U8(&op) || static_cast<Op>(op) != Op::kSegmentList) return false;
+  uint32_t n = 0;
+  if (!r.U32(&n)) return false;
+  // Bound before reserving: a relay claiming four billion segments must not be
+  // able to make a client allocate for them.
+  if (n > kMaxSegmentsListed) return false;
+  out->segments.clear();
+  out->segments.reserve(n);
+  for (uint32_t i = 0; i < n; ++i) {
+    SegmentEntryWire e;
+    if (!r.Bytes(e.segment.data(), e.segment.size())) return false;
+    if (!r.U64(&e.bytes)) return false;
+    if (e.bytes > kMaxSegmentBytes) return false;
+    out->segments.push_back(e);
   }
   return r.Done();
 }

@@ -37,6 +37,13 @@ constexpr char kReportPrefix = 'r';
 // key spaces rather than one it might be tempted to interpret.
 constexpr char kEnvelopePrefix = 'e';
 
+// Sealed index segments. 'g' holds the pieces, keyed by offset so a transfer
+// can resume; 'G' holds the total size, which is what says a segment is
+// complete. Separate prefixes because a listing of one must never see the
+// other.
+constexpr char kSegmentPiecePrefix = 'g';
+constexpr char kSegmentSizePrefix = 'G';
+
 std::string BlobKey(const VaultId& v, const ObjectId& o, const ReplicaId& r,
                     uint64_t counter) {
   std::string k(1, kBlobPrefix);
@@ -52,6 +59,24 @@ std::string ReportKey(const VaultId& v, const ReplicaId& device) {
   k.append(reinterpret_cast<const char*>(v.bytes.data()), v.bytes.size());
   k.append(reinterpret_cast<const char*>(device.bytes.data()),
            device.bytes.size());
+  return k;
+}
+
+std::string SegmentPieceKey(const VaultId& v,
+                            const std::array<uint8_t, 32>& seg,
+                            uint64_t offset) {
+  std::string k(1, kSegmentPiecePrefix);
+  k.append(reinterpret_cast<const char*>(v.bytes.data()), v.bytes.size());
+  k.append(reinterpret_cast<const char*>(seg.data()), seg.size());
+  PutBe64(offset, &k);
+  return k;
+}
+
+std::string SegmentSizeKey(const VaultId& v,
+                           const std::array<uint8_t, 32>& seg) {
+  std::string k(1, kSegmentSizePrefix);
+  k.append(reinterpret_cast<const char*>(v.bytes.data()), v.bytes.size());
+  k.append(reinterpret_cast<const char*>(seg.data()), seg.size());
   return k;
 }
 
@@ -254,6 +279,117 @@ StoreStatus Store::GetEnvelopes(const GetEnvelopesRequest& req,
   return err.ok() ? StoreStatus::kOk : StoreStatus::kReadFailed;
 }
 
+StoreStatus Store::PutSegment(const PutSegmentRequest& req) {
+  basalt::WriteBatch batch;
+  const std::string piece = SegmentPieceKey(req.vault, req.segment, req.offset);
+  batch.Set(basalt::Slice(piece), basalt::Slice(req.chunk));
+  // THE SIZE RECORD IS WHAT SAYS A SEGMENT IS COMPLETE. Written on every piece
+  // rather than only the last, so a transfer that is interrupted still leaves
+  // the relay able to say how much it is missing, and a reader can tell a
+  // partial segment from a finished one by comparing what it has against it.
+  std::string total;
+  PutBe64(req.total, &total);
+  const std::string size_key = SegmentSizeKey(req.vault, req.segment);
+  batch.Set(basalt::Slice(size_key), basalt::Slice(total));
+  basalt::wal::SeqNum seq = 0;
+  const basalt::Status s = impl_->db->Write(batch, &seq);
+  return s.ok() ? StoreStatus::kOk : StoreStatus::kWriteFailed;
+}
+
+StoreStatus Store::GetSegment(const GetSegmentRequest& req,
+                              SegmentResponse* out) {
+  out->found = false;
+  out->offset = req.offset;
+  out->total = 0;
+  out->chunk.clear();
+
+  const std::string size_key = SegmentSizeKey(req.vault, req.segment);
+  std::string total;
+  if (!impl_->db->Get(basalt::Slice(size_key), &total).ok()) {
+    return StoreStatus::kOk;  // not found is not an error
+  }
+  if (total.size() != 8) return StoreStatus::kReadFailed;
+  uint64_t size = 0;
+  for (std::size_t i = 0; i < 8; ++i) {
+    size = (size << 8) | static_cast<uint8_t>(total[i]);
+  }
+  out->total = size;
+  out->found = true;
+  if (req.offset >= size) return StoreStatus::kOk;  // a legitimate end
+
+  // THE RELAY DOES NOT REASSEMBLE. It hands back the piece stored at or after
+  // the requested offset and lets the client stitch, because reassembling would
+  // mean holding a whole segment in memory to answer one request -- which is
+  // exactly the allocation the chunking exists to avoid.
+  const std::string lo = SegmentPieceKey(req.vault, req.segment, req.offset);
+  std::string hi = SegmentPieceKey(req.vault, req.segment, UINT64_MAX);
+  hi.push_back('\0');
+  basalt::IterOptions o;
+  o.lower = basalt::Bound::At(basalt::Slice(lo));
+  o.upper = basalt::Bound::At(basalt::Slice(hi));
+  std::unique_ptr<basalt::Iterator> it = impl_->db->NewIter(o);
+  if (it->First()) {
+    const std::string k = it->Key().ToString();
+    if (k.size() != 1 + 16 + 32 + 8) {
+      (void)it->Close();
+      return StoreStatus::kReadFailed;
+    }
+    uint64_t at = 0;
+    for (std::size_t i = 0; i < 8; ++i) {
+      at = (at << 8) |
+           static_cast<uint8_t>(k[1 + 16 + 32 + static_cast<std::size_t>(i)]);
+    }
+    out->offset = at;
+    out->chunk = it->Value().ToString();
+  }
+  const basalt::Status err = it->Error();
+  (void)it->Close();
+  return err.ok() ? StoreStatus::kOk : StoreStatus::kReadFailed;
+}
+
+StoreStatus Store::ListSegments(const ListSegmentsRequest& req,
+                                SegmentListResponse* out) {
+  std::array<uint8_t, 32> hi_seg{};
+  hi_seg.fill(0xFF);
+  std::string lo = SegmentSizeKey(req.vault, req.after);
+  // Exclusive: paging asks for what comes AFTER the last id seen.
+  lo.push_back('\0');
+  std::string hi = SegmentSizeKey(req.vault, hi_seg);
+  hi.push_back('\0');
+
+  basalt::IterOptions o;
+  o.lower = basalt::Bound::At(basalt::Slice(lo));
+  o.upper = basalt::Bound::At(basalt::Slice(hi));
+  std::unique_ptr<basalt::Iterator> it = impl_->db->NewIter(o);
+  const uint32_t limit = (req.limit == 0 || req.limit > kMaxSegmentsListed)
+                             ? kMaxSegmentsListed
+                             : req.limit;
+  for (bool ok = it->First(); ok; ok = it->Next()) {
+    if (out->segments.size() >= limit) break;
+    const std::string k = it->Key().ToString();
+    if (k.size() != 1 + 16 + 32) {
+      (void)it->Close();
+      return StoreStatus::kReadFailed;
+    }
+    const std::string v = it->Value().ToString();
+    if (v.size() != 8) {
+      (void)it->Close();
+      return StoreStatus::kReadFailed;
+    }
+    SegmentEntryWire e;
+    std::memcpy(e.segment.data(), k.data() + 1 + 16, e.segment.size());
+    uint64_t size = 0;
+    for (std::size_t i = 0; i < 8; ++i) {
+      size = (size << 8) | static_cast<uint8_t>(v[i]);
+    }
+    e.bytes = size;
+    out->segments.push_back(e);
+  }
+  const basalt::Status err = it->Error();
+  (void)it->Close();
+  return err.ok() ? StoreStatus::kOk : StoreStatus::kReadFailed;
+}
+
 StoreStatus Store::GetReports(const GetReportsRequest& req,
                               ReportsResponse* out) {
   ReplicaId lo_dev;
@@ -358,6 +494,38 @@ std::string HandleRequest(Store* store, const std::string& body) {
       }
       return EncodeEnvelopes(resp);
     }
+    case Op::kPutSegment: {
+      PutSegmentRequest req;
+      if (!DecodePutSegment(body, &req))
+        return EncodeError("malformed put-segment");
+      if (store->PutSegment(req) != StoreStatus::kOk) {
+        return EncodeError("cannot store the segment");
+      }
+      if (store->Sync() != StoreStatus::kOk) {
+        return EncodeError("cannot sync the segment");
+      }
+      return EncodeOk();
+    }
+    case Op::kGetSegment: {
+      GetSegmentRequest req;
+      if (!DecodeGetSegment(body, &req))
+        return EncodeError("malformed get-segment");
+      SegmentResponse resp;
+      if (store->GetSegment(req, &resp) != StoreStatus::kOk) {
+        return EncodeError("cannot read the segment");
+      }
+      return EncodeSegment(resp);
+    }
+    case Op::kListSegments: {
+      ListSegmentsRequest req;
+      if (!DecodeListSegments(body, &req))
+        return EncodeError("malformed list-segments");
+      SegmentListResponse resp;
+      if (store->ListSegments(req, &resp) != StoreStatus::kOk) {
+        return EncodeError("cannot list segments");
+      }
+      return EncodeSegmentList(resp);
+    }
     case Op::kGetReports: {
       GetReportsRequest req;
       if (!DecodeGetReports(body, &req))
@@ -374,6 +542,8 @@ std::string HandleRequest(Store* store, const std::string& body) {
     case Op::kBlobs:
     case Op::kReports:
     case Op::kEnvelopes:
+    case Op::kSegment:
+    case Op::kSegmentList:
     case Op::kError:
       return EncodeError("not a request");
   }

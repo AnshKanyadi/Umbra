@@ -130,6 +130,17 @@ VaultKeys MakeKeys() {
   return k;
 }
 
+// One device, one identity. Fixed rather than random so a test that reopens an
+// index is the same device doing it, which is what the manifest operations
+// assume.
+ReplicaId TestReplica(uint8_t seed) {
+  ReplicaId r;
+  r.bytes.fill(seed);
+  return r;
+}
+const ReplicaId kTestReplica = TestReplica(0xA1);
+const ReplicaId kOtherReplica = TestReplica(0xB2);
+
 ObjectId ObjectFromSeed(uint32_t seed) {
   ObjectId id;
   for (std::size_t i = 0; i < id.bytes.size(); ++i) {
@@ -194,7 +205,7 @@ TEST(Index, RoundTripsThroughDiskAndFindsWhatItStored) {
 
   {
     std::unique_ptr<Index> idx;
-    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
               IndexStatus::kOk);
     for (std::size_t i = 0; i < c.objects.size(); ++i) {
       ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
@@ -206,7 +217,7 @@ TEST(Index, RoundTripsThroughDiskAndFindsWhatItStored) {
   // REOPENED FROM DISK. An index that only works while it is in memory is not
   // an index, and the manifest plus segments shape is the whole point.
   std::unique_ptr<Index> idx;
-  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
             IndexStatus::kOk);
   EXPECT_EQ(idx->Stats().objects, 24u);
   EXPECT_GT(idx->Stats().vectors, 0u);
@@ -235,7 +246,7 @@ TEST(Index, RecallAgainstBruteForce) {
   const Corpus c = BuildCorpus(e.get(), 200);
 
   std::unique_ptr<Index> idx;
-  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
             IndexStatus::kOk);
   for (std::size_t i = 0; i < c.objects.size(); ++i) {
     ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
@@ -318,7 +329,7 @@ TEST(Index, AnEditTouchesOneObject) {
   const Corpus c = BuildCorpus(e.get(), 12);
 
   std::unique_ptr<Index> idx;
-  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
             IndexStatus::kOk);
   for (std::size_t i = 0; i < c.objects.size(); ++i) {
     ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
@@ -360,7 +371,7 @@ TEST(Index, ADeletedObjectStopsBeingReturned) {
   const Corpus c = BuildCorpus(e.get(), 12);
 
   std::unique_ptr<Index> idx;
-  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
             IndexStatus::kOk);
   for (std::size_t i = 0; i < c.objects.size(); ++i) {
     ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
@@ -388,7 +399,7 @@ TEST(Index, ADeletedObjectStopsBeingReturned) {
   // And it stays deleted across a reopen, which is what says the tombstone is
   // in the manifest rather than only in memory.
   idx.reset();
-  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
             IndexStatus::kOk);
   std::vector<SearchHit> reopened;
   ASSERT_EQ(idx->Search(q, 20, 64, &reopened), IndexStatus::kOk);
@@ -405,7 +416,7 @@ TEST(Index, CompactionReclaimsTombstonedSlots) {
   const Corpus c = BuildCorpus(e.get(), 30);
 
   std::unique_ptr<Index> idx;
-  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
             IndexStatus::kOk);
   for (std::size_t i = 0; i < c.objects.size(); ++i) {
     ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
@@ -451,7 +462,7 @@ TEST(Index, CompactionDoesNothingOnAnIdleStore) {
   std::unique_ptr<Embedder> e = NewHashingEmbedder(96);
   const Corpus c = BuildCorpus(e.get(), 3);
   std::unique_ptr<Index> idx;
-  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
             IndexStatus::kOk);
   for (std::size_t i = 0; i < c.objects.size(); ++i) {
     ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
@@ -480,7 +491,7 @@ TEST(Index, TheSameVectorsProduceTheSameSegmentBytes) {
   for (int round = 0; round < 2; ++round) {
     TempDir dir;
     std::unique_ptr<Index> idx;
-    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
               IndexStatus::kOk);
     for (std::size_t i = 0; i < c.objects.size(); ++i) {
       ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
@@ -502,7 +513,7 @@ TEST(Index, CompactionIsAlsoReproducible) {
   for (int round = 0; round < 2; ++round) {
     TempDir dir;
     std::unique_ptr<Index> idx;
-    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
               IndexStatus::kOk);
     for (std::size_t i = 0; i < c.objects.size(); ++i) {
       ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
@@ -533,7 +544,7 @@ TEST(Index, RefusesAnIndexBuiltByAnotherModel) {
   const Corpus c = BuildCorpus(a.get(), 4);
   {
     std::unique_ptr<Index> idx;
-    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, a->id(), a->dimension(), &idx),
+    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, a->id(), a->dimension(), kTestReplica, &idx),
               IndexStatus::kOk);
     for (std::size_t i = 0; i < c.objects.size(); ++i) {
       ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
@@ -541,7 +552,7 @@ TEST(Index, RefusesAnIndexBuiltByAnotherModel) {
     }
   }
   std::unique_ptr<Index> wrong;
-  EXPECT_EQ(Index::Open(dir.path(), &keys, 0, b->id(), b->dimension(), &wrong),
+  EXPECT_EQ(Index::Open(dir.path(), &keys, 0, b->id(), b->dimension(), kTestReplica, &wrong),
             IndexStatus::kModelMismatch);
 }
 
@@ -550,7 +561,7 @@ TEST(Index, RefusesVectorsOfTheWrongWidth) {
   VaultKeys keys = MakeKeys();
   std::unique_ptr<Embedder> e = NewHashingEmbedder(96);
   std::unique_ptr<Index> idx;
-  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
             IndexStatus::kOk);
 
   std::vector<Chunk> chunks;
@@ -577,7 +588,7 @@ TEST(Index, RefusesASegmentThatWasAlteredOnDisk) {
   const Corpus c = BuildCorpus(e.get(), 4);
   {
     std::unique_ptr<Index> idx;
-    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
               IndexStatus::kOk);
     for (std::size_t i = 0; i < c.objects.size(); ++i) {
       ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
@@ -590,7 +601,7 @@ TEST(Index, RefusesASegmentThatWasAlteredOnDisk) {
   ASSERT_TRUE(FlipByteAt(victim, 200));
 
   std::unique_ptr<Index> idx;
-  EXPECT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+  EXPECT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
             IndexStatus::kSegmentLost);
 }
 
@@ -601,7 +612,7 @@ TEST(Index, ReportsAMissingSegmentRatherThanSearchingWithoutIt) {
   const Corpus c = BuildCorpus(e.get(), 4);
   {
     std::unique_ptr<Index> idx;
-    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
               IndexStatus::kOk);
     for (std::size_t i = 0; i < c.objects.size(); ++i) {
       ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
@@ -612,7 +623,7 @@ TEST(Index, ReportsAMissingSegmentRatherThanSearchingWithoutIt) {
   ASSERT_FALSE(victim.empty());
   ASSERT_EQ(::unlink(victim.c_str()), 0);
   std::unique_ptr<Index> idx;
-  EXPECT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
+  EXPECT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), kTestReplica, &idx),
             IndexStatus::kSegmentLost);
 }
 
@@ -649,7 +660,7 @@ TEST(Index, SurvivesAReopenWithSeparatelyDerivedKeys) {
     VaultKeys writing = derive();
     std::unique_ptr<Index> idx;
     ASSERT_EQ(
-        Index::Open(dir.path(), &writing, 0, e->id(), e->dimension(), &idx),
+        Index::Open(dir.path(), &writing, 0, e->id(), e->dimension(), kTestReplica, &idx),
         IndexStatus::kOk);
     for (std::size_t i = 0; i < c.objects.size(); ++i) {
       ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
@@ -664,7 +675,7 @@ TEST(Index, SurvivesAReopenWithSeparatelyDerivedKeys) {
 
   VaultKeys reading = derive();
   std::unique_ptr<Index> idx;
-  ASSERT_EQ(Index::Open(dir.path(), &reading, 0, e->id(), e->dimension(), &idx),
+  ASSERT_EQ(Index::Open(dir.path(), &reading, 0, e->id(), e->dimension(), kTestReplica, &idx),
             IndexStatus::kOk);
   EXPECT_EQ(idx->Stats().objects, 10u);
   Vector q;
@@ -693,12 +704,12 @@ TEST(Index, RefusesAModelChangeOnAnIndexWithNoSegments) {
   ASSERT_NE(a->id(), b->id());
   {
     std::unique_ptr<Index> idx;
-    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, a->id(), a->dimension(), &idx),
+    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, a->id(), a->dimension(), kTestReplica, &idx),
               IndexStatus::kOk);
     EXPECT_EQ(idx->Stats().segments, 0u) << "the point is that it is empty";
   }
   std::unique_ptr<Index> wrong;
-  EXPECT_EQ(Index::Open(dir.path(), &keys, 0, b->id(), b->dimension(), &wrong),
+  EXPECT_EQ(Index::Open(dir.path(), &keys, 0, b->id(), b->dimension(), kTestReplica, &wrong),
             IndexStatus::kModelMismatch);
 }
 

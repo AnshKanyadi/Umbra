@@ -63,6 +63,14 @@ class Store {
   StoreStatus PutReport(const PutReportRequest& req);
   StoreStatus GetReports(const GetReportsRequest& req, ReportsResponse* out);
 
+  // SEALED INDEX SEGMENTS, in pieces. The relay stores bytes under a name it
+  // does not interpret; it never reassembles one, never verifies the content
+  // hash, and cannot tell a segment from any other blob of the same size.
+  StoreStatus PutSegment(const PutSegmentRequest& req);
+  StoreStatus GetSegment(const GetSegmentRequest& req, SegmentResponse* out);
+  StoreStatus ListSegments(const ListSegmentsRequest& req,
+                           SegmentListResponse* out);
+
   // Enrolment envelopes. Opaque to the relay in both directions.
   StoreStatus PutEnvelope(const PutEnvelopeRequest& req);
   StoreStatus GetEnvelopes(const GetEnvelopesRequest& req,

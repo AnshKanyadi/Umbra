@@ -228,6 +228,97 @@ SyncStatus Client::CollectEnvelopes(std::vector<relay::Envelope>* out) {
   return SyncStatus::kOk;
 }
 
+SyncStatus Client::PushSegment(const std::array<uint8_t, 32>& id,
+                               const std::string& sealed) {
+  if (sealed.empty()) return SyncStatus::kLocalError;
+  if (sealed.size() > relay::kMaxSegmentBytes) return SyncStatus::kLocalError;
+  const uint64_t total = static_cast<uint64_t>(sealed.size());
+  for (uint64_t off = 0; off < total; off += relay::kSegmentChunkBytes) {
+    const uint64_t take =
+        std::min<uint64_t>(relay::kSegmentChunkBytes, total - off);
+    relay::PutSegmentRequest req;
+    req.vault = vault_;
+    req.segment = id;
+    req.offset = off;
+    req.total = total;
+    req.chunk.assign(sealed, static_cast<std::size_t>(off),
+                     static_cast<std::size_t>(take));
+    if (!transport_->PutSegment(req)) return SyncStatus::kUnreachable;
+  }
+  return SyncStatus::kOk;
+}
+
+SyncStatus Client::PullSegment(const std::array<uint8_t, 32>& id,
+                               std::string* sealed) {
+  sealed->clear();
+  uint64_t total = 0;
+  uint64_t want = 0;
+  // A BOUND ON ROUNDS, NOT ONLY ON BYTES. A relay that answers every request
+  // with an empty chunk at the offset asked for would otherwise spin here
+  // forever; the loop refuses to make more requests than a correct transfer
+  // could possibly need.
+  const uint64_t max_rounds =
+      (relay::kMaxSegmentBytes / relay::kSegmentChunkBytes) + 8;
+  for (uint64_t round = 0; round < max_rounds; ++round) {
+    relay::GetSegmentRequest req;
+    req.vault = vault_;
+    req.segment = id;
+    req.offset = want;
+    relay::SegmentResponse resp;
+    if (!transport_->GetSegment(req, &resp)) return SyncStatus::kUnreachable;
+    if (!resp.found) return SyncStatus::kBadResponse;
+    if (total == 0) {
+      total = resp.total;
+      if (total == 0 || total > relay::kMaxSegmentBytes) {
+        return SyncStatus::kBadResponse;
+      }
+      sealed->reserve(static_cast<std::size_t>(total));
+    } else if (resp.total != total) {
+      // THE SEGMENT CHANGED SIZE MID TRANSFER. A segment is content addressed
+      // and therefore immutable, so this is a relay saying something that
+      // cannot be true.
+      return SyncStatus::kBadResponse;
+    }
+    if (resp.offset != want) {
+      // A hole, or a piece from somewhere else. Either way the client cannot
+      // stitch a segment it was not given contiguously.
+      return SyncStatus::kBadResponse;
+    }
+    if (resp.chunk.empty()) return SyncStatus::kBadResponse;
+    sealed->append(resp.chunk);
+    want += static_cast<uint64_t>(resp.chunk.size());
+    if (want >= total) break;
+  }
+  if (sealed->size() != total) {
+    sealed->clear();
+    return SyncStatus::kBadResponse;
+  }
+  return SyncStatus::kOk;
+}
+
+SyncStatus Client::ListSegments(std::vector<std::array<uint8_t, 32>>* ids,
+                                std::vector<uint64_t>* sizes) {
+  ids->clear();
+  if (sizes != nullptr) sizes->clear();
+  std::array<uint8_t, 32> after{};
+  for (;;) {
+    relay::ListSegmentsRequest req;
+    req.vault = vault_;
+    req.after = after;
+    req.limit = relay::kMaxSegmentsListed;
+    relay::SegmentListResponse resp;
+    if (!transport_->ListSegments(req, &resp)) return SyncStatus::kUnreachable;
+    if (resp.segments.empty()) break;
+    for (const relay::SegmentEntryWire& e : resp.segments) {
+      ids->push_back(e.segment);
+      if (sizes != nullptr) sizes->push_back(e.bytes);
+    }
+    after = resp.segments.back().segment;
+    if (resp.segments.size() < relay::kMaxSegmentsListed) break;
+  }
+  return SyncStatus::kOk;
+}
+
 SyncStatus Client::PublishReport(uint64_t clock,
                                  const std::vector<ObjectId>& objects,
                                  const ReplicaId& tree_object_source_hint) {

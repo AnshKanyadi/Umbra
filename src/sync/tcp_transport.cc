@@ -112,6 +112,27 @@ class TcpTransport : public Transport {
     return relay::DecodeEnvelopes(body, out);
   }
 
+  bool PutSegment(const relay::PutSegmentRequest& req) override {
+    std::string body;
+    if (!RoundTrip(relay::EncodePutSegment(req), &body)) return false;
+    relay::Op op;
+    return relay::PeekOp(body, &op) && op == relay::Op::kOk;
+  }
+
+  bool GetSegment(const relay::GetSegmentRequest& req,
+                  relay::SegmentResponse* out) override {
+    std::string body;
+    if (!RoundTrip(relay::EncodeGetSegment(req), &body)) return false;
+    return relay::DecodeSegment(body, out);
+  }
+
+  bool ListSegments(const relay::ListSegmentsRequest& req,
+                    relay::SegmentListResponse* out) override {
+    std::string body;
+    if (!RoundTrip(relay::EncodeListSegments(req), &body)) return false;
+    return relay::DecodeSegmentList(body, out);
+  }
+
  private:
   int Connect() {
     struct addrinfo hints;

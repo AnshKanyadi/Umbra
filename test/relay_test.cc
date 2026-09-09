@@ -518,6 +518,20 @@ class HostileTransport : public sync::Transport {
     return store_->PutEnvelope(req) == relay::StoreStatus::kOk;
   }
 
+  bool PutSegment(const relay::PutSegmentRequest& req) override {
+    return store_->PutSegment(req) == relay::StoreStatus::kOk;
+  }
+
+  bool GetSegment(const relay::GetSegmentRequest& req,
+                  relay::SegmentResponse* out) override {
+    return store_->GetSegment(req, out) == relay::StoreStatus::kOk;
+  }
+
+  bool ListSegments(const relay::ListSegmentsRequest& req,
+                    relay::SegmentListResponse* out) override {
+    return store_->ListSegments(req, out) == relay::StoreStatus::kOk;
+  }
+
   bool GetEnvelopes(const relay::GetEnvelopesRequest& req,
                     relay::EnvelopesResponse* out) override {
     return store_->GetEnvelopes(req, out) == relay::StoreStatus::kOk;

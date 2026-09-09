@@ -1,5 +1,6 @@
 #include "umbra/ai/index.h"
 
+#include <sodium.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -19,6 +20,12 @@
 namespace umbra {
 namespace ai {
 namespace {
+
+// HOW MUCH LARGER A SEGMENT MAY BE than the smallest in a round and still be
+// merged with it. Four is the usual starting point for a tiered store: small
+// enough that the big compacted segment is left alone until several of its own
+// size have accumulated, large enough that a round makes real progress.
+constexpr uint32_t kTierRatio = 4;
 
 // Key spaces in the manifest. One byte each, so a scan over one never sees
 // another, and a person reading the store with a hex dump can tell them apart.
@@ -162,14 +169,63 @@ struct Index::Impl {
   Epoch epoch = 0;
   EmbeddingModelId model;
   uint32_t dimension = 0;
+  ReplicaId replica;
   std::unique_ptr<basalt::Env> env;
   std::unique_ptr<basalt::DB> db;
   // Ordered so that iteration, and therefore search order and tie-breaking, is
   // a function of the ids rather than of insertion history.
   std::map<SegmentId, Loaded> segments;
 
+  // The replicated half. `manifest` is the fold of every operation this device
+  // has seen, its own included; `pending` is what it has produced and not yet
+  // handed to a client to publish.
+  std::unique_ptr<ManifestDoc> manifest;
+  std::vector<ManifestOp> pending;
+  // This replica's manifest counter and the back-pointer to its previous
+  // operation, exactly as the text and tree logs keep them.
+  uint64_t counter = 0;
+  uint64_t prev = 0;
+
   std::string PathFor(const SegmentId& id) const {
     return segment_dir + "/" + id.Hex() + ".seg";
+  }
+
+  bool Present(const SegmentId& id) const { return segments.count(id) != 0; }
+
+  // Every manifest operation this device makes goes through here, so the
+  // counter and the chain cannot be advanced in one place and forgotten in
+  // another.
+  ManifestOp Make(ManifestOpKind kind) {
+    ManifestOp op;
+    op.kind = kind;
+    op.id.replica = replica;
+    op.id.counter = ++counter;
+    op.prev = prev;
+    prev = op.id.counter;
+    return op;
+  }
+
+  void Emit(const ManifestOp& op) {
+    (void)manifest->Apply(op);
+    pending.push_back(op);
+  }
+
+  // THE PUBLISHED COUNTER IS PERSISTED, so a restart continues the sequence
+  // rather than reissuing ids another device has already seen. The oplog is
+  // keyed by (object, replica, counter), so a reissued counter is a lost write
+  // and not a conflict -- the same defect Vault::ApplyTreeOp had.
+  void SaveCounter() {
+    std::string value;
+    for (int i = 7; i >= 0; --i) {
+      value.push_back(static_cast<char>((counter >> (i * 8)) & 0xFF));
+    }
+    const std::string key = std::string(1, kMetaPrefix) + "counter";
+    basalt::WriteBatch batch;
+    batch.Set(basalt::Slice(key), basalt::Slice(value));
+    basalt::wal::SeqNum seq = 0;
+    if (!db->Write(batch, &seq).ok()) return;
+    basalt::wal::SeqNum watermark = 0;
+    (void)db->Sync(&watermark);
   }
 };
 
@@ -178,7 +234,8 @@ Index::~Index() = default;
 
 IndexStatus Index::Open(const std::string& dir, const VaultKeys* keys,
                         Epoch epoch, const EmbeddingModelId& model,
-                        uint32_t dimension, std::unique_ptr<Index>* out) {
+                        uint32_t dimension, const ReplicaId& replica,
+                        std::unique_ptr<Index>* out) {
   if (keys == nullptr || dimension == 0) return IndexStatus::kBadArgument;
   std::unique_ptr<Index> idx(new Index);
   Impl& im = *idx->impl_;
@@ -188,6 +245,8 @@ IndexStatus Index::Open(const std::string& dir, const VaultKeys* keys,
   im.epoch = epoch;
   im.model = model;
   im.dimension = dimension;
+  im.replica = replica;
+  im.manifest.reset(new ManifestDoc(model));
   if (!MakeDirs(im.segment_dir)) return IndexStatus::kStoreFailed;
   // Basalt opens a directory that already exists; it does not create one.
   if (!MakeDirs(dir + "/manifest")) return IndexStatus::kStoreFailed;
@@ -290,6 +349,58 @@ IndexStatus Index::Open(const std::string& dir, const VaultKeys* keys,
     const basalt::Status err = it->Error();
     (void)it->Close();
     if (!err.ok()) return IndexStatus::kStoreFailed;
+  }
+
+  // THE MANIFEST FOLD IS REBUILT FROM WHAT IS ON DISK, not persisted as a
+  // second copy. The local store already records which segments exist and which
+  // slots are dead; deriving the fold from it means there is one source of
+  // truth on this device and no way for the two to disagree after a crash.
+  //
+  // Operations that arrived from peers were applied to the store as they came,
+  // so replaying them is not needed either. What IS lost across a restart is
+  // this device's manifest counter, which is recovered below.
+  for (const std::pair<const SegmentId, Loaded>& kv : im.segments) {
+    ManifestOp add;
+    add.kind = ManifestOpKind::kAdd;
+    add.id.replica = replica;
+    // Counter zero would be refused as malformed, and these are not real
+    // operations -- they are the fold of operations already published. The
+    // sequence is local and never leaves this device.
+    add.id.counter = ++im.counter;
+    add.prev = im.counter - 1;
+    add.segment = kv.first;
+    add.count = kv.second.segment->count();
+    add.bytes = kv.second.bytes;
+    add.model = model;
+    (void)im.manifest->Apply(add);
+    for (uint32_t slot = 0; slot < kv.second.dead.size(); ++slot) {
+      if (!kv.second.dead[slot]) continue;
+      ManifestOp t;
+      t.kind = ManifestOpKind::kTombstone;
+      t.id.replica = replica;
+      t.id.counter = ++im.counter;
+      t.prev = im.counter - 1;
+      t.segment = kv.first;
+      t.slot = slot;
+      (void)im.manifest->Apply(t);
+    }
+  }
+  // THE PUBLISHED COUNTER IS RECOVERED FROM THE STORE, not restarted. A device
+  // that reissued counters after a restart would produce two different manifest
+  // operations with one id, and the oplog is keyed by (object, replica,
+  // counter) -- so the second would overwrite the first. That is the same
+  // defect Vault::ApplyTreeOp had, and it is worth not making twice.
+  {
+    const std::string key = std::string(1, kMetaPrefix) + "counter";
+    std::string held;
+    if (im.db->Get(basalt::Slice(key), &held).ok() && held.size() == 8) {
+      uint64_t stored = 0;
+      for (std::size_t i = 0; i < 8; ++i) {
+        stored = (stored << 8) | static_cast<uint8_t>(held[i]);
+      }
+      if (stored > im.counter) im.counter = stored;
+    }
+    im.prev = im.counter;
   }
 
   *out = std::move(idx);
@@ -402,6 +513,25 @@ IndexStatus Index::PutObject(const ObjectId& object,
   basalt::wal::SeqNum watermark = 0;
   if (!im.db->Sync(&watermark).ok()) return IndexStatus::kStoreFailed;
 
+  // THE MANIFEST OPERATIONS ARE MADE AFTER THE WRITE IS DURABLE. A device that
+  // published "segment X exists" and then failed to write X would be telling
+  // its peers to fetch something nobody has.
+  if (have_new) {
+    ManifestOp add = im.Make(ManifestOpKind::kAdd);
+    add.segment = new_id;
+    add.count = static_cast<uint32_t>(chunks.size());
+    add.bytes = sealed.size();
+    add.model = im.model;
+    im.Emit(add);
+  }
+  for (const std::pair<SegmentId, uint32_t>& p : previous) {
+    ManifestOp t = im.Make(ManifestOpKind::kTombstone);
+    t.segment = p.first;
+    t.slot = p.second;
+    im.Emit(t);
+  }
+  im.SaveCounter();
+
   // Reflect it in memory only after it is durable, so an in-memory index never
   // claims something the manifest does not.
   for (const std::pair<SegmentId, uint32_t>& p : previous) {
@@ -505,33 +635,27 @@ IndexStatus Index::Compact(uint32_t min_segments,
   if (merged != nullptr) *merged = 0;
   if (reclaimed != nullptr) *reclaimed = 0;
 
-  // WHAT IS WORTH REWRITING. Either there are enough segments that search is
-  // paying to visit them all, or some segment is mostly dead and is carrying
-  // its own weight for nothing. Neither test alone is enough: a vault with two
-  // segments where one is 90% tombstoned should still be compacted, and a vault
-  // with forty clean segments should be merged even though nothing is dead.
-  std::vector<SegmentId> chosen;
-  const bool too_many = im.segments.size() >= min_segments && min_segments > 0;
-  for (const std::pair<const SegmentId, Loaded>& kv : im.segments) {
-    const Loaded& l = kv.second;
-    const uint32_t total = l.segment->count();
-    const uint32_t dead_pct =
-        (total == 0) ? 0
-                     : static_cast<uint32_t>(
-                           (static_cast<uint64_t>(l.dead_count) * 100) / total);
-    if (too_many || dead_pct >= max_dead_ratio_percent)
-      chosen.push_back(kv.first);
-  }
-  if (chosen.size() < 2) {
-    // Merging one segment into one segment is still worth doing when it is
-    // mostly dead, but not when it is clean.
-    if (chosen.size() == 1) {
-      const Loaded& l = im.segments[chosen[0]];
-      if (l.dead_count == 0) return IndexStatus::kOk;
-    } else {
-      return IndexStatus::kOk;
-    }
-  }
+  // WHAT IS WORTH REWRITING, AS A PURE FUNCTION OF THE MANIFEST.
+  //
+  // Phase 4 chose inputs by walking the local segment map, which was fine when
+  // one device existed. It is not fine now: two devices choosing inputs by
+  // local iteration can pick different sets, produce different outputs, and
+  // leave the index holding both. PlanCompaction takes the manifest and the
+  // live set and nothing else, so two devices with the same view choose the
+  // same inputs -- and because building a segment is deterministic (ADR 0005)
+  // they then produce the same content-addressed id, which the lattice absorbs
+  // as one operation rather than two.
+  //
+  // It is also TIERED. Phase 4 measured an all-or-nothing merge of a
+  // 13,838-vector index at 103 seconds and recorded tiering as the unbuilt fix;
+  // segments now arrive from elsewhere, so a routine merge that rewrites the
+  // whole index would make every pull expensive. See manifest.h.
+  const auto present = [&im](const SegmentId& id) { return im.Present(id); };
+  const std::vector<SegmentId> live = im.manifest->Live(present);
+  const CompactionPlan plan = PlanCompaction(
+      *im.manifest, live, min_segments, max_dead_ratio_percent, kTierRatio);
+  const std::vector<SegmentId> chosen = plan.inputs;
+  if (chosen.size() < 2) return IndexStatus::kOk;
 
   // Gather the live vectors, in a fixed order: by segment id, then slot. The
   // output is therefore a function of the input rather than of iteration.
@@ -610,6 +734,27 @@ IndexStatus Index::Compact(uint32_t min_segments,
   basalt::wal::SeqNum watermark = 0;
   if (!im.db->Sync(&watermark).ok()) return IndexStatus::kStoreFailed;
 
+  // THE RETIREMENT NAMES ITS REPLACEMENT, which is what lets a peer apply the
+  // safety condition: it can hold the fact that S is retired while keeping S
+  // live until it has T. A bare "S is gone" would give a peer no way to know
+  // when it is safe to stop using S. See manifest.h.
+  if (have_new) {
+    ManifestOp add = im.Make(ManifestOpKind::kAdd);
+    add.segment = new_id;
+    add.count = static_cast<uint32_t>(entries.size());
+    add.bytes = sealed.size();
+    add.model = im.model;
+    im.Emit(add);
+  }
+  for (const SegmentId& id : chosen) {
+    if (have_new && id == new_id) continue;
+    ManifestOp r = im.Make(ManifestOpKind::kRetire);
+    r.segment = id;
+    r.superseded_by = new_id;
+    im.Emit(r);
+  }
+  im.SaveCounter();
+
   // THE FILES GO LAST. If the process dies between the manifest write and
   // these unlinks the store is correct and carrying garbage; the other order
   // would leave the manifest naming files that are gone, which is corruption.
@@ -634,6 +779,183 @@ IndexStatus Index::Compact(uint32_t min_segments,
   if (reclaimed != nullptr) *reclaimed = dropped;
   return IndexStatus::kOk;
 }
+
+std::vector<ManifestOp> Index::TakePending() {
+  std::vector<ManifestOp> out;
+  out.swap(impl_->pending);
+  return out;
+}
+
+ManifestApply Index::ApplyManifestOp(const ManifestOp& op) {
+  Impl& im = *impl_;
+  const ManifestApply a = im.manifest->Apply(op);
+  if (a != ManifestApply::kApplied) return a;
+
+  // A TOMBSTONE FROM A PEER APPLIES TO BYTES THIS DEVICE MAY ALREADY HOLD, so
+  // it has to reach the loaded segment as well as the fold. Without this a
+  // deletion made on another device would be recorded and not obeyed: the
+  // manifest would say the slot is dead and search would keep returning it.
+  if (op.kind == ManifestOpKind::kTombstone) {
+    const std::map<SegmentId, Loaded>::iterator it =
+        im.segments.find(op.segment);
+    if (it != im.segments.end() && op.slot < it->second.dead.size() &&
+        !it->second.dead[op.slot]) {
+      it->second.dead[op.slot] = true;
+      ++it->second.dead_count;
+      basalt::WriteBatch batch;
+      const std::string key = TombstoneKey(op.segment, op.slot);
+      batch.Set(basalt::Slice(key), basalt::Slice(""));
+      basalt::wal::SeqNum seq = 0;
+      if (im.db->Write(batch, &seq).ok()) {
+        basalt::wal::SeqNum watermark = 0;
+        (void)im.db->Sync(&watermark);
+      }
+    }
+  }
+
+  // A RETIREMENT DOES NOT DROP ANYTHING HERE. The safety condition in
+  // manifest.h says a retired segment stays live until its replacement is
+  // present, and `Live` evaluates that on every search. Dropping the bytes at
+  // this point is what would open the window where the index is quietly
+  // incomplete; they are dropped by Compact, which knows the replacement is in
+  // hand because it just wrote it, or by Prune once the replacement arrives.
+  return a;
+}
+
+IndexStatus Index::AdoptSegment(const std::string& sealed) {
+  Impl& im = *impl_;
+  if (sealed.empty()) return IndexStatus::kBadArgument;
+
+  // THE HASH IS CHECKED BEFORE ANYTHING IS WRITTEN. A segment arrives from a
+  // relay that is not trusted, over a link that is not trusted, and the name it
+  // will be stored under is derived from its bytes -- so a segment whose
+  // contents do not match its name must never reach the disk, or the store
+  // would hold a file that lies about what it is.
+  SegmentId id;
+  crypto_generichash(id.bytes.data(), id.bytes.size(),
+                     reinterpret_cast<const unsigned char*>(sealed.data()),
+                     sealed.size(), nullptr, 0);
+
+  if (im.segments.count(id) != 0) return IndexStatus::kOk;  // already held
+
+  Loaded loaded;
+  loaded.id = id;
+  const SegmentStatus ss =
+      Segment::Open(*im.keys, sealed, im.model, &loaded.segment);
+  if (ss == SegmentStatus::kModelMismatch) return IndexStatus::kModelMismatch;
+  if (ss != SegmentStatus::kOk) return IndexStatus::kSegmentLost;
+
+  if (loaded.segment->dimension() != im.dimension) {
+    return IndexStatus::kModelMismatch;
+  }
+  if (!WriteFileAtomically(im.PathFor(id), sealed)) {
+    return IndexStatus::kStoreFailed;
+  }
+  loaded.bytes = sealed.size();
+  loaded.dead.assign(loaded.segment->count(), false);
+
+  // Tombstones the manifest already knows about apply to a segment the moment
+  // it arrives. They routinely precede it: operations are small and segments
+  // are not.
+  const SegmentState* state = im.manifest->Get(id);
+  if (state != nullptr) {
+    for (uint32_t slot : state->dead) {
+      if (slot < loaded.dead.size() && !loaded.dead[slot]) {
+        loaded.dead[slot] = true;
+        ++loaded.dead_count;
+      }
+    }
+  }
+
+  basalt::WriteBatch batch;
+  std::deque<std::string> keep_alive;
+  keep_alive.push_back(std::string());
+  std::string& value = keep_alive.back();
+  PutU32(&value, loaded.segment->count());
+  PutU32(&value, static_cast<uint32_t>(sealed.size()));
+  keep_alive.push_back(SegmentKey(id));
+  batch.Set(basalt::Slice(keep_alive.back()), basalt::Slice(value));
+  for (uint32_t i = 0; i < loaded.segment->count(); ++i) {
+    keep_alive.push_back(ObjectKey(loaded.segment->entry(i).object, id, i));
+    batch.Set(basalt::Slice(keep_alive.back()), basalt::Slice(""));
+    if (i < loaded.dead.size() && loaded.dead[i]) {
+      keep_alive.push_back(TombstoneKey(id, i));
+      batch.Set(basalt::Slice(keep_alive.back()), basalt::Slice(""));
+    }
+  }
+  basalt::wal::SeqNum seq = 0;
+  if (!im.db->Write(batch, &seq).ok()) return IndexStatus::kStoreFailed;
+  basalt::wal::SeqNum watermark = 0;
+  if (!im.db->Sync(&watermark).ok()) return IndexStatus::kStoreFailed;
+
+  im.segments[id] = std::move(loaded);
+
+  // ADOPTING A SEGMENT CAN SATISFY A RETIREMENT THAT WAS WAITING. This is where
+  // the safety condition's second half pays off: the retired segment has been
+  // answering queries all along and stops now, at the moment its replacement
+  // can answer instead.
+  Prune();
+  return IndexStatus::kOk;
+}
+
+// Drop segments whose retirement has become safe: retired, and the segment that
+// supersedes them is present. Called after anything that changes what is
+// present.
+void Index::Prune() {
+  Impl& im = *impl_;
+  const auto present = [&im](const SegmentId& id) { return im.Present(id); };
+  std::vector<SegmentId> drop;
+  for (const std::pair<const SegmentId, Loaded>& kv : im.segments) {
+    const SegmentState* st = im.manifest->Get(kv.first);
+    if (st == nullptr || st->superseded_by.empty()) continue;
+    bool replaced = false;
+    for (const SegmentId& by : st->superseded_by) {
+      if (present(by)) replaced = true;
+    }
+    if (replaced) drop.push_back(kv.first);
+  }
+  if (drop.empty()) return;
+
+  basalt::WriteBatch batch;
+  std::deque<std::string> keep_alive;
+  for (const SegmentId& id : drop) {
+    const Loaded& l = im.segments[id];
+    keep_alive.push_back(SegmentKey(id));
+    batch.Delete(basalt::Slice(keep_alive.back()));
+    for (uint32_t slot = 0; slot < l.segment->count(); ++slot) {
+      keep_alive.push_back(TombstoneKey(id, slot));
+      batch.Delete(basalt::Slice(keep_alive.back()));
+      keep_alive.push_back(ObjectKey(l.segment->entry(slot).object, id, slot));
+      batch.Delete(basalt::Slice(keep_alive.back()));
+    }
+  }
+  basalt::wal::SeqNum seq = 0;
+  if (!im.db->Write(batch, &seq).ok()) return;
+  basalt::wal::SeqNum watermark = 0;
+  (void)im.db->Sync(&watermark);
+  for (const SegmentId& id : drop) {
+    im.segments.erase(id);
+    ::unlink(im.PathFor(id).c_str());
+  }
+}
+
+std::vector<SegmentId> Index::Missing() const {
+  std::vector<SegmentId> out;
+  for (const SegmentId& id : impl_->manifest->Wanted()) {
+    if (!impl_->Present(id)) out.push_back(id);
+  }
+  return out;
+}
+
+std::vector<SegmentId> Index::AwaitingReplacement() const {
+  const Impl& im = *impl_;
+  const auto present = [&im](const SegmentId& id) { return im.Present(id); };
+  return im.manifest->AwaitingReplacement(present);
+}
+
+bool Index::Complete() const { return Missing().empty(); }
+
+const ManifestDoc& Index::manifest() const { return *impl_->manifest; }
 
 IndexStats Index::Stats() const {
   IndexStats st;

@@ -45,6 +45,7 @@
 
 #include "umbra/ai/chunk.h"
 #include "umbra/ai/embed.h"
+#include "umbra/ai/manifest.h"
 #include "umbra/ai/segment.h"
 #include "umbra/crypto/keys.h"
 
@@ -96,11 +97,18 @@ class Index {
   ~Index();
 
   // Opens or creates an index under `dir`. `model` is the identity every
-  // segment must match. A segment that does not is refused at open, and the
+  // segment must match; a segment that does not is refused at open and the
   // caller is told rather than having it silently skipped.
+  //
+  // `replica` is the id this device signs its manifest operations with -- the
+  // same id the oplog and the CRDTs use, because one device has one identity.
+  // It is required rather than optional: an index that cannot say who changed
+  // it cannot replicate, and an overload that quietly invented one would be a
+  // way to build an index that looks replicable and is not.
   static IndexStatus Open(const std::string& dir, const VaultKeys* keys,
                           Epoch epoch, const EmbeddingModelId& model,
-                          uint32_t dimension, std::unique_ptr<Index>* out);
+                          uint32_t dimension, const ReplicaId& replica,
+                          std::unique_ptr<Index>* out);
 
   // Replace everything indexed for `object` with these chunks and vectors.
   // Writes one new segment and tombstones the object's previous slots. Passing
@@ -132,12 +140,54 @@ class Index {
 
   IndexStats Stats() const;
 
+  // ------------------------------------------------------------ replication
+  //
+  // The index is not the thing that talks to a relay -- that is the client, and
+  // this layer must not learn about sockets. What it exposes instead is the two
+  // halves replication needs: the operations it produced, and a door for
+  // operations that arrived.
+
+  // Manifest operations this device generated and has not yet handed out, in
+  // the order it made them. Cleared by TakePending.
+  std::vector<ManifestOp> TakePending();
+
+  // Apply a manifest operation that arrived from another device. Segment bytes
+  // are NOT required to be present: the fold records what exists and the safety
+  // condition decides what is live. See manifest.h.
+  ManifestApply ApplyManifestOp(const ManifestOp& op);
+
+  // Adopt a segment whose bytes arrived from elsewhere. Verifies the content
+  // hash and the model before anything is written, so a corrupted or foreign
+  // segment is refused at the door rather than discovered during a search.
+  IndexStatus AdoptSegment(const std::string& sealed);
+
+  // Segments the manifest names that this device does not hold. What a puller
+  // asks the relay for.
+  std::vector<SegmentId> Missing() const;
+
+  // Segments this device holds that the manifest says are retired but which are
+  // still live because their replacement has not arrived. Exists so a client
+  // can explain why its index is larger than the manifest implies.
+  std::vector<SegmentId> AwaitingReplacement() const;
+
+  // THE HONEST ANSWER TO "IS THIS INDEX COMPLETE". False when the manifest
+  // names segments this device does not have, which is exactly the state a
+  // device is in after pulling operations but before pulling bytes. Search
+  // still works; it is simply searching less than the vault holds, and a caller
+  // that reports results as complete while this is false is lying.
+  bool Complete() const;
+
+  const ManifestDoc& manifest() const;
+
   // Every segment id the manifest names, in a stable order. Exists so a test
   // can assert byte-for-byte reproducibility of the files themselves.
   std::vector<SegmentId> SegmentIds() const;
 
  private:
   Index();
+  // Drop segments whose retirement has become safe. See the safety condition in
+  // manifest.h: safe means the superseding segment is present here.
+  void Prune();
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

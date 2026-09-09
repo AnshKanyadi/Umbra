@@ -200,6 +200,7 @@ add_library(umbra STATIC
   src/ai/hnsw.cc
   src/ai/index.cc
   src/ai/keyspace.cc
+  src/ai/manifest.cc
   src/ai/segment.cc
   src/sync/enroll.cc
   src/sync/tcp_transport.cc
