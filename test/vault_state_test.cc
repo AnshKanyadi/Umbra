@@ -31,7 +31,10 @@ class TempDir {
     (void)::unlink((path_ + "/device").c_str());
     (void)::rmdir(path_.c_str());
   }
-  const std::string& path() const { return path_; }
+  // Named Path rather than path because .clang-tidy asks for CamelCase and
+  // the lint lane checks changed lines. The older TempDir helpers in the other
+  // test files predate the lane running and are grandfathered.
+  const std::string& Path() const { return path_; }
 
  private:
   std::string path_;
@@ -58,30 +61,30 @@ TEST(VaultState, AnExplicitStateDirIsUsedAsGiven) {
 
 TEST(VaultState, AMissingIdentityIsReportedRatherThanInvented) {
   TempDir dir;
-  ASSERT_FALSE(dir.path().empty());
+  ASSERT_FALSE(dir.Path().empty());
   DeviceKeyPair d;
-  EXPECT_EQ(cmdstate::LoadDeviceKeys(dir.path(), &d),
+  EXPECT_EQ(cmdstate::LoadDeviceKeys(dir.Path(), &d),
             cmdstate::DeviceKeyStatus::kMissing);
 
   // RequireDeviceKeys must not create one. A fresh identity is indistinguishable
   // from a stranger to every other device in the vault, so guessing is worse
   // than failing.
   EXPECT_FALSE(
-      cmdstate::RequireDeviceKeys("/tmp/no-such-vault", dir.path(), &d))
+      cmdstate::RequireDeviceKeys("/tmp/no-such-vault", dir.Path(), &d))
       << "an identity was invented for a machine that has none";
-  EXPECT_EQ(cmdstate::LoadDeviceKeys(dir.path(), &d),
+  EXPECT_EQ(cmdstate::LoadDeviceKeys(dir.Path(), &d),
             cmdstate::DeviceKeyStatus::kMissing)
       << "RequireDeviceKeys wrote a key it was not allowed to write";
 }
 
 TEST(VaultState, ACreatedIdentityIsStableAndPrivate) {
   TempDir dir;
-  ASSERT_FALSE(dir.path().empty());
+  ASSERT_FALSE(dir.Path().empty());
   DeviceKeyPair made;
-  ASSERT_TRUE(cmdstate::CreateDeviceKeys(dir.path(), &made));
+  ASSERT_TRUE(cmdstate::CreateDeviceKeys(dir.Path(), &made));
 
   DeviceKeyPair loaded;
-  ASSERT_EQ(cmdstate::LoadDeviceKeys(dir.path(), &loaded),
+  ASSERT_EQ(cmdstate::LoadDeviceKeys(dir.Path(), &loaded),
             cmdstate::DeviceKeyStatus::kOk);
   EXPECT_EQ(made.Replica(), loaded.Replica())
       << "the identity changed between writing and reading it";
@@ -89,12 +92,12 @@ TEST(VaultState, ACreatedIdentityIsStableAndPrivate) {
   // Reloading must not reissue: a device that changed identity on restart would
   // be a new device to every peer.
   DeviceKeyPair again;
-  ASSERT_EQ(cmdstate::LoadDeviceKeys(dir.path(), &again),
+  ASSERT_EQ(cmdstate::LoadDeviceKeys(dir.Path(), &again),
             cmdstate::DeviceKeyStatus::kOk);
   EXPECT_EQ(made.Replica(), again.Replica());
 
   struct stat st;
-  ASSERT_EQ(::stat((dir.path() + "/device").c_str(), &st), 0);
+  ASSERT_EQ(::stat((dir.Path() + "/device").c_str(), &st), 0);
   EXPECT_EQ(st.st_mode & 0777, 0600)
       << "a private key was written world- or group-readable";
 }
