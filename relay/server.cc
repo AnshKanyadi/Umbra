@@ -168,11 +168,20 @@ void Server::HandleConnection(int fd) {
     if (!WriteAll(fd, reply)) break;
   }
   ::close(fd);
-  --live_connections_;
+  // LOGGED BEFORE THE DECREMENT, AND THE ORDER IS LOAD BEARING.
+  //
+  // live_connections_ reaching zero is what releases the shutdown wait in
+  // Run(), after which the Server can be destroyed -- so every touch of a
+  // member has to happen before this thread says it is finished. Logging after
+  // the decrement read `opts_.verbose` out of a freed object, on every single
+  // connection. TSan called it: "Previous read of size 1 by thread T28" against
+  // "Write of size 8 by main thread" in operator delete, and both ubuntu lanes
+  // went red. The count printed is the one this thread is about to produce.
   if (opts_.verbose) {
     std::fprintf(stderr, "relay: connection closed (%d live)\n",
-                 live_connections_.load());
+                 live_connections_.load() - 1);
   }
+  --live_connections_;
 }
 
 void Server::Run() {
