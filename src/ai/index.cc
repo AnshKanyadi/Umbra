@@ -33,6 +33,12 @@ constexpr char kSegmentPrefix = 's';    // 's' || segment id   -> count, bytes
 constexpr char kTombstonePrefix = 't';  // 't' || seg || slot  -> empty
 constexpr char kObjectPrefix = 'o';     // 'o' || object || seg || slot -> empty
 constexpr char kMetaPrefix = 'm';       // 'm' || name         -> value
+// 'p' || counter(8 BE) -> the encoded operation. PENDING OPERATIONS OUTLIVE THE
+// PROCESS THAT MADE THEM. They were in memory only to begin with, and the
+// end-to-end run showed exactly what that costs: a device indexed a vault,
+// exited, and the next process published ten segments and zero operations --
+// so the segments were on the relay and nothing said they existed.
+constexpr char kPendingPrefix = 'p';
 
 void PutU32(std::string* out, uint32_t v) {
   out->push_back(static_cast<char>((v >> 24) & 0xFF));
@@ -208,6 +214,15 @@ struct Index::Impl {
   void Emit(const ManifestOp& op) {
     (void)manifest->Apply(op);
     pending.push_back(op);
+    std::string key(1, kPendingPrefix);
+    for (int i = 7; i >= 0; --i) {
+      key.push_back(static_cast<char>((op.id.counter >> (i * 8)) & 0xFF));
+    }
+    const std::string value = EncodeManifestOp(op);
+    basalt::WriteBatch batch;
+    batch.Set(basalt::Slice(key), basalt::Slice(value));
+    basalt::wal::SeqNum seq = 0;
+    (void)db->Write(batch, &seq);
   }
 
   // THE PUBLISHED COUNTER IS PERSISTED, so a restart continues the sequence
@@ -495,6 +510,21 @@ IndexStatus Index::PutObject(const ObjectId& object,
   // already in it and leaves every Slice built from one pointing at freed
   // memory. The batch then writes and deletes whatever those addresses now
   // hold. A deque never invalidates references to elements already in it.
+  // NOT THE SEGMENT WE JUST WROTE. Segments are content addressed, so
+  // re-indexing a note that has not changed produces the SAME segment id -- and
+  // the object's "previous" slots are then the very slots this call just added.
+  // Tombstoning them kills the note it was re-indexing: a second build over an
+  // unchanged vault left 19 of 20 vectors dead and one object where there were
+  // ten, which is what the end-to-end run found.
+  if (have_new) {
+    previous.erase(
+        std::remove_if(previous.begin(), previous.end(),
+                       [&new_id](const std::pair<SegmentId, uint32_t>& p) {
+                         return p.first == new_id;
+                       }),
+        previous.end());
+  }
+
   for (const std::pair<SegmentId, uint32_t>& p : previous) {
     keep_alive.push_back(TombstoneKey(p.first, p.second));
     batch.Set(basalt::Slice(keep_alive.back()), basalt::Slice(""));
@@ -781,8 +811,46 @@ IndexStatus Index::Compact(uint32_t min_segments,
 }
 
 std::vector<ManifestOp> Index::TakePending() {
+  Impl& im = *impl_;
+  // FROM THE STORE, NOT FROM MEMORY. What this device has produced and not yet
+  // published has to survive the process that produced it, or a device that
+  // indexes and exits publishes nothing.
   std::vector<ManifestOp> out;
-  out.swap(impl_->pending);
+  std::vector<std::string> keys;
+  {
+    const std::string lo(1, kPendingPrefix);
+    const std::string hi = PrefixUpperBound(lo);
+    basalt::IterOptions o;
+    o.lower = basalt::Bound::At(basalt::Slice(lo));
+    if (!hi.empty()) o.upper = basalt::Bound::At(basalt::Slice(hi));
+    std::unique_ptr<basalt::Iterator> it = im.db->NewIter(o);
+    for (bool ok = it->First(); ok; ok = it->Next()) {
+      ManifestOp op;
+      if (DecodeManifestOp(it->Value().ToString(), &op)) {
+        out.push_back(op);
+        keys.push_back(it->Key().ToString());
+      }
+    }
+    (void)it->Close();
+  }
+  im.pending.clear();
+  if (keys.empty()) return out;
+
+  // TAKEN MEANS TAKEN. Publishing is idempotent -- the relay stores a blob
+  // under (object, replica, counter) and a repeat is the same blob -- so the
+  // risk of clearing here is a lost publish rather than a duplicate one, and
+  // the caller is about to write them into the oplog, which is durable.
+  basalt::WriteBatch batch;
+  std::deque<std::string> keep_alive;
+  for (const std::string& k : keys) {
+    keep_alive.push_back(k);
+    batch.Delete(basalt::Slice(keep_alive.back()));
+  }
+  basalt::wal::SeqNum seq = 0;
+  if (im.db->Write(batch, &seq).ok()) {
+    basalt::wal::SeqNum watermark = 0;
+    (void)im.db->Sync(&watermark);
+  }
   return out;
 }
 

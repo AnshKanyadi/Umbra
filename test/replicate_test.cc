@@ -861,5 +861,100 @@ TEST(Replication, AnOfflineDeviceCatchesUpWithoutReindexing) {
          "redid work rather than adopting it";
 }
 
+// PENDING OPERATIONS OUTLIVE THE PROCESS THAT MADE THEM.
+//
+// The end-to-end run found this: a device indexed a whole vault, exited, and
+// the next process pushed ten segments and zero operations -- so the bytes were
+// on the relay and nothing said they existed. A peer would have seen an empty
+// manifest and called itself complete.
+TEST(Replication, PendingOperationsSurviveTheProcessThatMadeThem) {
+  Device a;
+  ASSERT_NO_FATAL_FAILURE(a.Open(0xA1));
+  for (uint8_t i = 0; i < 3; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+        a.IndexNote(static_cast<uint8_t>(i + 1), kTopics[i]));
+  }
+  // The indexing process ends without publishing anything.
+  ASSERT_NO_FATAL_FAILURE(a.Reopen());
+
+  const std::vector<ManifestOp> ops = a.index->TakePending();
+  EXPECT_GE(ops.size(), 3u)
+      << "operations made before a restart were lost, so the segments would be "
+         "on the relay with nothing saying they exist";
+
+  // And a peer given exactly those operations wants exactly those segments.
+  Device b;
+  ASSERT_NO_FATAL_FAILURE(b.Open(0xB2));
+  for (const ManifestOp& op : ops) {
+    (void)b.index->ApplyManifestOp(op);
+  }
+  EXPECT_EQ(b.index->Missing().size(), a.index->SegmentIds().size());
+  EXPECT_FALSE(b.index->Complete());
+
+  // Taken means taken: a second call does not hand them out again.
+  EXPECT_TRUE(a.index->TakePending().empty());
+}
+
+// RE-INDEXING AN UNCHANGED NOTE MUST NOT KILL IT.
+//
+// The end-to-end run found this: a second build over a vault that had not
+// changed left 19 of 20 vectors tombstoned and one object where there were ten.
+// Segments are content addressed, so re-indexing identical content produces the
+// SAME segment id -- and the object's previous slots are then the very slots
+// the call just wrote. Tombstoning them is self-destruction with no error.
+TEST(Replication, ReindexingUnchangedContentIsANoOp) {
+  Device a;
+  ASSERT_NO_FATAL_FAILURE(a.Open(0xA1));
+  for (uint8_t i = 0; i < 4; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+        a.IndexNote(static_cast<uint8_t>(i + 1), kTopics[i]));
+  }
+  const IndexStats first = a.index->Stats();
+  ASSERT_EQ(first.objects, 4u);
+  ASSERT_EQ(first.tombstoned, 0u);
+  const std::vector<SegmentId> ids = a.index->SegmentIds();
+
+  // The same notes, the same bytes, indexed again.
+  for (uint8_t i = 0; i < 4; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+        a.IndexNote(static_cast<uint8_t>(i + 1), kTopics[i]));
+  }
+  const IndexStats second = a.index->Stats();
+  EXPECT_EQ(second.tombstoned, 0u)
+      << "re-indexing unchanged content tombstoned " << second.tombstoned
+      << " of its own vectors";
+  EXPECT_EQ(second.objects, 4u) << "objects vanished on a re-index";
+  EXPECT_EQ(second.vectors, first.vectors);
+  EXPECT_EQ(a.index->SegmentIds(), ids)
+      << "identical content produced different segments";
+
+  // And search still works, which is the part a user would notice.
+  Vector q;
+  ASSERT_EQ(a.embedder->EmbedQuery(kTopics[0], &q), EmbedStatus::kOk);
+  std::vector<SearchHit> hits;
+  ASSERT_EQ(a.index->Search(q, 5, 64, &hits), IndexStatus::kOk);
+  EXPECT_FALSE(hits.empty()) << "the vault searched empty after a re-index";
+}
+
+// A CHANGED NOTE STILL RETIRES ITS OLD CHUNKS, which is the property the filter
+// above must not break.
+TEST(Replication, ReindexingChangedContentStillTombstonesTheOld) {
+  Device a;
+  ASSERT_NO_FATAL_FAILURE(a.Open(0xA1));
+  ASSERT_NO_FATAL_FAILURE(a.IndexNote(1, kTopics[0]));
+  const IndexStats before = a.index->Stats();
+  ASSERT_EQ(before.tombstoned, 0u);
+
+  ASSERT_NO_FATAL_FAILURE(a.IndexNote(
+      1,
+      "# Keys\n\nRewritten completely, with different words about how a "
+      "vault handles its rotation schedule.\n"));
+  const IndexStats after = a.index->Stats();
+  EXPECT_GT(after.tombstoned, 0u)
+      << "an edited note kept its old chunks live, so search returns text the "
+         "vault no longer holds";
+  EXPECT_EQ(after.objects, 1u);
+}
+
 }  // namespace ai
 }  // namespace umbra

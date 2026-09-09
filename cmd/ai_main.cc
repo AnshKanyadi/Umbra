@@ -631,6 +631,12 @@ int Push(const Options& o) {
     std::fprintf(stderr, "cannot push manifest operations\n");
     return 1;
   }
+  // A REPORT, SO A PULLER CAN FIND THIS DEVICE. The relay does not index who
+  // has written what; a client learns the other devices from their sealed
+  // reports, exactly as the Phase 3 sync client does. Without this a puller has
+  // nobody to fetch manifest operations from and quietly concludes the vault
+  // has no index.
+  (void)h.client->PublishReport(1, {IndexObject()}, h.me);
   const double op_seconds = Since(t0);
 
   const auto b0 = std::chrono::steady_clock::now();
@@ -719,8 +725,24 @@ int Pull(const Options& o) {
   for (const ReplicaId& d : devices) {
     if (d == h.me) continue;
     sync::FetchStats st;
-    const sync::SyncStatus s = h.client->FetchObject(
+    const sync::SyncStatus s = h.client->FetchObjectWith(
         IndexObject(), d,
+        [](const OpPayload& p, uint64_t* prev) {
+          ManifestOp op;
+          if (!DecodeManifestOp(p.bytes, &op)) {
+            std::fprintf(
+                stderr,
+                "  payload of %zu bytes did not decode as a manifest "
+                "operation (version byte %u)\n",
+                p.bytes.size(),
+                p.bytes.empty()
+                    ? 0u
+                    : static_cast<unsigned>(static_cast<uint8_t>(p.bytes[0])));
+            return false;
+          }
+          *prev = op.prev;
+          return true;
+        },
         [&index, &applied, &refused](const OpPayload& p) {
           ManifestOp op;
           if (!DecodeManifestOp(p.bytes, &op)) return false;

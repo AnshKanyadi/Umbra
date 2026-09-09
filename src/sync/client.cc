@@ -115,6 +115,28 @@ SyncStatus Client::PushObject(const ObjectId& object, std::size_t* pushed) {
 SyncStatus Client::FetchObject(
     const ObjectId& object, const ReplicaId& source,
     const std::function<bool(const OpPayload&)>& apply, FetchStats* stats) {
+  // The two payload kinds this layer knows. A payload that decodes as neither
+  // is refused, which is what it was before this became a parameter.
+  const auto builtin = [](const OpPayload& p, uint64_t* prev) {
+    Op text_op;
+    TreeOp tree_op;
+    if (DecodeOp(p, &text_op)) {
+      *prev = text_op.prev;
+      return true;
+    }
+    if (DecodeTreeOp(p, &tree_op)) {
+      *prev = tree_op.prev;
+      return true;
+    }
+    return false;
+  };
+  return FetchObjectWith(object, source, builtin, apply, stats);
+}
+
+SyncStatus Client::FetchObjectWith(
+    const ObjectId& object, const ReplicaId& source,
+    const std::function<bool(const OpPayload&, uint64_t*)>& back_pointer,
+    const std::function<bool(const OpPayload&)>& apply, FetchStats* stats) {
   uint64_t cursor = 0;
   (void)LoadCursor(object, source, &cursor);
   stats->cursor_before = cursor;
@@ -159,15 +181,7 @@ SyncStatus Client::FetchObject(
       // applies is the caller's business, so the pointer is read here from
       // whichever decodes. A payload that decodes as neither is refused.
       uint64_t prev = 0;
-      Op text_op;
-      TreeOp tree_op;
-      if (DecodeOp(payload, &text_op)) {
-        prev = text_op.prev;
-      } else if (DecodeTreeOp(payload, &tree_op)) {
-        prev = tree_op.prev;
-      } else {
-        return SyncStatus::kBadResponse;
-      }
+      if (!back_pointer(payload, &prev)) return SyncStatus::kBadResponse;
       if (prev != cursor) {
         // The relay skipped something. The cursor stays where it is, nothing
         // after this point is applied, and the caller is told. Anything already

@@ -133,6 +133,23 @@ class Client {
                          const std::function<bool(const OpPayload&)>& apply,
                          FetchStats* stats);
 
+  // The same, for a payload this layer does not know how to read.
+  //
+  // THE CHAIN CHECK NEEDS THE BACK-POINTER AND NOTHING ELSE. The overload above
+  // finds it by trying the text and tree decoders, which is fine for the two
+  // kinds this layer was written around and refuses everything else -- Phase 5's
+  // manifest operations decoded as neither and came back as bad-response.
+  //
+  // Rather than teach the sync layer about the ai layer, which is the wrong
+  // direction and the reason the relay does not link the CRDTs either, the
+  // caller supplies a function that reads the back-pointer out of its own
+  // payload. Returning false means "this is not my payload", and the fetch
+  // refuses it exactly as before.
+  SyncStatus FetchObjectWith(
+      const ObjectId& object, const ReplicaId& source,
+      const std::function<bool(const OpPayload&, uint64_t*)>& back_pointer,
+      const std::function<bool(const OpPayload&)>& apply, FetchStats* stats);
+
   // Cursors, durable in the oplog's store.
   uint64_t Cursor(const ObjectId& object, const ReplicaId& source) const;
 
