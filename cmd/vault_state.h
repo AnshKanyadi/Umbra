@@ -28,11 +28,11 @@ bool ReadWholeFile(const std::string& path, std::string* out);
 bool WriteWholeFile(const std::string& path, const std::string& body);
 bool MakeDirs(const std::string& path);
 
-// `<vault>/.umbra/salt`, created on first use. The salt is per device, not per
-// vault: two devices deriving different roots is fine and expected, because
-// epoch keys travel by enrolment sealed to a device key rather than by being
-// derived from a shared root. Only the vault id is derived from the root, and a
-// joining device is told that rather than computing it.
+// `<vault>/.umbra/salt`, created on first use and then VAULT-WIDE: the
+// enrolment grant carries it (sync/enroll.h:81, which notes an Argon2id salt is
+// public by construction), so every device in a vault derives the same root and
+// computes the same vault id. A joining device is told the id anyway, because
+// it needs one before it has been granted anything.
 std::array<uint8_t, kSaltBytes> LoadOrCreateSalt(const std::string& dir);
 
 // `<vault>/.umbra/epochs`: epoch(4 BE) || length(4 BE) || wrapped, repeated.
