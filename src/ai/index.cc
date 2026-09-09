@@ -903,17 +903,8 @@ IndexStatus Index::AdoptSegment(const std::string& sealed) {
 // present.
 void Index::Prune() {
   Impl& im = *impl_;
-  const auto present = [&im](const SegmentId& id) { return im.Present(id); };
-  std::vector<SegmentId> drop;
-  for (const std::pair<const SegmentId, Loaded>& kv : im.segments) {
-    const SegmentState* st = im.manifest->Get(kv.first);
-    if (st == nullptr || st->superseded_by.empty()) continue;
-    bool replaced = false;
-    for (const SegmentId& by : st->superseded_by) {
-      if (present(by)) replaced = true;
-    }
-    if (replaced) drop.push_back(kv.first);
-  }
+  const std::vector<SegmentId> drop = im.manifest->Droppable(
+      [&im](const SegmentId& id) { return im.Present(id); });
   if (drop.empty()) return;
 
   basalt::WriteBatch batch;
@@ -941,24 +932,8 @@ void Index::Prune() {
 
 std::vector<SegmentId> Index::Missing() const {
   const Impl& im = *impl_;
-  std::vector<SegmentId> out;
-  for (const SegmentId& id : im.manifest->Wanted()) {
-    if (im.Present(id)) continue;
-    // NOT WANTED IF SOMETHING PRESENT HAS REPLACED IT. A retired segment stays
-    // in the fold forever -- the lattice is grow-only -- so asking for
-    // everything the manifest names would make a device re-fetch the very
-    // segments it correctly discarded after compaction, and it would never stop
-    // reporting itself incomplete.
-    const SegmentState* st = im.manifest->Get(id);
-    bool replaced = false;
-    if (st != nullptr) {
-      for (const SegmentId& by : st->superseded_by) {
-        if (im.Present(by)) replaced = true;
-      }
-    }
-    if (!replaced) out.push_back(id);
-  }
-  return out;
+  return im.manifest->MissingFrom(
+      [&im](const SegmentId& id) { return im.Present(id); });
 }
 
 std::vector<SegmentId> Index::AwaitingReplacement() const {

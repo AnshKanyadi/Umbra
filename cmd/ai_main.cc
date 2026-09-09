@@ -21,6 +21,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -29,7 +30,11 @@
 #include "umbra/ai/chunk.h"
 #include "umbra/ai/embed.h"
 #include "umbra/ai/index.h"
+#include "umbra/ai/manifest.h"
+#include "umbra/crdt/op.h"
+#include "umbra/crdt/oplog.h"
 #include "umbra/crypto/keys.h"
+#include "umbra/sync/client.h"
 
 namespace {
 
@@ -181,6 +186,10 @@ void Usage() {
                "  --eval FILE          run a question set and report\n"
                "  --stats              what the index holds\n"
                "  --compact            merge segments and drop tombstones\n"
+               "  --push               publish this index to the relay\n"
+               "  --pull               fetch the index from the relay\n"
+               "\n"
+               "  --relay HOST:PORT    where the vault's relay is\n"
                "\n"
                "  --model NAME         all-minilm, nomic-embed-text, or\n"
                "                       hashing for the deterministic stand-in\n"
@@ -191,6 +200,9 @@ void Usage() {
 struct Options {
   std::string vault;
   std::string index_dir;
+  std::string relay;
+  bool push = false;
+  bool pull = false;
   std::string model = "all-minilm";
   std::string generator;
   std::string question;
@@ -211,8 +223,8 @@ int Build(const Options& o) {
   VaultKeys keys = KeysFor("umbra ai driver");
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
-  if (Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), ReplicaForIndex(o.index_dir), &index) !=
-      IndexStatus::kOk) {
+  if (Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
+                  ReplicaForIndex(o.index_dir), &index) != IndexStatus::kOk) {
     std::fprintf(stderr, "cannot open the index at %s\n", o.index_dir.c_str());
     return 1;
   }
@@ -362,7 +374,8 @@ int Ask(const Options& o) {
   std::unique_ptr<Index> index;
   {
     const IndexStatus s =
-        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), ReplicaForIndex(o.index_dir), &index);
+        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
+                    ReplicaForIndex(o.index_dir), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));
@@ -430,7 +443,8 @@ int Eval(const Options& o) {
   std::unique_ptr<Index> index;
   {
     const IndexStatus s =
-        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), ReplicaForIndex(o.index_dir), &index);
+        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
+                    ReplicaForIndex(o.index_dir), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));
@@ -522,12 +536,267 @@ int Eval(const Options& o) {
   return 0;
 }
 
+// ------------------------------------------------------------- replication
+//
+// PUSH AND PULL GO THROUGH THE PHASE 3 CLIENT, not a second transport. Manifest
+// operations travel in the oplog under IndexObject() with the same chain, the
+// same cursor and the same ordering guarantees the tree and text operations
+// get; segment bytes travel as blobs the relay stores under a name it does not
+// interpret.
+
+// The vault id and keys a driver uses. Derived, as everywhere else in this
+// tool, because it has no enrolment channel.
+struct RelayHandle {
+  VaultKeys keys;
+  relay::VaultId vault;
+  std::unique_ptr<OpLog> log;
+  std::unique_ptr<sync::Transport> transport;
+  std::unique_ptr<sync::Client> client;
+  ReplicaId me;
+};
+
+bool OpenRelay(const Options& o, VaultKeys keys, RelayHandle* h) {
+  if (o.relay.empty()) {
+    std::fprintf(stderr, "--push and --pull need --relay HOST:PORT\n");
+    return false;
+  }
+  const std::size_t colon = o.relay.rfind(':');
+  if (colon == std::string::npos) {
+    std::fprintf(stderr, "--relay wants HOST:PORT\n");
+    return false;
+  }
+  const std::string host = o.relay.substr(0, colon);
+  const uint16_t port =
+      static_cast<uint16_t>(std::atoi(o.relay.c_str() + colon + 1));
+
+  h->keys = keys;
+  const SecretKey vid = DeriveSubkey(h->keys.root(), 1, "umbVault");
+  std::memcpy(h->vault.bytes.data(), vid.data(), h->vault.bytes.size());
+  h->me = ReplicaForIndex(o.index_dir);
+
+  if (OpLog::OpenEncrypted(o.index_dir + "/oplog", &h->keys, &h->log) !=
+      LogStatus::kOk) {
+    std::fprintf(stderr, "cannot open the index oplog\n");
+    return false;
+  }
+  h->transport = sync::NewTcpTransport(host, port);
+  h->client.reset(new sync::Client(h->vault, h->me, &h->keys, h->log.get(),
+                                   h->transport.get()));
+  return true;
+}
+
+int Push(const Options& o) {
+  VaultKeys keys = KeysFor("umbra ai driver");
+  std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
+  std::unique_ptr<Index> index;
+  {
+    const IndexStatus s =
+        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
+                    ReplicaForIndex(o.index_dir), &index);
+    if (s != IndexStatus::kOk) {
+      std::fprintf(stderr, "cannot open the index: %s\n", IndexStatusName(s));
+      return 1;
+    }
+  }
+  RelayHandle h;
+  if (!OpenRelay(o, keys, &h)) return 1;
+
+  const auto t0 = std::chrono::steady_clock::now();
+
+  // THE OPERATIONS FIRST, THEN THE BYTES. A peer that has the operations and
+  // not the bytes knows it is incomplete and says so; a peer that has bytes
+  // nobody has vouched for cannot tell whether they belong to this vault.
+  const std::vector<ManifestOp> ops = index->TakePending();
+  // THE RAW LAYER, THE SAME ONE TREE OPERATIONS USE. A manifest operation is
+  // not a text operation and must not be smuggled through Op, whose `text` is a
+  // vector of code points rather than a bag of bytes. AppendRaw takes an opaque
+  // payload and gives it the encryption, the chain and the cursor that every
+  // other operation in this project gets.
+  std::vector<LoggedOp> raw;
+  raw.reserve(ops.size());
+  for (const ManifestOp& op : ops) {
+    LoggedOp l;
+    l.id = op.id;
+    l.payload.bytes = EncodeManifestOp(op);
+    raw.push_back(l);
+  }
+  if (!raw.empty() && h.log->AppendRaw(IndexObject(), raw) != LogStatus::kOk) {
+    std::fprintf(stderr, "cannot record the manifest operations\n");
+    return 1;
+  }
+  if (!raw.empty() && h.log->Sync() != LogStatus::kOk) return 1;
+  std::size_t pushed_ops = 0;
+  if (h.client->PushObject(IndexObject(), &pushed_ops) !=
+      sync::SyncStatus::kOk) {
+    std::fprintf(stderr, "cannot push manifest operations\n");
+    return 1;
+  }
+  const double op_seconds = Since(t0);
+
+  const auto b0 = std::chrono::steady_clock::now();
+  std::size_t pushed_segments = 0;
+  uint64_t pushed_bytes = 0;
+  std::vector<std::array<uint8_t, 32>> already;
+  (void)h.client->ListSegments(&already, nullptr);
+  std::set<std::string> have;
+  for (const std::array<uint8_t, 32>& id : already) {
+    have.insert(
+        std::string(reinterpret_cast<const char*>(id.data()), id.size()));
+  }
+  for (const SegmentId& id : index->SegmentIds()) {
+    const std::string key(reinterpret_cast<const char*>(id.bytes.data()),
+                          id.bytes.size());
+    // ALREADY THERE MEANS ALREADY THERE. Segments are content addressed, so a
+    // relay that has one has exactly this one -- re-uploading would move tens
+    // of megabytes to arrive at the byte-identical result.
+    if (have.count(key) != 0) continue;
+    std::string sealed;
+    if (!ReadWholeFile(o.index_dir + "/segments/" + id.Hex() + ".seg",
+                       &sealed)) {
+      continue;
+    }
+    if (h.client->PushSegment(id.bytes, sealed) != sync::SyncStatus::kOk) {
+      std::fprintf(stderr, "cannot push segment %s\n", id.Short().c_str());
+      return 1;
+    }
+    ++pushed_segments;
+    pushed_bytes += sealed.size();
+  }
+  const double byte_seconds = Since(b0);
+
+  std::printf(
+      "pushed %zu manifest operations in %.2fs\n"
+      "pushed %zu segments, %llu bytes, in %.2fs\n"
+      "index holds %u segments, %u vectors\n",
+      ops.size(), op_seconds, pushed_segments,
+      static_cast<unsigned long long>(pushed_bytes), byte_seconds,
+      index->Stats().segments, index->Stats().vectors);
+  return 0;
+}
+
+int Pull(const Options& o) {
+  VaultKeys keys = KeysFor("umbra ai driver");
+  std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
+  std::unique_ptr<Index> index;
+  {
+    const IndexStatus s =
+        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
+                    ReplicaForIndex(o.index_dir), &index);
+    if (s != IndexStatus::kOk) {
+      std::fprintf(stderr, "cannot open the index: %s\n", IndexStatusName(s));
+      return 1;
+    }
+  }
+  RelayHandle h;
+  if (!OpenRelay(o, keys, &h)) return 1;
+
+  const auto t0 = std::chrono::steady_clock::now();
+  // Every device that has published manifest operations, learned the same way
+  // a client learns who else exists.
+  std::vector<ReplicaId> devices;
+  {
+    relay::GetReportsRequest gr;
+    gr.vault = h.vault;
+    relay::ReportsResponse rr;
+    if (h.transport->GetReports(gr, &rr)) {
+      for (const relay::SealedReport& s : rr.reports) {
+        ReplicaId d;
+        d.bytes = s.device.bytes;
+        devices.push_back(d);
+      }
+    }
+  }
+  // A driver has no device roster, so it also asks the relay who has written
+  // manifest operations by trying the ids it knows. Publishing a report makes
+  // this device discoverable to the other one.
+  (void)h.client->PublishReport(1, {IndexObject()}, h.me);
+  if (std::find(devices.begin(), devices.end(), h.me) == devices.end()) {
+    devices.push_back(h.me);
+  }
+
+  std::size_t applied = 0;
+  std::size_t refused = 0;
+  for (const ReplicaId& d : devices) {
+    if (d == h.me) continue;
+    sync::FetchStats st;
+    const sync::SyncStatus s = h.client->FetchObject(
+        IndexObject(), d,
+        [&index, &applied, &refused](const OpPayload& p) {
+          ManifestOp op;
+          if (!DecodeManifestOp(p.bytes, &op)) return false;
+          const ManifestApply a = index->ApplyManifestOp(op);
+          if (a == ManifestApply::kModelMismatch) {
+            ++refused;
+          } else if (a == ManifestApply::kApplied) {
+            ++applied;
+          }
+          // kMalformed is the only refusal that breaks the fetch: it means the
+          // stream is not what it claims to be.
+          return a != ManifestApply::kMalformed;
+        },
+        &st);
+    if (s != sync::SyncStatus::kOk) {
+      std::printf("  manifest fetch from %s: %s\n", d.Short().c_str(),
+                  sync::SyncStatusName(s));
+    }
+  }
+  if (h.log->Sync() != LogStatus::kOk) return 1;
+  const double op_seconds = Since(t0);
+
+  const auto b0 = std::chrono::steady_clock::now();
+  std::size_t pulled = 0;
+  uint64_t pulled_bytes = 0;
+  std::size_t failed = 0;
+  for (const SegmentId& id : index->Missing()) {
+    std::string sealed;
+    if (h.client->PullSegment(id.bytes, &sealed) != sync::SyncStatus::kOk) {
+      ++failed;
+      continue;
+    }
+    const IndexStatus s = index->AdoptSegment(sealed);
+    if (s == IndexStatus::kOk) {
+      ++pulled;
+      pulled_bytes += sealed.size();
+    } else {
+      ++failed;
+      std::printf("  segment %s refused: %s\n", id.Short().c_str(),
+                  IndexStatusName(s));
+    }
+  }
+  const double byte_seconds = Since(b0);
+
+  const IndexStats st = index->Stats();
+  std::printf(
+      "applied %zu manifest operations in %.2fs (%zu refused for the model)\n"
+      "pulled %zu segments, %llu bytes, in %.2fs (%zu failed)\n"
+      "index holds %u segments, %u vectors, %u objects\n"
+      "complete: %s",
+      applied, op_seconds, refused, pulled,
+      static_cast<unsigned long long>(pulled_bytes), byte_seconds, failed,
+      st.segments, st.vectors, st.objects, index->Complete() ? "yes" : "no");
+  if (!index->Complete()) {
+    std::printf(" (%zu segment(s) still missing)", index->Missing().size());
+  }
+  std::printf("\n");
+  const std::vector<SegmentId> waiting = index->AwaitingReplacement();
+  if (!waiting.empty()) {
+    // The safety condition, visible. A device holding more than the manifest
+    // implies should be able to say why.
+    std::printf(
+        "%zu retired segment(s) are still live because their replacement has "
+        "not arrived\n",
+        waiting.size());
+  }
+  return 0;
+}
+
 int Stats(const Options& o) {
   VaultKeys keys = KeysFor("umbra ai driver");
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
   const IndexStatus s =
-      Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), ReplicaForIndex(o.index_dir), &index);
+      Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
+                  ReplicaForIndex(o.index_dir), &index);
   if (s != IndexStatus::kOk) {
     std::fprintf(stderr, "cannot open the index: %s\n", IndexStatusName(s));
     return 1;
@@ -551,7 +820,8 @@ int CompactCommand(const Options& o) {
   std::unique_ptr<Index> index;
   {
     const IndexStatus s =
-        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), ReplicaForIndex(o.index_dir), &index);
+        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
+                    ReplicaForIndex(o.index_dir), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));
@@ -609,6 +879,13 @@ int main(int argc, char** argv) {
       o.stats = true;
     } else if (a == "--compact") {
       o.compact = true;
+    } else if (a == "--relay" && next) {
+      o.relay = next;
+      ++i;
+    } else if (a == "--push") {
+      o.push = true;
+    } else if (a == "--pull") {
+      o.pull = true;
     } else {
       Usage();
       return 2;
@@ -619,6 +896,8 @@ int main(int argc, char** argv) {
     return 2;
   }
   if (o.build) return Build(o);  // --compact modifies it rather than replacing
+  if (o.push) return Push(o);
+  if (o.pull) return Pull(o);
   if (!o.question.empty()) return Ask(o);
   if (!o.eval_file.empty()) return Eval(o);
   if (o.stats) return Stats(o);

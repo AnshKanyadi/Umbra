@@ -179,26 +179,62 @@ class ManifestDoc {
   // whatever is in here that it does not have.
   std::vector<SegmentId> Wanted() const;
 
-  // THE SAFETY CONDITION, EVALUATED. `present` answers whether a segment's
-  // bytes are on this device. A retired segment stays live until whatever
-  // supersedes it is present.
+  // THE SAFETY CONDITION, IN ONE PLACE. Every question about whether a segment
+  // still counts goes through here: what is live, what is still wanted, what
+  // may be dropped.
   //
-  // Passing a predicate rather than a set keeps this a pure function of the
-  // operations plus what the caller can see, which is what makes it testable
-  // without a store.
+  // It was written out three times to begin with -- in Live, in Index::Missing
+  // and in Index::Prune -- and deliberate breakage found the cost: removing the
+  // check from Live left the other two intact, so the test that exists to prove
+  // the condition is enforced passed while it was not. Three copies of an
+  // invariant is three chances for one of them to be right.
+  //
+  // `present` answers whether a segment's bytes are on this device. Taking a
+  // predicate rather than a set keeps this a pure function of the operations
+  // plus what the caller can see, which is what makes it testable without a
+  // store.
+  template <typename Present>
+  bool Superseded(const SegmentId& id, const Present& present) const {
+    const SegmentState* st = Get(id);
+    if (st == nullptr) return false;
+    for (const SegmentId& by : st->superseded_by) {
+      if (present(by)) return true;
+    }
+    return false;
+  }
+
   template <typename Present>
   std::vector<SegmentId> Live(const Present& present) const {
     std::vector<SegmentId> out;
     for (const std::pair<const SegmentId, SegmentState>& kv : segments_) {
       if (!present(kv.first)) continue;
-      bool replaced = false;
-      for (const SegmentId& by : kv.second.superseded_by) {
-        if (present(by)) {
-          replaced = true;
-          break;
-        }
-      }
-      if (!replaced) out.push_back(kv.first);
+      if (Superseded(kv.first, present)) continue;
+      out.push_back(kv.first);
+    }
+    return out;
+  }
+
+  // What a device should be holding and does not: named by the manifest, not
+  // here, and not already replaced by something that is here.
+  template <typename Present>
+  std::vector<SegmentId> MissingFrom(const Present& present) const {
+    std::vector<SegmentId> out;
+    for (const SegmentId& id : Wanted()) {
+      if (present(id)) continue;
+      if (Superseded(id, present)) continue;
+      out.push_back(id);
+    }
+    return out;
+  }
+
+  // What may now be dropped: held here, and replaced by something also held
+  // here.
+  template <typename Present>
+  std::vector<SegmentId> Droppable(const Present& present) const {
+    std::vector<SegmentId> out;
+    for (const std::pair<const SegmentId, SegmentState>& kv : segments_) {
+      if (!present(kv.first)) continue;
+      if (Superseded(kv.first, present)) out.push_back(kv.first);
     }
     return out;
   }
@@ -212,11 +248,7 @@ class ManifestDoc {
     for (const std::pair<const SegmentId, SegmentState>& kv : segments_) {
       if (kv.second.superseded_by.empty()) continue;
       if (!present(kv.first)) continue;
-      bool replaced = false;
-      for (const SegmentId& by : kv.second.superseded_by) {
-        if (present(by)) replaced = true;
-      }
-      if (!replaced) out.push_back(kv.first);
+      if (!Superseded(kv.first, present)) out.push_back(kv.first);
     }
     return out;
   }

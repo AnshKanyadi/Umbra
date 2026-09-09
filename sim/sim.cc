@@ -1970,17 +1970,35 @@ void RunIndexSegmentBeforeManifest(Sim* s) {
     published.push_back(add);
     ++s->result.manifest_ops;
 
-    // Deliver to everyone else, with the bytes and the operation in an order
-    // the schedule chooses rather than a fixed one.
+    // A tombstone against the segment, which is what an edit on another device
+    // produces. It is delivered in an order the schedule chooses -- INCLUDING
+    // BEFORE THE ADD IT REFERS TO, which is the ordering that makes the fold
+    // depend on arrival order if a placeholder entry is mistaken for a prior
+    // add. Deliberate breakage found this schedule too weak without it: the
+    // defect was caught by a unit test and not here.
+    ai::ManifestOp tomb =
+        peers[who].Make(ai::ManifestOpKind::kTombstone, s->replicas[who].id);
+    tomb.segment = add.segment;
+    tomb.slot = static_cast<uint32_t>(s->rng.Below(add.count));
+    (void)peers[who].manifest->Apply(tomb);
+    ++s->result.manifest_ops;
+
     for (std::size_t j = 0; j < peers.size(); ++j) {
       if (j == who) continue;
       const bool bytes_first = s->rng.Chance(50);
+      const bool tombstone_first = s->rng.Chance(50);
       if (bytes_first) {
         peers[j].present.insert(add.segment);
         ++s->result.segments_adopted;
+      }
+      if (tombstone_first) {
+        (void)peers[j].manifest->Apply(tomb);
         (void)peers[j].manifest->Apply(add);
       } else {
         (void)peers[j].manifest->Apply(add);
+        (void)peers[j].manifest->Apply(tomb);
+      }
+      if (!bytes_first) {
         peers[j].present.insert(add.segment);
         ++s->result.segments_adopted;
       }

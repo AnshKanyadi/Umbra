@@ -710,8 +710,26 @@ TEST(Replication, ARestartDoesNotReissueManifestCounters) {
     highest = std::max(highest, op.id.counter);
   }
 
+  // A COMPACTION FIRST. Without one this test passed even with the counter
+  // recovery removed, because reopening replays the local segments and
+  // tombstones and happens to reconstruct a counter as large as the published
+  // one. Retirements are NOT reconstructed -- they are not derivable from what
+  // is on disk -- so a compaction is what makes the published counter outrun
+  // anything the replay can rebuild, which is the case the recovery exists for.
+  for (uint8_t i = 1; i < 4; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+        a.IndexNote(static_cast<uint8_t>(i + 1), kTopics[i]));
+  }
+  uint32_t merged = 0;
+  uint32_t reclaimed = 0;
+  ASSERT_EQ(a.index->Compact(2, 10, &merged, &reclaimed), IndexStatus::kOk);
+  ASSERT_GT(merged, 1u);
+  for (const ManifestOp& op : a.index->TakePending()) {
+    highest = std::max(highest, op.id.counter);
+  }
+
   ASSERT_NO_FATAL_FAILURE(a.Reopen());
-  ASSERT_NO_FATAL_FAILURE(a.IndexNote(2, kTopics[1]));
+  ASSERT_NO_FATAL_FAILURE(a.IndexNote(9, kTopics[1]));
   const std::vector<ManifestOp> second = a.index->TakePending();
   ASSERT_FALSE(second.empty());
   for (const ManifestOp& op : second) {
