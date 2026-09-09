@@ -62,6 +62,33 @@ struct SealContext {
 std::string Seal(const SecretKey& key, const SealContext& ctx,
                  const std::string& plaintext);
 
+// Seals with a nonce DERIVED FROM THE PLAINTEXT instead of drawn at random, so
+// that sealing the same bytes twice under the same key produces the same
+// output. The result opens with the ordinary Open.
+//
+// WHY THIS EXISTS. Index segments must be reproducible: the same vectors have
+// to produce the same segment, byte for byte, or the determinism test in item 5
+// is untestable and Phase 5 cannot content-address them. A random nonce makes
+// that impossible.
+//
+// WHY IT IS SAFE HERE, AND THE CONDITION UNDER WHICH IT STOPS BEING SAFE.
+// Reusing a nonce under one key normally destroys XChaCha20-Poly1305: two
+// messages under one nonce leak their XOR and forge each other's tags. The
+// nonce here is a keyed BLAKE2b over the plaintext AND the associated data,
+// which is the SIV construction: two different messages get different nonces
+// with overwhelming probability, and the only way to repeat one is to seal
+// identical bytes in an identical context -- which produces an identical
+// ciphertext for what is, by definition, the same object.
+//
+// The cost is that identical plaintexts are recognisable as identical. For
+// content-addressed segments that is already true by construction.
+//
+// DO NOT ADD AN OVERLOAD THAT TAKES A CALLER-SUPPLIED NONCE. The safety here is
+// entirely in the derivation; a caller that picks its own would be one typo
+// from catastrophic reuse, and the type system cannot tell the difference.
+std::string SealDeterministic(const SecretKey& key, const SealContext& ctx,
+                              const std::string& plaintext);
+
 // Opens. Returns kAuthFailed for a wrong key, a wrong context, a truncated
 // input or a tampered one, and does not distinguish between them.
 CryptoStatus Open(const SecretKey& key, const SealContext& ctx,

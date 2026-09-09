@@ -39,6 +39,8 @@
 #include <string>
 #include <vector>
 
+#include "umbra/ai/embed.h"
+
 namespace umbra {
 namespace ai {
 
@@ -51,11 +53,6 @@ struct HnswParams {
   uint32_t ef_construction = 200;
   // A ceiling on levels, so a pathological draw cannot make the graph deep.
   uint32_t max_level = 16;
-};
-
-struct Neighbour {
-  uint32_t id = 0;
-  float score = 0.0f;  // similarity, higher is nearer
 };
 
 // An immutable graph over a fixed set of vectors. Built once, searched many

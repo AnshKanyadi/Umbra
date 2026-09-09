@@ -50,6 +50,17 @@ namespace ai {
 // square roots on the hot path.
 using Vector = std::vector<float>;
 
+// One result of a nearest-neighbour search: which vector, and how near.
+//
+// It lives here rather than in the index because it is a fact about vectors,
+// and because both the public segment API and the private graph need it --
+// defining it in the graph header would have made the public one depend on a
+// private one.
+struct Neighbour {
+  uint32_t id = 0;
+  float score = 0.0f;  // similarity, higher is nearer
+};
+
 // What makes two vectors comparable.
 //
 // NOT the hash of the model file: two people who quantise the same weights with

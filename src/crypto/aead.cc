@@ -59,6 +59,39 @@ std::string Seal(const SecretKey& key, const SealContext& ctx,
   return out;
 }
 
+std::string SealDeterministic(const SecretKey& key, const SealContext& ctx,
+                              const std::string& plaintext) {
+  UMBRA_CHECK(::sodium_init() >= 0, "sodium_init failed");
+  const std::string aad = ctx.Bytes();
+  std::string out;
+  out.resize(kNonceBytes + plaintext.size() + kMacBytes);
+
+  // A KEYED hash, not a plain one. An unkeyed digest would also be unique per
+  // plaintext, but keying it means an observer who guesses the plaintext cannot
+  // confirm the guess by recomputing the nonce.
+  crypto_generichash_state st;
+  ::crypto_generichash_init(&st, key.data(), SecretKey::size(), kNonceBytes);
+  ::crypto_generichash_update(
+      &st, reinterpret_cast<const unsigned char*>(aad.data()), aad.size());
+  ::crypto_generichash_update(
+      &st, reinterpret_cast<const unsigned char*>(plaintext.data()),
+      plaintext.size());
+  ::crypto_generichash_final(&st, reinterpret_cast<unsigned char*>(&out[0]),
+                             kNonceBytes);
+
+  unsigned long long clen = 0;
+  const int rc = ::crypto_aead_xchacha20poly1305_ietf_encrypt(
+      reinterpret_cast<unsigned char*>(&out[0]) + kNonceBytes, &clen,
+      reinterpret_cast<const unsigned char*>(plaintext.data()),
+      static_cast<unsigned long long>(plaintext.size()),
+      reinterpret_cast<const unsigned char*>(aad.data()),
+      static_cast<unsigned long long>(aad.size()), nullptr,
+      reinterpret_cast<const unsigned char*>(&out[0]), key.data());
+  UMBRA_CHECK(rc == 0, "deterministic seal failed");
+  out.resize(kNonceBytes + static_cast<std::size_t>(clen));
+  return out;
+}
+
 CryptoStatus Open(const SecretKey& key, const SealContext& ctx,
                   const std::string& sealed, std::string* plaintext) {
   UMBRA_CHECK(::sodium_init() >= 0, "sodium_init failed");
