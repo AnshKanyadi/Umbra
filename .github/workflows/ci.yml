@@ -215,21 +215,21 @@ jobs:
         with:
           fetch-depth: 0
 
-      # THE RUNNER'S THIRD PARTY APT LISTS ARE NOT THIS BUILD'S BUSINESS.
-      # `apt-get update` exits non-zero if ANY configured repository serves a
-      # bad index, and the GitHub image ships Google Chrome's and Microsoft's.
-      # Both lint lanes failed twice in a row on "Hash Sum mismatch ...
-      # dl.google.com/linux/chrome-stable" -- a repo this project does not use,
-      # for a package it does not install -- so neither tool was ever installed
-      # and neither lane said anything about the code.
+      # A BROKEN THIRD PARTY REPO ON THE RUNNER MUST NOT DECIDE WHETHER THIS
+      # LANE RUNS. `apt-get update` exits 100 if ANY configured repository
+      # fails, and the GitHub image ships Google Chrome's, which served a
+      # Packages.gz whose hash did not match its Release file for long enough to
+      # fail both lint lanes three times running. Neither tool was ever
+      # installed, so neither lane said anything about the code -- while
+      # reporting red as though it had.
       #
-      # Named files, not a glob: on noble the Ubuntu archive itself lives under
-      # sources.list.d, and removing it would turn this into "Unable to locate
-      # package", which is a worse failure wearing the same clothes.
+      # Deleting the .list did not help: the repo is configured somewhere else
+      # on the image, and chasing that filename is a guess with an expiry date.
+      # So the update is allowed to be partial and the INSTALL is the gate. If
+      # the Ubuntu archive itself is unreachable the package will not install
+      # and this lane fails for a reason that is about this build.
       - run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
-                     /etc/apt/sources.list.d/microsoft-prod.list
-          sudo apt-get update
+          sudo apt-get update || true
           sudo apt-get install -y clang-format
 
       # The merge base, not the base tip: comparing against the tip would
@@ -300,21 +300,21 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      # THE RUNNER'S THIRD PARTY APT LISTS ARE NOT THIS BUILD'S BUSINESS.
-      # `apt-get update` exits non-zero if ANY configured repository serves a
-      # bad index, and the GitHub image ships Google Chrome's and Microsoft's.
-      # Both lint lanes failed twice in a row on "Hash Sum mismatch ...
-      # dl.google.com/linux/chrome-stable" -- a repo this project does not use,
-      # for a package it does not install -- so neither tool was ever installed
-      # and neither lane said anything about the code.
+      # A BROKEN THIRD PARTY REPO ON THE RUNNER MUST NOT DECIDE WHETHER THIS
+      # LANE RUNS. `apt-get update` exits 100 if ANY configured repository
+      # fails, and the GitHub image ships Google Chrome's, which served a
+      # Packages.gz whose hash did not match its Release file for long enough to
+      # fail both lint lanes three times running. Neither tool was ever
+      # installed, so neither lane said anything about the code -- while
+      # reporting red as though it had.
       #
-      # Named files, not a glob: on noble the Ubuntu archive itself lives under
-      # sources.list.d, and removing it would turn this into "Unable to locate
-      # package", which is a worse failure wearing the same clothes.
+      # Deleting the .list did not help: the repo is configured somewhere else
+      # on the image, and chasing that filename is a guess with an expiry date.
+      # So the update is allowed to be partial and the INSTALL is the gate. If
+      # the Ubuntu archive itself is unreachable the package will not install
+      # and this lane fails for a reason that is about this build.
       - run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
-                     /etc/apt/sources.list.d/microsoft-prod.list
-          sudo apt-get update
+          sudo apt-get update || true
           sudo apt-get install -y clang-tidy cmake
 
       - name: resolve the merge base
