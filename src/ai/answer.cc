@@ -416,6 +416,11 @@ AnswerResult Answer(const Index& index, Embedder* embedder,
                     Generator* generator, const DocumentSource& source,
                     const std::string& query, const AnswerOptions& options) {
   AnswerResult r;
+  // RECORDED BEFORE ANYTHING ELSE. Whether the index was whole is a property of
+  // the answer, not a detail of how it was produced, and a caller that renders
+  // results without it is presenting a partial vault as the whole one.
+  r.segments_missing = static_cast<uint32_t>(index.Missing().size());
+  r.index_complete = r.segments_missing == 0;
   const IndexStatus s = Retrieve(index, embedder, source, query, options,
                                  &r.passages, &r.near_misses);
   if (s != IndexStatus::kOk) {
@@ -427,9 +432,22 @@ AnswerResult Answer(const Index& index, Embedder* embedder,
     // not even a hedged one, because a hedged answer from a model that was
     // given nothing is still a model talking about a vault it cannot see.
     r.status = AnswerStatus::kNoPassages;
-    r.text =
-        "Nothing in the vault is close enough to that question to answer "
-        "from.";
+    // TWO DIFFERENT SENTENCES, BECAUSE THEY MEAN DIFFERENT THINGS. "The vault
+    // has nothing" and "this device has not caught up" lead a user to do
+    // different things, and collapsing them into one message would turn a
+    // temporary sync gap into an apparently permanent absence.
+    if (r.index_complete) {
+      r.text =
+          "Nothing in the vault is close enough to that question to answer "
+          "from.";
+    } else {
+      r.text =
+          "Nothing found, and this device has not finished pulling the "
+          "index: " +
+          std::to_string(r.segments_missing) +
+          " segment(s) are still missing. The answer may be here once it has "
+          "caught up.";
+    }
     return r;
   }
   if (generator == nullptr) {

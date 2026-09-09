@@ -157,6 +157,19 @@ struct AnswerOptions {
 
 struct AnswerResult {
   AnswerStatus status = AnswerStatus::kNoPassages;
+
+  // WHETHER THE INDEX SEARCHED WAS COMPLETE. False when the manifest names
+  // segments this device does not hold yet -- a phone that has pulled the
+  // operations but not the bytes, or a laptop catching up after a week away.
+  //
+  // The result is still correct as far as it goes, and saying so is the point:
+  // an answer drawn from part of a vault, presented as if drawn from all of it,
+  // is the same failure as an ungrounded answer presented as a grounded one.
+  // Retrieval degrades, and the caller is told that it did.
+  bool index_complete = true;
+  // How many segments were missing when the search ran, so a caller can say
+  // "still catching up, 3 of 11 segments" rather than only "incomplete".
+  uint32_t segments_missing = 0;
   std::string text;
   // Every passage that was put in front of the model, in the order it was
   // numbered.

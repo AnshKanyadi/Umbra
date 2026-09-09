@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include "umbra/ai/answer.h"
 #include "umbra/ai/chunk.h"
 #include "umbra/ai/embed.h"
 #include "umbra/ai/index.h"
@@ -719,6 +720,127 @@ TEST(Replication, ARestartDoesNotReissueManifestCounters) {
         << ", which the oplog would treat as a lost write rather than a "
            "conflict";
   }
+}
+
+// ------------------------------------------------------- honest degradation
+
+// A PHONE THAT NEVER INDEXES MUST STILL SEARCH, AND MUST SAY WHAT IT HAS.
+//
+// The prompt asks what happens when nobody has indexed recent notes yet. The
+// answer has to be visible in the result rather than inferred, because a
+// partial vault presented as the whole one is the same failure as an ungrounded
+// answer presented as a grounded one.
+TEST(Replication, ADeviceThatNeverIndexesSearchesAndSaysWhatItHas) {
+  Device laptop;
+  ASSERT_NO_FATAL_FAILURE(laptop.Open(0xA1));
+  Device phone;
+  ASSERT_NO_FATAL_FAILURE(phone.Open(0xB2));
+
+  // The vault's documents, so a passage can be resolved on either device.
+  std::map<std::string, std::string> vault;
+  const auto key = [](const ObjectId& o) {
+    return std::string(reinterpret_cast<const char*>(o.bytes.data()),
+                       o.bytes.size());
+  };
+  for (uint8_t i = 0; i < 4; ++i) {
+    vault[key(Object(static_cast<uint8_t>(i + 1)))] = kTopics[i];
+  }
+  const DocumentSource source = [&vault, &key](const ObjectId& o,
+                                               std::string* out) {
+    const std::map<std::string, std::string>::const_iterator it =
+        vault.find(key(o));
+    if (it == vault.end()) return false;
+    *out = it->second;
+    return true;
+  };
+
+  // The laptop indexes everything. The phone indexes nothing, ever.
+  for (uint8_t i = 0; i < 4; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+        laptop.IndexNote(static_cast<uint8_t>(i + 1), kTopics[i]));
+  }
+
+  AnswerOptions o;
+  o.min_score = -1.0f;
+  o.relative_floor = -1.0f;
+
+  // Operations only: the phone knows what exists and holds none of it.
+  Ship(&laptop, &phone);
+  {
+    const AnswerResult r = Answer(*phone.index, phone.embedder.get(), nullptr,
+                                  source, "epoch key random derived", o);
+    EXPECT_FALSE(r.index_complete)
+        << "a device holding no segments reported a complete index";
+    EXPECT_GT(r.segments_missing, 0u);
+    EXPECT_EQ(r.status, AnswerStatus::kNoPassages);
+    EXPECT_NE(r.text.find("not finished pulling"), std::string::npos)
+        << "an empty result from a catching-up device read as an empty vault";
+  }
+
+  // Half the bytes. Still incomplete, and now it answers from what it has.
+  const std::vector<SegmentId> missing = phone.index->Missing();
+  ASSERT_GE(missing.size(), 2u);
+  ASSERT_EQ(phone.index->AdoptSegment(laptop.SealedBytes(missing[0])),
+            IndexStatus::kOk);
+  {
+    const AnswerResult r = Answer(*phone.index, phone.embedder.get(), nullptr,
+                                  source, "epoch key random derived", o);
+    EXPECT_FALSE(r.index_complete);
+    EXPECT_LT(r.segments_missing, missing.size());
+  }
+
+  // Fully caught up: complete, and searching as well as the device that did
+  // the work.
+  ShipSegments(&laptop, &phone);
+  ASSERT_TRUE(phone.index->Complete());
+  for (int t = 0; t < 4; ++t) {
+    const AnswerResult on_phone = Answer(*phone.index, phone.embedder.get(),
+                                         nullptr, source, kTopics[t], o);
+    const AnswerResult on_laptop = Answer(*laptop.index, laptop.embedder.get(),
+                                          nullptr, source, kTopics[t], o);
+    EXPECT_TRUE(on_phone.index_complete);
+    ASSERT_EQ(on_phone.passages.size(), on_laptop.passages.size())
+        << "topic " << t;
+    for (std::size_t i = 0; i < on_phone.passages.size(); ++i) {
+      EXPECT_EQ(on_phone.passages[i].object, on_laptop.passages[i].object)
+          << "topic " << t << " rank " << i;
+      EXPECT_EQ(on_phone.passages[i].start, on_laptop.passages[i].start);
+      EXPECT_NEAR(on_phone.passages[i].score, on_laptop.passages[i].score,
+                  1e-6);
+    }
+  }
+}
+
+// A LAPTOP THAT HAS BEEN OFFLINE CATCHES UP WITHOUT REDOING WORK.
+TEST(Replication, AnOfflineDeviceCatchesUpWithoutReindexing) {
+  Device a;
+  ASSERT_NO_FATAL_FAILURE(a.Open(0xA1));
+  Device b;
+  ASSERT_NO_FATAL_FAILURE(b.Open(0xB2));
+
+  ASSERT_NO_FATAL_FAILURE(a.IndexNote(1, kTopics[0]));
+  Ship(&a, &b);
+  ShipSegments(&a, &b);
+  ASSERT_TRUE(b.index->Complete());
+
+  // B goes away. A indexes the rest of the vault.
+  for (uint8_t i = 1; i < 4; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+        a.IndexNote(static_cast<uint8_t>(i + 1), kTopics[i]));
+  }
+  // B produced nothing while it was away.
+  EXPECT_TRUE(b.index->TakePending().empty());
+
+  // B comes back and pulls. THE WORK IS NOT REDONE: B embeds nothing, and its
+  // segments are byte-identical to A's because they ARE A's.
+  Ship(&a, &b);
+  const std::size_t pulled = ShipSegments(&a, &b);
+  EXPECT_EQ(pulled, 3u) << "B did not pull exactly the three it was missing";
+  EXPECT_TRUE(b.index->Complete());
+  EXPECT_EQ(a.index->SegmentIds(), b.index->SegmentIds());
+  EXPECT_TRUE(b.index->TakePending().empty())
+      << "catching up made B publish operations of its own, which means it "
+         "redid work rather than adopting it";
 }
 
 }  // namespace ai
