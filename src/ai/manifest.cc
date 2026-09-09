@@ -33,7 +33,8 @@ class Reader {
     if (at_ + 4 > s_.size()) return false;
     uint32_t x = 0;
     for (int i = 0; i < 4; ++i) {
-      x = (x << 8) | static_cast<uint8_t>(s_[at_ + static_cast<std::size_t>(i)]);
+      x = (x << 8) |
+          static_cast<uint8_t>(s_[at_ + static_cast<std::size_t>(i)]);
     }
     at_ += 4;
     *v = x;
@@ -43,7 +44,8 @@ class Reader {
     if (at_ + 8 > s_.size()) return false;
     uint64_t x = 0;
     for (int i = 0; i < 8; ++i) {
-      x = (x << 8) | static_cast<uint8_t>(s_[at_ + static_cast<std::size_t>(i)]);
+      x = (x << 8) |
+          static_cast<uint8_t>(s_[at_ + static_cast<std::size_t>(i)]);
     }
     at_ += 8;
     *v = x;
@@ -175,11 +177,27 @@ ManifestApply ManifestDoc::Apply(const ManifestOp& op) {
       }
       const std::map<SegmentId, SegmentState>::iterator it =
           segments_.find(op.segment);
+      if (it != segments_.end() && it->second.count == 0) {
+        // A PLACEHOLDER, NOT A PRIOR ADD. A tombstone or a retirement for a
+        // segment whose kAdd has not arrived creates an entry with no count --
+        // routinely, because operations overtake each other. Treating that as
+        // an existing add made the fold depend on arrival order: the kAdd was
+        // refused as a conflict and the count stayed zero, so a device that
+        // happened to see the tombstone first ended up with a different
+        // manifest from one that did not.
+        it->second.count = op.count;
+        it->second.bytes = op.bytes;
+        it->second.model = op.model;
+        it->second.added_at = op.id;
+        it->second.added_by = op.id.replica;
+        ++applied_;
+        return ManifestApply::kApplied;
+      }
       if (it != segments_.end()) {
-        // A SECOND kAdd FOR ONE SEGMENT IS NORMAL AND MUST AGREE. Segments are
-        // content addressed, so two devices that build the same one really did
-        // build the same bytes; disagreement about the count means one of them
-        // is lying or the id has collided, and neither should be absorbed
+        // A SECOND REAL kAdd FOR ONE SEGMENT IS NORMAL AND MUST AGREE. Segments
+        // are content addressed, so two devices that build the same one really
+        // did build the same bytes; disagreement about the count means one of
+        // them is lying or the id has collided, and neither should be absorbed
         // quietly.
         if (it->second.count != op.count) {
           return ManifestApply::kMalformed;
@@ -283,11 +301,10 @@ CompactionPlan PlanCompaction(const ManifestDoc& manifest,
 
   // Ordered by size then by id: size is what tiering is about, and the id
   // breaks ties so the order is total rather than whatever sort happened to do.
-  std::sort(entries.begin(), entries.end(),
-            [](const Entry& a, const Entry& b) {
-              if (a.count != b.count) return a.count < b.count;
-              return a.id < b.id;
-            });
+  std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+    if (a.count != b.count) return a.count < b.count;
+    return a.id < b.id;
+  });
 
   // TIERED, WHICH IS WHAT KEEPS A ROUTINE MERGE FROM REWRITING THE INDEX.
   // Phase 4 measured an all-or-nothing compaction of a 13,838-vector index at

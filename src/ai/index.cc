@@ -940,9 +940,23 @@ void Index::Prune() {
 }
 
 std::vector<SegmentId> Index::Missing() const {
+  const Impl& im = *impl_;
   std::vector<SegmentId> out;
-  for (const SegmentId& id : impl_->manifest->Wanted()) {
-    if (!impl_->Present(id)) out.push_back(id);
+  for (const SegmentId& id : im.manifest->Wanted()) {
+    if (im.Present(id)) continue;
+    // NOT WANTED IF SOMETHING PRESENT HAS REPLACED IT. A retired segment stays
+    // in the fold forever -- the lattice is grow-only -- so asking for
+    // everything the manifest names would make a device re-fetch the very
+    // segments it correctly discarded after compaction, and it would never stop
+    // reporting itself incomplete.
+    const SegmentState* st = im.manifest->Get(id);
+    bool replaced = false;
+    if (st != nullptr) {
+      for (const SegmentId& by : st->superseded_by) {
+        if (im.Present(by)) replaced = true;
+      }
+    }
+    if (!replaced) out.push_back(id);
   }
   return out;
 }

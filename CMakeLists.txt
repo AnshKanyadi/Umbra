@@ -308,6 +308,7 @@ add_executable(umbra_test
   test/embed_test.cc
   test/index_test.cc
   test/enroll_test.cc
+  test/replicate_test.cc
   test/relay_test.cc
   test/oplog_test.cc
   test/converge_test.cc
