@@ -1934,12 +1934,20 @@ std::vector<ai::SegmentId> LiveFor(const IndexPeer& p) {
       [&p](const ai::SegmentId& id) { return p.Present(id); });
 }
 
+// EVERYTHING THE FOLD DECIDED, not just which ids are live. The first version
+// compared ids and dead-counts only, so a peer whose fold had lost a segment's
+// COUNT -- which is what happens when a placeholder entry is mistaken for a
+// prior add -- compared equal to one that had not. Deliberate breakage caught
+// the defect in a unit test and not here, and this is why.
 std::string StateOf(const IndexPeer& p) {
   std::string out;
   for (const ai::SegmentId& id : LiveFor(p)) {
-    out += id.Short();
     const ai::SegmentState* st = p.manifest->Get(id);
-    out += ":" + std::to_string(st == nullptr ? 0 : st->dead.size());
+    out += id.Short();
+    out += ":n" + std::to_string(st == nullptr ? 0 : st->count);
+    out += ":b" + std::to_string(st == nullptr ? 0 : st->bytes);
+    out += ":d" + std::to_string(st == nullptr ? 0 : st->dead.size());
+    out += ":s" + std::to_string(st == nullptr ? 0 : st->superseded_by.size());
     out += ";";
   }
   return out;
