@@ -280,9 +280,14 @@ struct Options {
 };
 
 ReplicaId ReplicaFor(const Options& o) {
-  // Falls back to the index directory only when there is no vault to anchor to,
-  // which is --stats and --compact. Those are local and never publish, so the
-  // id they use never reaches another device.
+  // Falls back to the index directory only for --stats, which reads and
+  // publishes nothing, so the id it uses never reaches another device.
+  //
+  // --compact used to be on that list and did not belong there: compaction
+  // emits kAdd and kRetire operations (src/ai/index.cc:843), so a compaction
+  // run without --vault would sign them as a device that exists nowhere else,
+  // mint a second keypair under the index directory, and publish under an
+  // identity the vault has never enrolled. main() now refuses that.
   const std::string anchor = o.vault.empty() ? o.index_dir : o.vault;
   return LoadOrCreateDeviceKeys(anchor).Replica();
 }
@@ -839,20 +844,49 @@ int Pull(const Options& o) {
   std::size_t pulled = 0;
   uint64_t pulled_bytes = 0;
   std::size_t failed = 0;
-  for (const SegmentId& id : index->Missing()) {
-    std::string sealed;
-    if (h.client->PullSegment(id.bytes, &sealed) != sync::SyncStatus::kOk) {
-      ++failed;
-      continue;
-    }
-    const IndexStatus s = index->AdoptSegment(sealed);
-    if (s == IndexStatus::kOk) {
-      ++pulled;
-      pulled_bytes += sealed.size();
-    } else {
-      ++failed;
-      std::printf("  segment %s refused: %s\n", id.Short().c_str(),
-                  IndexStatusName(s));
+  // REPLACEMENTS FIRST, THE SEGMENTS THEY RETIRE SECOND.
+  //
+  // A segment that a retirement is waiting on is genuinely still live -- the
+  // safety condition says so, and MissingFrom lists it -- but it stops being
+  // wanted the instant its replacement arrives. Fetching in manifest order
+  // therefore spends a round trip on each of them for nothing.
+  //
+  // This was invisible on localhost and glaring on a network: a cold pull of a
+  // compacted 2000-note index made 2000 doomed fetches, 0.5 seconds at a
+  // sub-millisecond round trip and about seven minutes at 200ms. The second
+  // pass re-reads Missing(), which by then excludes every one of them.
+  std::set<std::string> tried;
+  for (int pass = 0; pass < 2; ++pass) {
+    for (const SegmentId& id : index->Missing()) {
+      const std::string key(reinterpret_cast<const char*>(id.bytes.data()),
+                            id.bytes.size());
+      if (pass == 0) {
+        // Retired in favour of something else, so its replacement is in this
+        // same list and fetching that one first makes this one unwanted.
+        //
+        // Not Index::AwaitingReplacement, which answers a different question:
+        // it reports what THIS DEVICE HOLDS and has not yet been able to drop,
+        // so a cold puller -- the case that matters -- gets an empty list from
+        // it and defers nothing.
+        const SegmentState* st = index->manifest().Get(id);
+        if (st != nullptr && !st->superseded_by.empty()) continue;
+      }
+      if (!tried.insert(key).second) continue;
+      if (!tried.insert(key).second) continue;
+      std::string sealed;
+      if (h.client->PullSegment(id.bytes, &sealed) != sync::SyncStatus::kOk) {
+        ++failed;
+        continue;
+      }
+      const IndexStatus s = index->AdoptSegment(sealed);
+      if (s == IndexStatus::kOk) {
+        ++pulled;
+        pulled_bytes += sealed.size();
+      } else {
+        ++failed;
+        std::printf("  segment %s refused: %s\n", id.Short().c_str(),
+                    IndexStatusName(s));
+      }
     }
   }
   const double byte_seconds = Since(b0);
@@ -983,6 +1017,14 @@ int main(int argc, char** argv) {
   }
   if (o.index_dir.empty()) {
     Usage();
+    return 2;
+  }
+  // EVERY COMMAND THAT PUBLISHES NEEDS A VAULT, because the vault is where this
+  // device's identity lives. --stats is the one that does not publish.
+  if (o.vault.empty() && !o.stats) {
+    std::fprintf(stderr,
+                 "--vault is required: the device identity that signs manifest "
+                 "operations lives beside the vault, not beside the index\n");
     return 2;
   }
   if (o.build) return Build(o);  // --compact modifies it rather than replacing

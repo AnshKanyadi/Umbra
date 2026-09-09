@@ -1209,5 +1209,72 @@ TEST(Replication, AnAnnouncedLegacyIndexPublishesAFollowableChain) {
   EXPECT_EQ(b.index->Stats().segments, a.index->Stats().segments);
 }
 
+// A COLD PULLER DOES NOT FETCH WHAT COMPACTION ALREADY RETIRED.
+//
+// MissingFrom is right to list a retired segment: the safety condition keeps it
+// live until its replacement is present, and a device that dropped it early
+// would lose data. But a puller that walks that list in manifest order asks for
+// every retired segment before the one that retires them, and each of those is
+// a round trip for bytes the relay does not have and that stop being wanted a
+// moment later.
+//
+// Free on localhost, ruinous on a network: a cold pull of a compacted
+// 2000-note index made 2000 doomed fetches, half a second at a sub-millisecond
+// round trip and about seven minutes at 200ms. cmd/ai_main.cc orders the fetch
+// so replacements come first; this pins the property that makes that possible.
+TEST(Replication, WhatCompactionRetiredIsNotWantedOnceItsReplacementIsHeld) {
+  Device a;
+  ASSERT_NO_FATAL_FAILURE(a.Open(0xA1));
+  for (uint8_t i = 0; i < 4; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+        a.IndexNote(static_cast<uint8_t>(i + 1), kTopics[i % 4]));
+  }
+  uint32_t merged = 0;
+  uint32_t reclaimed = 0;
+  ASSERT_EQ(a.index->Compact(2, 10, &merged, &reclaimed), IndexStatus::kOk);
+  ASSERT_GT(merged, 1u);
+
+  Device b;
+  ASSERT_NO_FATAL_FAILURE(b.Open(0xB2));
+  ASSERT_GT(Ship(&a, &b), 0u);
+
+  // Everything is wanted, and most of it is a segment A no longer holds.
+  //
+  // Note which question separates them. Index::AwaitingReplacement answers
+  // "what do I hold that I cannot drop yet", which for a cold puller is
+  // nothing; the useful one is whether the manifest has retired it, which is
+  // `superseded_by` and which a device with no segments can still answer.
+  const std::vector<SegmentId> want = b.index->Missing();
+  EXPECT_TRUE(b.index->AwaitingReplacement().empty())
+      << "a device holding no segments cannot be waiting to drop one";
+  std::size_t retired = 0;
+  for (const SegmentId& id : want) {
+    const SegmentState* st = b.index->manifest().Get(id);
+    if (st != nullptr && !st->superseded_by.empty()) ++retired;
+  }
+  EXPECT_EQ(retired, static_cast<std::size_t>(merged));
+  EXPECT_GT(want.size(), retired)
+      << "nothing here supersedes anything, so the ordering has no work to do";
+
+  // The replacement is what A actually still has. Adopt only that.
+  std::size_t adopted = 0;
+  for (const SegmentId& id : want) {
+    const SegmentState* st = b.index->manifest().Get(id);
+    if (st != nullptr && !st->superseded_by.empty()) continue;
+    const std::string sealed = a.SealedBytes(id);
+    ASSERT_FALSE(sealed.empty()) << "a segment nobody deferred is not held";
+    ASSERT_EQ(b.index->AdoptSegment(sealed), IndexStatus::kOk);
+    ++adopted;
+  }
+  EXPECT_GT(adopted, 0u);
+
+  // And now nothing else is wanted: every one of those round trips would have
+  // been spent on bytes this device stopped needing.
+  EXPECT_TRUE(b.index->Missing().empty())
+      << b.index->Missing().size() << " segment(s) still wanted after the "
+      << "replacement arrived";
+  EXPECT_TRUE(b.index->Complete());
+}
+
 }  // namespace ai
 }  // namespace umbra
