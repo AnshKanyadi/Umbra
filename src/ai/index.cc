@@ -216,6 +216,13 @@ IndexStatus Index::Open(const std::string& dir, const VaultKeys* keys,
       batch.Set(basalt::Slice(key), basalt::Slice(value));
       basalt::wal::SeqNum seq = 0;
       if (!im.db->Write(batch, &seq).ok()) return IndexStatus::kStoreFailed;
+      // SYNCED, because this is the record that decides whether the store will
+      // ever accept a different model. Without it, an index created and closed
+      // without anything being added forgot its own identity, and the next
+      // open adopted whatever model it was given -- which is precisely the
+      // silent mixing of two vector spaces the identity exists to prevent.
+      basalt::wal::SeqNum watermark = 0;
+      if (!im.db->Sync(&watermark).ok()) return IndexStatus::kStoreFailed;
     }
   }
 

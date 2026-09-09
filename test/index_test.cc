@@ -611,5 +611,130 @@ TEST(Index, SurvivesAReopenWithSeparatelyDerivedKeys) {
   EXPECT_FALSE(hits.empty());
 }
 
+// AN EMPTY INDEX STILL HAS AN IDENTITY.
+//
+// Deliberate breakage found this gap: removing the model check from the
+// manifest did NOT fail RefusesAnIndexBuiltByAnotherModel, because
+// Segment::Open checks the model too and there was a segment to check. The
+// manifest check is only load-bearing when there are no segments yet -- a vault
+// that has been opened and not yet indexed -- and nothing covered that.
+//
+// Without it, an empty index would silently adopt whichever model opened it
+// next and then mix two vector spaces as soon as anything was added.
+TEST(Index, RefusesAModelChangeOnAnIndexWithNoSegments) {
+  TempDir dir;
+  VaultKeys keys = MakeKeys();
+  std::unique_ptr<Embedder> a = NewHashingEmbedder(96);
+  std::unique_ptr<Embedder> b = NewHashingEmbedder(128);
+  ASSERT_NE(a->id(), b->id());
+  {
+    std::unique_ptr<Index> idx;
+    ASSERT_EQ(Index::Open(dir.path(), &keys, 0, a->id(), a->dimension(), &idx),
+              IndexStatus::kOk);
+    EXPECT_EQ(idx->Stats().segments, 0u) << "the point is that it is empty";
+  }
+  std::unique_ptr<Index> wrong;
+  EXPECT_EQ(Index::Open(dir.path(), &keys, 0, b->id(), b->dimension(), &wrong),
+            IndexStatus::kModelMismatch);
+}
+
+// THE AEAD IS WHAT REFUSES A TAMPERED SEGMENT; the plaintext digest in the
+// header is a second check on the same thing.
+//
+// Deliberate breakage showed removing the digest comparison does not fail
+// RefusesASegmentThatWasAlteredOnDisk, because the AEAD already rejects altered
+// ciphertext. The digest is not pointless -- it also serves as the nonce and as
+// the associated data, so it binds the header to the body -- but it is not what
+// catches tampering, and a comment claiming otherwise would be wrong.
+//
+// This asserts the property directly at the segment layer, so the redundancy is
+// recorded rather than assumed.
+TEST(Segment, BothTheAeadAndTheDigestRefuseATamperedBody) {
+  VaultKeys keys = MakeKeys();
+  std::unique_ptr<Embedder> e = NewHashingEmbedder(64);
+  const Corpus c = BuildCorpus(e.get(), 2);
+
+  std::vector<SegmentEntry> entries;
+  for (const Chunk& ch : c.chunks[0]) {
+    SegmentEntry se;
+    se.object = ch.object;
+    se.start = ch.start;
+    se.end = ch.end;
+    se.ordinal = ch.ordinal;
+    se.kind = ch.kind;
+    se.heading_path = ch.heading_path;
+    entries.push_back(se);
+  }
+  std::string plaintext;
+  ASSERT_EQ(Segment::Build(e->id(), e->dimension(), entries, c.vectors[0],
+                           &plaintext),
+            SegmentStatus::kOk);
+  std::string sealed;
+  SegmentId id;
+  ASSERT_EQ(Segment::Seal(keys, 0, plaintext, &sealed, &id),
+            SegmentStatus::kOk);
+
+  std::unique_ptr<Segment> ok;
+  ASSERT_EQ(Segment::Open(keys, sealed, e->id(), &ok), SegmentStatus::kOk);
+
+  // Flip a byte in the ciphertext body.
+  std::string body_tampered = sealed;
+  body_tampered[body_tampered.size() - 8] =
+      static_cast<char>(body_tampered[body_tampered.size() - 8] ^ 0x40);
+  std::unique_ptr<Segment> bad;
+  EXPECT_EQ(Segment::Open(keys, body_tampered, e->id(), &bad),
+            SegmentStatus::kAuthFailed);
+
+  // And a byte in the header's digest, which is the associated data.
+  std::string header_tampered = sealed;
+  header_tampered[12] = static_cast<char>(header_tampered[12] ^ 0x01);
+  EXPECT_EQ(Segment::Open(keys, header_tampered, e->id(), &bad),
+            SegmentStatus::kAuthFailed);
+
+  // A SEGMENT SEALED UNDER ANOTHER VAULT'S KEY DOES NOT OPEN.
+  std::array<uint8_t, kSaltBytes> other_salt{};
+  other_salt.fill(77);
+  VaultKeys other;
+  ASSERT_EQ(VaultKeys::Create("a different vault", other_salt, Fast(), &other),
+            CryptoStatus::kOk);
+  EXPECT_EQ(Segment::Open(other, sealed, e->id(), &bad),
+            SegmentStatus::kAuthFailed);
+}
+
+// The determinism claim at the segment layer, stated directly: the same vectors
+// seal to the same bytes.
+TEST(Segment, SealingIsReproducible) {
+  VaultKeys keys = MakeKeys();
+  std::unique_ptr<Embedder> e = NewHashingEmbedder(64);
+  const Corpus c = BuildCorpus(e.get(), 2);
+  std::vector<SegmentEntry> entries;
+  for (const Chunk& ch : c.chunks[0]) {
+    SegmentEntry se;
+    se.object = ch.object;
+    se.start = ch.start;
+    se.end = ch.end;
+    se.ordinal = ch.ordinal;
+    se.kind = ch.kind;
+    entries.push_back(se);
+  }
+  std::string p1;
+  std::string p2;
+  ASSERT_EQ(Segment::Build(e->id(), e->dimension(), entries, c.vectors[0], &p1),
+            SegmentStatus::kOk);
+  ASSERT_EQ(Segment::Build(e->id(), e->dimension(), entries, c.vectors[0], &p2),
+            SegmentStatus::kOk);
+  EXPECT_EQ(p1, p2) << "two builds over identical vectors differ";
+
+  std::string s1;
+  std::string s2;
+  SegmentId i1;
+  SegmentId i2;
+  ASSERT_EQ(Segment::Seal(keys, 0, p1, &s1, &i1), SegmentStatus::kOk);
+  ASSERT_EQ(Segment::Seal(keys, 0, p2, &s2, &i2), SegmentStatus::kOk);
+  EXPECT_EQ(s1, s2) << "sealing is not reproducible, so segments cannot be "
+                       "content addressed";
+  EXPECT_EQ(i1, i2);
+}
+
 }  // namespace ai
 }  // namespace umbra
