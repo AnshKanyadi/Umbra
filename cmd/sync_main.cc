@@ -933,14 +933,31 @@ int main(int argc, char** argv) {
     const auto push_start = std::chrono::steady_clock::now();
     std::size_t pushed = 0;
     std::size_t n = 0;
-    if (client.PushObject(TreeObject(), &n) == sync::SyncStatus::kOk)
+    // A ROUND THAT REACHED NOBODY IS NOT A QUIET ROUND. Every call below
+    // already returned kUnreachable when the relay was gone and every one of
+    // them was discarded, so a dead relay printed "0 pushed, 0 applied, 0
+    // devices" -- the same line as a vault with nothing to do -- and exited
+    // zero. Two containers ran for several minutes against a relay that had
+    // crashed, both reporting healthy rounds. Silence about a network failure
+    // is the one thing a sync client must not do.
+    bool unreachable = false;
+    if (client.PushObject(TreeObject(), &n) == sync::SyncStatus::kOk) {
       pushed += n;
+    } else {
+      unreachable = true;
+    }
     for (const std::pair<std::string, ObjectId>& kv : v.tree().Listing()) {
       if (v.tree().IsDir(kv.second)) continue;
-      if (client.PushObject(kv.second, &n) == sync::SyncStatus::kOk)
+      if (client.PushObject(kv.second, &n) == sync::SyncStatus::kOk) {
         pushed += n;
+      } else {
+        unreachable = true;
+      }
     }
-    (void)client.PublishReport(v.clock()->counter(), {TreeObject()}, me);
+    if (client.PublishReport(v.clock()->counter(), {TreeObject()}, me) !=
+        sync::SyncStatus::kOk) {
+      unreachable = true;
+    }
     const double push_seconds = SecondsSince(push_start);
 
     const auto pull_start = std::chrono::steady_clock::now();
@@ -958,6 +975,8 @@ int main(int argc, char** argv) {
           d.bytes = s.device.bytes;
           devices.push_back(d);
         }
+      } else {
+        unreachable = true;
       }
     }
 
@@ -1049,9 +1068,19 @@ int main(int argc, char** argv) {
         key_seconds, push_seconds, pull_seconds, SecondsSince(t0),
         stale ? "  RELAY LOOKS STALE" : "");
     if (stale && verbose) std::printf("  %s\n", why.c_str());
+    if (unreachable) {
+      std::fprintf(stderr,
+                   "  cannot reach the relay at %s. Nothing was pushed or "
+                   "pulled this round.\n",
+                   relay.c_str());
+    }
     std::fflush(stdout);
 
-    if (!watch) break;
+    // A single round that reached nobody is a failure, and the exit status has
+    // to say so: --once in a cron entry or a shell && chain is the whole
+    // audience for this. --watch keeps going, because a relay that comes back
+    // is the ordinary case there.
+    if (!watch) return unreachable ? 1 : 0;
     struct timespec ts;
     ts.tv_sec = interval;
     ts.tv_nsec = 0;
