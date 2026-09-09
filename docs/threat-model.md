@@ -234,6 +234,57 @@ hold, and it does not learn the passphrase, which never leaves a device. What it
 learns is that the household grew, which is the same class of fact as §5.3 and
 is not separable from having an enrolment mechanism at all.
 
+### 5.9 The index: segment sizes, counts, and when a device indexes — **mostly not mitigated**
+
+Phase 5 replicates the vector index through the relay. The segments are sealed
+and `RelayEndToEnd.TheRelayHoldsNoPartOfAnIndexSegment` asserts over every byte
+the relay returns and every byte it writes that they contain no note text, no
+heading, no path, no vector, and not even the embedding model's identity.
+
+What the relay does learn, each named and each answered honestly:
+
+| What | Mitigated | Why |
+|---|---|---|
+| The **size** of each segment | **No** | It stores the bytes. Padding was declined for note payloads in §5.1 and the same reasoning applies here. |
+| The **number** of segments | **No** | It answers `list-segments`, which a client needs to know what to fetch. |
+| **Index growth over time** | **No** | Follows from the two above, observed repeatedly. |
+| **How often a device indexes** | **No** | A push is a push. §5.2 already concedes per-message timing. |
+| **Which device pushed a segment** | **Partly** | The relay sees the connection, not the content; a segment carries no author. But a device that only ever pushes from one address is trivially correlated. |
+| The **content address** of each segment | **No** | It is the storage key. It also means two devices that build the same segment are visibly building the same segment. |
+| The **embedding model** | **Yes** | Inside the sealed body. Asserted in the test above. |
+| **How many vectors** a segment holds | **Yes**, approximately | Not stated on the wire, but strongly implied by size: vectors dominate a segment and are fixed width. Treat this as leaked. |
+
+**The adversary who watches segment sizes as a user writes.** This is the
+interesting case and it is a real exposure.
+
+Indexing is incremental by design: editing one note produces one small segment
+holding only that note's chunks. Segment size is therefore roughly proportional
+to how much was written, and the timing is roughly when it was written. A relay
+that records `(time, size)` for every push gets a writing diary: how much you
+wrote, when, in what bursts, and — after a compaction — how large the corpus has
+become. Correlated with the operation stream from §5.2, which already leaks
+edit timing, it sharpens rather than duplicates: the operation stream says *an
+edit happened*, the segment size says *roughly how much text it produced*.
+
+It gets worse with a small vault. If the relay knows a device indexed exactly
+one note and the segment is 12 KB, it knows the note is around a dozen chunks,
+which is a few thousand words. That is not the content, and it is more than
+"nothing".
+
+**What is done about it: nothing, deliberately, and here is the cost of the
+alternatives.** Padding every segment to a bucket boundary would blunt the size
+signal at the cost of storage and bandwidth on exactly the artefact that is
+already the largest thing this project moves. Batching pushes on a timer would
+blunt the timing signal at the cost of making a second device wait for search
+results that already exist. Both are real options and both were declined, for
+the same reason §5.1 declined padding: they buy a partial defence against a
+metadata channel that is already conceded elsewhere in the same document, and
+they charge for it in the two resources a local-first tool has least of.
+
+**The honest summary is that a hostile relay learns roughly how much you write
+and when.** It does not learn what. If that is unacceptable, the answer is the
+one §5.6 already gives: host the relay yourself, where the observer is you.
+
 ### 5.7 Summary
 
 | What the relay learns | Mitigated? | How, or why not |
@@ -250,6 +301,10 @@ is not separable from having an enrolment mechanism at all.
 | Whether a client is missing an operation | Yes | Encrypted back-pointer chain; the cursor refuses to advance across a gap |
 | Whether the relay is withholding everything newer | **Detected, not prevented** | A denial of service that holds log compaction hostage; see §5.6 |
 | That a device enrolled, and when | **No** | Inseparable from having an enrolment mechanism; see §5.8 |
+| Index segment sizes and push times | **No** | Roughly how much you write and when; see §5.9 |
+| Index segment count and growth | **No** | Needed for a client to know what to fetch; see §5.9 |
+| Note text, headings, paths or vectors in a segment | Yes | Sealed; asserted over the bytes in relay_test.cc |
+| Which embedding model built a segment | Yes | Inside the sealed body |
 | Who sealed an enrolment grant | **Detected, not prevented** | A pairing code the user compares; see §6a |
 
 Five of the first nine rows are "no". That ratio is what an encrypted-blob store

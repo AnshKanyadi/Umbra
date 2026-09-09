@@ -23,6 +23,10 @@
 #include "scan.h"
 #include "server.h"
 #include "store.h"
+#include "umbra/ai/chunk.h"
+#include "umbra/ai/embed.h"
+#include "umbra/ai/index.h"
+#include "umbra/ai/segment.h"
 #include "umbra/crdt/oplog.h"
 #include "umbra/crdt/vault.h"
 #include "umbra/sync/client.h"
@@ -795,4 +799,174 @@ TEST_F(HostileRelay, TheCursorEqualsTheMarkAfterAWithheldOperation) {
 }
 
 }  // namespace
+
+// WHAT THE RELAY LEARNS FROM AN INDEX SEGMENT, ASSERTED OVER ITS BYTES.
+//
+// This is the claim the project is built on, extended to the thing Phase 5
+// added. Vectors encode a great deal about the text that produced them, so a
+// segment left in the clear would give a relay far more than the operations do.
+//
+// The test asserts the negative over every byte the relay holds -- returned and
+// on disk -- and then asserts the positives too: what it CAN see is written
+// down in the same test, so nobody has to take a prose claim on faith.
+TEST(RelayEndToEnd, TheRelayHoldsNoPartOfAnIndexSegment) {
+  TempDir dir;
+  // Distinctive strings that appear in the note, in its path, and therefore in
+  // the chunk text a segment was built from.
+  const std::string kBody =
+      "SEGMENT-SECRET-zzyzx-hyperborea. The quarterly figures for Antarctica "
+      "were falsified by Ozymandias in the month of Thermidor.";
+  const std::string kHeading = "SEGMENT-HEADING-frobozz";
+  const std::string kPath = "SEGMENT-PATH-xyzzy.md";
+
+  RunningRelay relay_(dir.path() + "/relay");
+  VaultKeys keys;
+  ASSERT_EQ(VaultKeys::Create("pass", FixedSalt(3), FastParams(), &keys),
+            CryptoStatus::kOk);
+  {
+    const SecretKey e0 = DeriveSubkey(keys.root(), 0, "umbRlySg");
+    keys.OverwriteEpochForBootstrap(0, e0);
+  }
+  const ReplicaId dev = ReplicaIdFromSeed(9);
+
+  // Build a real index over a real note.
+  std::unique_ptr<ai::Embedder> embedder = ai::NewHashingEmbedder(96);
+  ASSERT_NE(embedder, nullptr);
+  std::unique_ptr<ai::Index> index;
+  ASSERT_EQ(ai::Index::Open(dir.path() + "/idx", &keys, 0, embedder->id(),
+                            embedder->dimension(), dev, &index),
+            ai::IndexStatus::kOk);
+  ObjectId object;
+  object.bytes.fill(0x5E);
+  const std::string doc = "# " + kHeading + "\n\n" + kBody + "\n";
+  std::vector<ai::Chunk> chunks;
+  ASSERT_EQ(ai::ChunkMarkdown(object, doc, &chunks), ai::ChunkStatus::kOk);
+  ASSERT_FALSE(chunks.empty());
+  std::vector<std::string> texts;
+  for (const ai::Chunk& c : chunks) texts.push_back(c.text);
+  std::vector<ai::Vector> vs;
+  ASSERT_EQ(embedder->EmbedDocuments(texts, &vs), ai::EmbedStatus::kOk);
+  ASSERT_EQ(index->PutObject(object, chunks, vs), ai::IndexStatus::kOk);
+
+  const std::vector<ai::SegmentId> ids = index->SegmentIds();
+  ASSERT_EQ(ids.size(), 1u);
+  std::string sealed;
+  {
+    const std::string path =
+        dir.path() + "/idx/segments/" + ids[0].Hex() + ".seg";
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    ASSERT_NE(f, nullptr);
+    char buf[65536];
+    std::size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) sealed.append(buf, n);
+    std::fclose(f);
+  }
+  ASSERT_FALSE(sealed.empty());
+
+  // Push it through the same relay the operations use.
+  std::unique_ptr<OpLog> log;
+  ASSERT_EQ(OpLog::OpenEncrypted(dir.path() + "/c", &keys, &log),
+            LogStatus::kOk);
+  std::unique_ptr<sync::Transport> t =
+      sync::NewTcpTransport("127.0.0.1", relay_.port());
+  sync::Client client(TestVault(), dev, &keys, log.get(), t.get());
+  ASSERT_EQ(client.PushSegment(ids[0].bytes, sealed), sync::SyncStatus::kOk);
+  ASSERT_EQ(relay_.store()->Sync(), relay::StoreStatus::kOk);
+
+  // 1. WHAT THE RELAY HANDS BACK holds none of it.
+  std::string served;
+  ASSERT_EQ(client.PullSegment(ids[0].bytes, &served), sync::SyncStatus::kOk);
+  EXPECT_EQ(served, sealed) << "the round trip did not preserve the segment";
+  EXPECT_FALSE(Contains(served, kBody)) << "the note text is in the segment";
+  EXPECT_FALSE(Contains(served, kHeading)) << "the heading is in the segment";
+  EXPECT_FALSE(Contains(served, kPath));
+  EXPECT_FALSE(Contains(served, kBody.substr(0, 16)));
+  EXPECT_FALSE(Contains(served, "Ozymandias"));
+  EXPECT_FALSE(Contains(served, "Antarctica"));
+
+  // NO MODEL IDENTITY EITHER. It is inside the sealed body, not beside it: a
+  // relay that knew which model built a segment would learn which devices can
+  // read it and when a vault re-embedded.
+  const std::string model_bytes(
+      reinterpret_cast<const char*>(embedder->id().bytes.data()),
+      embedder->id().bytes.size());
+  EXPECT_FALSE(Contains(served, model_bytes))
+      << "the embedding model identity is visible on the wire";
+
+  // NO VECTOR EITHER. A float from the segment, in its wire form, must not
+  // appear in what the relay holds.
+  {
+    const float* v = nullptr;
+    std::unique_ptr<ai::Segment> opened;
+    ASSERT_EQ(ai::Segment::Open(keys, sealed, embedder->id(), &opened),
+              ai::SegmentStatus::kOk);
+    ASSERT_GT(opened->count(), 0u);
+    v = opened->vector(0);
+    ASSERT_NE(v, nullptr);
+    // The first four floats as the segment writes them: big-endian bit
+    // patterns. If these appear in the sealed bytes the vectors are in clear.
+    std::string probe;
+    for (uint32_t i = 0; i < 4 && i < opened->dimension(); ++i) {
+      uint32_t bits = 0;
+      std::memcpy(&bits, v + i, sizeof(bits));
+      for (int k = 3; k >= 0; --k) {
+        probe.push_back(static_cast<char>((bits >> (k * 8)) & 0xFF));
+      }
+    }
+    ASSERT_EQ(probe.size(), 16u);
+    EXPECT_FALSE(Contains(served, probe)) << "vectors are on the wire in clear";
+  }
+
+  // 2. NOR ANYWHERE ON THE RELAY'S DISK.
+  std::string on_disk;
+  WalkSubtree(dir.path() + "/relay", dir.path() + "/relay",
+              [&on_disk](const std::string& p, const FileState& st) {
+                if (st.is_dir) return;
+                const int fd = ::open(p.c_str(), O_RDONLY);
+                if (fd < 0) return;
+                char buf[8192];
+                for (;;) {
+                  const ssize_t r = ::read(fd, buf, sizeof(buf));
+                  if (r <= 0) break;
+                  on_disk.append(buf, static_cast<std::size_t>(r));
+                }
+                ::close(fd);
+              });
+  EXPECT_GT(on_disk.size(), sealed.size() / 2)
+      << "the relay wrote almost nothing, so this proves little";
+  EXPECT_FALSE(Contains(on_disk, kBody)) << "note text on the relay's disk";
+  EXPECT_FALSE(Contains(on_disk, kHeading));
+  EXPECT_FALSE(Contains(on_disk, "Ozymandias"));
+  EXPECT_FALSE(Contains(on_disk, model_bytes))
+      << "model identity on the relay's disk";
+
+  // 3. AND IT CANNOT OPEN WHAT IT HOLDS. Not "we withheld the key" -- the bytes
+  // do not parse as a segment under any key the relay could construct.
+  {
+    VaultKeys other;
+    ASSERT_EQ(VaultKeys::Create("a relay guessing", FixedSalt(4), FastParams(),
+                                &other),
+              CryptoStatus::kOk);
+    std::unique_ptr<ai::Segment> opened;
+    EXPECT_EQ(ai::Segment::Open(other, served, embedder->id(), &opened),
+              ai::SegmentStatus::kAuthFailed);
+  }
+
+  // 4. WHAT IT DOES LEARN, ASSERTED RATHER THAN CONCEDED IN PROSE.
+  //
+  // The size, the count, and the timing. These are real and are not mitigated;
+  // docs/threat-model.md section 5.9 says so and this is the test that keeps
+  // that section honest.
+  relay::ListSegmentsRequest lr;
+  lr.vault = TestVault();
+  relay::SegmentListResponse lresp;
+  ASSERT_EQ(relay_.store()->ListSegments(lr, &lresp), relay::StoreStatus::kOk);
+  ASSERT_EQ(lresp.segments.size(), 1u);
+  EXPECT_EQ(lresp.segments[0].bytes, sealed.size())
+      << "the relay knows the exact size of every segment, and this test "
+         "asserts that rather than pretending otherwise";
+  EXPECT_EQ(lresp.segments[0].segment, ids[0].bytes)
+      << "the relay knows the content address of every segment";
+}
+
 }  // namespace umbra
