@@ -27,7 +27,11 @@ class TempDir {
     path_ = (p != nullptr) ? p : "";
   }
   ~TempDir() {
-    if (!path_.empty()) (void)std::system(("rm -rf '" + path_ + "'").c_str());
+    // ASSIGNED, NOT CAST TO VOID. GCC's warn_unused_result is not silenced by
+    // a (void) cast, so the idiom clang accepts is a build error there.
+    if (path_.empty()) return;
+    const int rc = std::system(("rm -rf '" + path_ + "'").c_str());
+    (void)rc;
   }
   const std::string& path() const { return path_; }
 

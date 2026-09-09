@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <set>
@@ -36,10 +37,12 @@ class TempDir {
     path_ = (p != nullptr) ? p : "";
   }
   ~TempDir() {
-    if (!path_.empty()) {
-      const std::string cmd = "rm -rf '" + path_ + "'";
-      (void)std::system(cmd.c_str());
-    }
+    if (path_.empty()) return;
+    // Assigned rather than cast to void: GCC's warn_unused_result is not
+    // silenced by a (void) cast.
+    const std::string cmd = "rm -rf '" + path_ + "'";
+    const int rc = std::system(cmd.c_str());
+    (void)rc;
   }
   const std::string& path() const { return path_; }
 
