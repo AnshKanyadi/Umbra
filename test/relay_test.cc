@@ -1414,4 +1414,41 @@ TEST(RelayEndToEnd, ManyDevicesSyncingAtOnceDoNotKillTheRelay) {
   }
 }
 
+// A REPLY IS FRAMED AND A REQUEST BODY IS NOT, so the opcode is at a different
+// offset in each. HandleRequest returns a framed reply; the server has already
+// consumed the request's 4 byte length header by the time it has a body. Peek
+// at a reply's first byte and you read the low byte of a length and get a
+// perfectly valid opcode name for it -- the relay's --verbose output claimed
+// "put-segment ... -> put-envelope" until this was understood.
+TEST(RelayWire, TheOpcodeIsAtAnotherOffsetInAReply) {
+  const std::string reply = relay::EncodeError("nope");
+  ASSERT_GT(reply.size(), 4u);
+
+  relay::Op at_four = relay::Op::kPush;
+  const std::string fifth(1, reply[4]);
+  ASSERT_TRUE(relay::PeekOp(fifth, &at_four));
+  EXPECT_EQ(at_four, relay::Op::kError);
+
+  // And the first byte is a length, which happens to name an opcode. This is
+  // the assertion that matters: it is not a decode failure a caller would
+  // notice, it is a wrong answer.
+  relay::Op at_zero = relay::Op::kError;
+  const bool decoded = relay::PeekOp(reply, &at_zero);
+  if (decoded) {
+    EXPECT_NE(at_zero, relay::Op::kError)
+        << "if a length byte ever decodes it must not decode as the truth, or "
+           "this test proves nothing";
+  }
+
+  // A request body, by contrast, carries its opcode at byte zero.
+  relay::GetReportsRequest gr;
+  gr.vault = TestVault();
+  const std::string framed = relay::EncodeGetReports(gr);
+  ASSERT_GT(framed.size(), 4u);
+  relay::Op req = relay::Op::kError;
+  const std::string body = framed.substr(4);
+  ASSERT_TRUE(relay::PeekOp(body, &req));
+  EXPECT_EQ(req, relay::Op::kGetReports);
+}
+
 }  // namespace umbra

@@ -110,6 +110,26 @@ void Server::Stop() { running_ = false; }
 void Server::HandleConnection(int fd) {
   int one = 1;
   (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  // WHAT --verbose MAY SAY, AND WHAT IT MAY NOT.
+  //
+  // The opcode and the two sizes, because those are what the relay already
+  // knows by handling the request at all -- the threat model grants it sizes
+  // and timing (§2) and this only prints them.
+  //
+  // NOT the vault id, which travels in every request. The relay sees it in
+  // memory for as long as it takes to build a key; writing it to a log turns
+  // "the relay learns which vaults exist" from a transient fact into a file
+  // that outlives the process, gets rotated somewhere, and ends up in a backup.
+  // A relay operator debugging traffic does not need it and an operator who is
+  // curious should not be handed it.
+  //
+  // The flag existed and did nothing for two phases. It is wired now because
+  // this phase spent an afternoon on a relay that died silently under two
+  // clients, and a line per request would have said so on the first run.
+  if (opts_.verbose) {
+    std::fprintf(stderr, "relay: connection opened (%d live)\n",
+                 live_connections_.load());
+  }
   while (running_) {
     char header[4];
     if (!ReadExactly(fd, header, 4, opts_.idle_timeout_seconds)) break;
@@ -125,10 +145,34 @@ void Server::HandleConnection(int fd) {
     if (!ReadExactly(fd, &body[0], len, opts_.idle_timeout_seconds)) break;
 
     const std::string reply = HandleRequest(store_, body);
+    if (opts_.verbose) {
+      // THE TWO SIDES ARE FRAMED DIFFERENTLY, which is a trap worth naming: the
+      // request `body` has had its 4 byte length header consumed above, and the
+      // reply from HandleRequest still carries one. Peeking at the reply's
+      // first byte reads the low byte of a length and names it as an opcode --
+      // it printed "put-segment ... -> put-envelope" before this, which is
+      // wrong in the most plausible-looking way.
+      Op op = Op::kError;
+      const bool known = PeekOp(body, &op);
+      Op answer = Op::kError;
+      bool answered = false;
+      if (reply.size() > 4) {
+        const std::string first(1, reply[4]);
+        answered = PeekOp(first, &answer);
+      }
+      // Both counts are bytes on the wire, so they are comparable.
+      std::fprintf(stderr, "relay: %s %zu bytes -> %s %zu bytes\n",
+                   known ? OpName(op) : "unknown", body.size() + 4,
+                   answered ? OpName(answer) : "unknown", reply.size());
+    }
     if (!WriteAll(fd, reply)) break;
   }
   ::close(fd);
   --live_connections_;
+  if (opts_.verbose) {
+    std::fprintf(stderr, "relay: connection closed (%d live)\n",
+                 live_connections_.load());
+  }
 }
 
 void Server::Run() {
