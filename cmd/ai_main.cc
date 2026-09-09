@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -52,6 +53,38 @@ bool ReadWholeFile(const std::string& path, std::string* out) {
   std::stringstream ss;
   ss << f.rdbuf();
   *out = ss.str();
+  return true;
+}
+
+bool WriteWholeFile(const std::string& path, const std::string& body) {
+  const std::string tmp = path + ".tmp";
+  std::FILE* f = std::fopen(tmp.c_str(), "wb");
+  if (f == nullptr) return false;
+  const bool ok = std::fwrite(body.data(), 1, body.size(), f) == body.size();
+  std::fclose(f);
+  if (!ok) {
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  return ::rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+bool MakeDirs(const std::string& path) {
+  if (path.empty()) return false;
+  std::string built;
+  std::size_t i = 0;
+  if (path[0] == '/') {
+    built = "/";
+    i = 1;
+  }
+  while (i < path.size()) {
+    std::size_t j = path.find('/', i);
+    if (j == std::string::npos) j = path.size();
+    built += path.substr(i, j - i);
+    if (::mkdir(built.c_str(), 0700) != 0 && errno != EEXIST) return false;
+    built += "/";
+    i = j + 1;
+  }
   return true;
 }
 
@@ -192,6 +225,7 @@ DeviceKeyPair LoadOrCreateDeviceKeys(const std::string& vault) {
   return d;
 }
 
+struct Options;
 ReplicaId ReplicaFor(const Options& o);
 
 std::unique_ptr<Embedder> MakeEmbedder(const std::string& model,
@@ -263,8 +297,8 @@ int Build(const Options& o) {
   VaultKeys keys = KeysFor("umbra ai driver");
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
-  if (Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
-                  ReplicaFor(o), &index) != IndexStatus::kOk) {
+  if (Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(), ReplicaFor(o),
+                  &index) != IndexStatus::kOk) {
     std::fprintf(stderr, "cannot open the index at %s\n", o.index_dir.c_str());
     return 1;
   }
@@ -413,9 +447,8 @@ int Ask(const Options& o) {
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
   {
-    const IndexStatus s =
-        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
-                    ReplicaFor(o), &index);
+    const IndexStatus s = Index::Open(o.index_dir, &keys, 0, e->id(),
+                                      e->dimension(), ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));
@@ -482,9 +515,8 @@ int Eval(const Options& o) {
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
   {
-    const IndexStatus s =
-        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
-                    ReplicaFor(o), &index);
+    const IndexStatus s = Index::Open(o.index_dir, &keys, 0, e->id(),
+                                      e->dimension(), ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));
@@ -630,9 +662,8 @@ int Push(const Options& o) {
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
   {
-    const IndexStatus s =
-        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
-                    ReplicaFor(o), &index);
+    const IndexStatus s = Index::Open(o.index_dir, &keys, 0, e->id(),
+                                      e->dimension(), ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index: %s\n", IndexStatusName(s));
       return 1;
@@ -725,9 +756,8 @@ int Pull(const Options& o) {
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
   {
-    const IndexStatus s =
-        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
-                    ReplicaFor(o), &index);
+    const IndexStatus s = Index::Open(o.index_dir, &keys, 0, e->id(),
+                                      e->dimension(), ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index: %s\n", IndexStatusName(s));
       return 1;
@@ -856,9 +886,8 @@ int Stats(const Options& o) {
   VaultKeys keys = KeysFor("umbra ai driver");
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
-  const IndexStatus s =
-      Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
-                  ReplicaFor(o), &index);
+  const IndexStatus s = Index::Open(o.index_dir, &keys, 0, e->id(),
+                                    e->dimension(), ReplicaFor(o), &index);
   if (s != IndexStatus::kOk) {
     std::fprintf(stderr, "cannot open the index: %s\n", IndexStatusName(s));
     return 1;
@@ -881,9 +910,8 @@ int CompactCommand(const Options& o) {
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
   {
-    const IndexStatus s =
-        Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
-                    ReplicaFor(o), &index);
+    const IndexStatus s = Index::Open(o.index_dir, &keys, 0, e->id(),
+                                      e->dimension(), ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));
