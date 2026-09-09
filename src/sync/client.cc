@@ -265,6 +265,27 @@ SyncStatus Client::PushSegment(const std::array<uint8_t, 32>& id,
 SyncStatus Client::PullSegment(const std::array<uint8_t, 32>& id,
                                std::string* sealed) {
   sealed->clear();
+  // NOTHING PARTIAL SURVIVES A FAILURE. Every early return below left whatever
+  // pieces had arrived in the caller's buffer, so a caller that logged the
+  // status instead of branching on it held a truncated segment that looked like
+  // a segment. The content hash catches it later, which is the wrong place: an
+  // out parameter on a failed call should be empty, not nearly right.
+  //
+  // A guard rather than a clear before each return, because there are six
+  // returns and the seventh is the one somebody forgets.
+  class Guard {
+   public:
+    explicit Guard(std::string* s) : s_(s) {}
+    ~Guard() {
+      if (!ok_) s_->clear();
+    }
+    void Keep() { ok_ = true; }
+
+   private:
+    std::string* s_;
+    bool ok_ = false;
+  } guard(sealed);
+
   uint64_t total = 0;
   uint64_t want = 0;
   // A BOUND ON ROUNDS, NOT ONLY ON BYTES. A relay that answers every request
@@ -303,10 +324,8 @@ SyncStatus Client::PullSegment(const std::array<uint8_t, 32>& id,
     want += static_cast<uint64_t>(resp.chunk.size());
     if (want >= total) break;
   }
-  if (sealed->size() != total) {
-    sealed->clear();
-    return SyncStatus::kBadResponse;
-  }
+  if (sealed->size() != total) return SyncStatus::kBadResponse;
+  guard.Keep();
   return SyncStatus::kOk;
 }
 

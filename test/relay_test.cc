@@ -971,4 +971,355 @@ TEST(RelayEndToEnd, TheRelayHoldsNoPartOfAnIndexSegment) {
       << "the relay knows the content address of every segment";
 }
 
+// ------------------------------------------------------- the chunk boundary
+//
+// A SEGMENT TRAVELS IN PIECES AND NOTHING HAD EVER CROSSED THE SEAM. Every
+// transfer tested before this was a few tens of kilobytes -- one piece, one
+// request, and the loop that stitches pieces together never ran more than once.
+// The first person to sync a real vault runs the untested path.
+//
+// The sizes are chosen to sit on the boundary rather than near it: one byte
+// under, exactly on, one byte over, and the same again at two chunks. An
+// off-by-one in `off < total`, in `want >= total`, or in the relay's "first
+// piece at or after this offset" scan shows up at exactly these sizes and
+// nowhere else.
+namespace {
+
+// Bytes that are not compressible and not repetitive, so a stitching bug that
+// duplicates or drops a piece cannot be hidden by the pieces looking alike.
+std::string PatternedBytes(std::size_t n, uint64_t seed) {
+  std::string out;
+  out.resize(n);
+  uint64_t x = seed | 1;
+  for (std::size_t i = 0; i < n; ++i) {
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    out[i] = static_cast<char>(x & 0xFF);
+  }
+  return out;
+}
+
+std::array<uint8_t, 32> IdFor(const std::string& body) {
+  std::array<uint8_t, 32> id{};
+  crypto_generichash(id.data(), id.size(),
+                     reinterpret_cast<const unsigned char*>(body.data()),
+                     body.size(), nullptr, 0);
+  return id;
+}
+
+}  // namespace
+
+TEST(SegmentTransfer, CrossesTheChunkBoundaryExactly) {
+  TempDir dir;
+  RunningRelay relay_(dir.path() + "/relay");
+  VaultKeys keys;
+  ASSERT_EQ(VaultKeys::Create("pass", FixedSalt(5), FastParams(), &keys),
+            CryptoStatus::kOk);
+  const ReplicaId dev = ReplicaIdFromSeed(21);
+  std::unique_ptr<OpLog> log;
+  ASSERT_EQ(OpLog::OpenEncrypted(dir.path() + "/c", &keys, &log),
+            LogStatus::kOk);
+  std::unique_ptr<sync::Transport> t =
+      sync::NewTcpTransport("127.0.0.1", relay_.port());
+  sync::Client client(TestVault(), dev, &keys, log.get(), t.get());
+
+  const std::size_t chunk = relay::kSegmentChunkBytes;
+  struct Case {
+    const char* name;
+    std::size_t size;
+    std::size_t expect_pieces;
+  };
+  const Case cases[] = {
+      {"one byte", 1, 1},
+      {"one under a chunk", chunk - 1, 1},
+      {"exactly a chunk", chunk, 1},
+      {"one over a chunk", chunk + 1, 2},
+      {"one under two chunks", (2 * chunk) - 1, 2},
+      {"exactly two chunks", 2 * chunk, 2},
+      {"one over two chunks", (2 * chunk) + 1, 3},
+  };
+
+  for (const Case& c : cases) {
+    const std::string body = PatternedBytes(c.size, c.size * 2654435761ull + 7);
+    const std::array<uint8_t, 32> id = IdFor(body);
+
+    ASSERT_EQ(client.PushSegment(id, body), sync::SyncStatus::kOk) << c.name;
+    ASSERT_EQ(relay_.store()->Sync(), relay::StoreStatus::kOk);
+
+    // THE RELAY STORED IT IN THE NUMBER OF PIECES THE MATH SAYS. Counted from
+    // the store rather than from the client, because a client that sent one
+    // enormous piece and a relay that accepted it would both be wrong and would
+    // still round trip.
+    std::size_t pieces = 0;
+    uint64_t at = 0;
+    for (;;) {
+      relay::GetSegmentRequest g;
+      g.vault = TestVault();
+      g.segment = id;
+      g.offset = at;
+      relay::SegmentResponse resp;
+      ASSERT_EQ(relay_.store()->GetSegment(g, &resp), relay::StoreStatus::kOk);
+      ASSERT_TRUE(resp.found) << c.name;
+      ASSERT_EQ(resp.total, c.size) << c.name;
+      if (resp.chunk.empty()) break;
+      ++pieces;
+      ASSERT_LE(resp.chunk.size(), chunk)
+          << c.name << ": a piece larger than the chunk size was stored";
+      ASSERT_EQ(resp.offset, at) << c.name
+                                 << ": a piece landed at the wrong "
+                                    "offset";
+      at += resp.chunk.size();
+      if (at >= c.size) break;
+    }
+    EXPECT_EQ(pieces, c.expect_pieces) << c.name;
+    EXPECT_EQ(at, c.size) << c.name << ": the pieces do not cover the segment";
+
+    // And the round trip is byte for byte.
+    std::string back;
+    ASSERT_EQ(client.PullSegment(id, &back), sync::SyncStatus::kOk) << c.name;
+    ASSERT_EQ(back.size(), body.size()) << c.name;
+    EXPECT_EQ(back, body) << c.name << ": the stitched segment differs";
+    EXPECT_EQ(IdFor(back), id) << c.name << ": the content address changed";
+  }
+}
+
+// NO SINGLE FRAME MAY EXCEED THE FRAME LIMIT, which is the reason segments are
+// chunked at all. A chunk of exactly kSegmentChunkBytes plus its header has to
+// still fit kMaxFrameBytes, and that headroom has never been checked.
+TEST(SegmentTransfer, AFullChunkStillFitsAFrame) {
+  const std::string body = PatternedBytes(relay::kSegmentChunkBytes, 99);
+  relay::PutSegmentRequest req;
+  req.vault = TestVault();
+  req.segment = IdFor(body);
+  req.offset = 0;
+  req.total = body.size();
+  req.chunk = body;
+  const std::string frame = relay::EncodePutSegment(req);
+  EXPECT_GT(frame.size(), relay::kSegmentChunkBytes);
+  EXPECT_LT(frame.size(), relay::kMaxFrameBytes)
+      << "a full chunk plus its header does not fit a frame, so the largest "
+         "legal piece cannot be sent at all";
+  // And it decodes back to the same bytes.
+  relay::PutSegmentRequest back;
+  ASSERT_TRUE(relay::DecodePutSegment(frame.substr(4), &back));
+  EXPECT_EQ(back.chunk, body);
+  EXPECT_EQ(back.total, body.size());
+}
+
+// A PIECE LARGER THAN THE CHUNK SIZE IS REFUSED. The decoder's bound is what
+// stops a hostile relay handing back one enormous piece and undoing the whole
+// point of chunking.
+TEST(SegmentTransfer, RefusesAPieceLargerThanAChunk) {
+  const std::string body = PatternedBytes(relay::kSegmentChunkBytes + 1, 5);
+  relay::PutSegmentRequest req;
+  req.vault = TestVault();
+  req.segment = IdFor(body);
+  req.offset = 0;
+  req.total = body.size();
+  req.chunk = body;  // one byte too large
+  const std::string frame = relay::EncodePutSegment(req);
+  relay::PutSegmentRequest back;
+  EXPECT_FALSE(relay::DecodePutSegment(frame.substr(4), &back))
+      << "a piece larger than the chunk size was accepted";
+
+  relay::SegmentResponse resp;
+  resp.found = true;
+  resp.offset = 0;
+  resp.total = body.size();
+  resp.chunk = body;
+  const std::string rframe = relay::EncodeSegment(resp);
+  relay::SegmentResponse rback;
+  EXPECT_FALSE(relay::DecodeSegment(rframe.substr(4), &rback))
+      << "a relay could return one piece larger than the chunk size";
+}
+
+// A TRANSFER THAT STOPS PARTWAY RESUMES FROM WHERE IT STOPPED.
+//
+// The client is killed mid-push: some pieces are on the relay and some are not.
+// A second client must be able to finish the job, and a puller must not be able
+// to read a half-written segment as if it were whole.
+TEST(SegmentTransfer, AnInterruptedPushResumesWithoutRefetchingEverything) {
+  TempDir dir;
+  RunningRelay relay_(dir.path() + "/relay");
+  VaultKeys keys;
+  ASSERT_EQ(VaultKeys::Create("pass", FixedSalt(6), FastParams(), &keys),
+            CryptoStatus::kOk);
+  const ReplicaId dev = ReplicaIdFromSeed(22);
+  std::unique_ptr<OpLog> log;
+  ASSERT_EQ(OpLog::OpenEncrypted(dir.path() + "/c", &keys, &log),
+            LogStatus::kOk);
+
+  const std::size_t size = (2 * relay::kSegmentChunkBytes) + 4096;
+  const std::string body = PatternedBytes(size, 31337);
+  const std::array<uint8_t, 32> id = IdFor(body);
+
+  // A transport that dies after the first piece, the way a client killed
+  // mid-transfer does.
+  class DyingTransport : public sync::Transport {
+   public:
+    DyingTransport(std::unique_ptr<sync::Transport> inner, int allow)
+        : inner_(std::move(inner)), allow_(allow) {}
+    bool Push(const relay::PushRequest& r) override { return inner_->Push(r); }
+    bool Fetch(const relay::FetchRequest& r, relay::BlobsResponse* o) override {
+      return inner_->Fetch(r, o);
+    }
+    bool PutReport(const relay::PutReportRequest& r) override {
+      return inner_->PutReport(r);
+    }
+    bool GetReports(const relay::GetReportsRequest& r,
+                    relay::ReportsResponse* o) override {
+      return inner_->GetReports(r, o);
+    }
+    bool PutEnvelope(const relay::PutEnvelopeRequest& r) override {
+      return inner_->PutEnvelope(r);
+    }
+    bool GetEnvelopes(const relay::GetEnvelopesRequest& r,
+                      relay::EnvelopesResponse* o) override {
+      return inner_->GetEnvelopes(r, o);
+    }
+    bool PutSegment(const relay::PutSegmentRequest& r) override {
+      if (sent_ >= allow_) return false;
+      ++sent_;
+      return inner_->PutSegment(r);
+    }
+    bool GetSegment(const relay::GetSegmentRequest& r,
+                    relay::SegmentResponse* o) override {
+      return inner_->GetSegment(r, o);
+    }
+    bool ListSegments(const relay::ListSegmentsRequest& r,
+                      relay::SegmentListResponse* o) override {
+      return inner_->ListSegments(r, o);
+    }
+    int sent() const { return sent_; }
+
+   private:
+    std::unique_ptr<sync::Transport> inner_;
+    int allow_;
+    int sent_ = 0;
+  };
+
+  {
+    DyingTransport dying(sync::NewTcpTransport("127.0.0.1", relay_.port()), 1);
+    sync::Client dying_client(TestVault(), dev, &keys, log.get(), &dying);
+    EXPECT_EQ(dying_client.PushSegment(id, body),
+              sync::SyncStatus::kUnreachable);
+    EXPECT_EQ(dying.sent(), 1) << "the transport did not die where intended";
+  }
+  ASSERT_EQ(relay_.store()->Sync(), relay::StoreStatus::kOk);
+
+  // A PARTIAL SEGMENT MUST NOT READ AS A WHOLE ONE. The relay has one piece and
+  // a size record saying three are coming; a puller must refuse rather than
+  // return a truncated segment that would then fail its content hash somewhere
+  // less obvious.
+  std::unique_ptr<sync::Transport> t2 =
+      sync::NewTcpTransport("127.0.0.1", relay_.port());
+  sync::Client reader(TestVault(), ReplicaIdFromSeed(23), &keys, log.get(),
+                      t2.get());
+  std::string partial;
+  EXPECT_NE(reader.PullSegment(id, &partial), sync::SyncStatus::kOk)
+      << "a half-written segment was served as complete";
+  EXPECT_TRUE(partial.empty())
+      << "a failed pull left bytes behind for a caller to misuse";
+
+  // The push is retried and finishes. Pushing is idempotent, so the piece that
+  // did land is simply written again rather than skipped -- which is the honest
+  // cost of resuming without a protocol for asking what the relay already has.
+  std::unique_ptr<sync::Transport> t3 =
+      sync::NewTcpTransport("127.0.0.1", relay_.port());
+  sync::Client finisher(TestVault(), dev, &keys, log.get(), t3.get());
+  ASSERT_EQ(finisher.PushSegment(id, body), sync::SyncStatus::kOk);
+  ASSERT_EQ(relay_.store()->Sync(), relay::StoreStatus::kOk);
+
+  std::string whole;
+  ASSERT_EQ(reader.PullSegment(id, &whole), sync::SyncStatus::kOk);
+  EXPECT_EQ(whole, body);
+  EXPECT_EQ(IdFor(whole), id);
+}
+
+// A PULL THAT STOPS PARTWAY LEAVES NOTHING BEHIND, and a retry succeeds. The
+// local state after a failed pull has to be "no segment", not "some of one".
+TEST(SegmentTransfer, AnInterruptedPullLeavesNoPartialState) {
+  TempDir dir;
+  RunningRelay relay_(dir.path() + "/relay");
+  VaultKeys keys;
+  ASSERT_EQ(VaultKeys::Create("pass", FixedSalt(7), FastParams(), &keys),
+            CryptoStatus::kOk);
+  std::unique_ptr<OpLog> log;
+  ASSERT_EQ(OpLog::OpenEncrypted(dir.path() + "/c", &keys, &log),
+            LogStatus::kOk);
+
+  const std::size_t size = (3 * relay::kSegmentChunkBytes) + 11;
+  const std::string body = PatternedBytes(size, 4242);
+  const std::array<uint8_t, 32> id = IdFor(body);
+  {
+    std::unique_ptr<sync::Transport> t =
+        sync::NewTcpTransport("127.0.0.1", relay_.port());
+    sync::Client c(TestVault(), ReplicaIdFromSeed(24), &keys, log.get(),
+                   t.get());
+    ASSERT_EQ(c.PushSegment(id, body), sync::SyncStatus::kOk);
+  }
+  ASSERT_EQ(relay_.store()->Sync(), relay::StoreStatus::kOk);
+
+  class HalfReader : public sync::Transport {
+   public:
+    HalfReader(std::unique_ptr<sync::Transport> inner, int allow)
+        : inner_(std::move(inner)), allow_(allow) {}
+    bool Push(const relay::PushRequest& r) override { return inner_->Push(r); }
+    bool Fetch(const relay::FetchRequest& r, relay::BlobsResponse* o) override {
+      return inner_->Fetch(r, o);
+    }
+    bool PutReport(const relay::PutReportRequest& r) override {
+      return inner_->PutReport(r);
+    }
+    bool GetReports(const relay::GetReportsRequest& r,
+                    relay::ReportsResponse* o) override {
+      return inner_->GetReports(r, o);
+    }
+    bool PutEnvelope(const relay::PutEnvelopeRequest& r) override {
+      return inner_->PutEnvelope(r);
+    }
+    bool GetEnvelopes(const relay::GetEnvelopesRequest& r,
+                      relay::EnvelopesResponse* o) override {
+      return inner_->GetEnvelopes(r, o);
+    }
+    bool PutSegment(const relay::PutSegmentRequest& r) override {
+      return inner_->PutSegment(r);
+    }
+    bool GetSegment(const relay::GetSegmentRequest& r,
+                    relay::SegmentResponse* o) override {
+      if (got_ >= allow_) return false;
+      ++got_;
+      return inner_->GetSegment(r, o);
+    }
+    bool ListSegments(const relay::ListSegmentsRequest& r,
+                      relay::SegmentListResponse* o) override {
+      return inner_->ListSegments(r, o);
+    }
+    int got() const { return got_; }
+
+   private:
+    std::unique_ptr<sync::Transport> inner_;
+    int allow_;
+    int got_ = 0;
+  };
+
+  std::string partial;
+  {
+    HalfReader half(sync::NewTcpTransport("127.0.0.1", relay_.port()), 2);
+    sync::Client c(TestVault(), ReplicaIdFromSeed(25), &keys, log.get(), &half);
+    EXPECT_EQ(c.PullSegment(id, &partial), sync::SyncStatus::kUnreachable);
+    EXPECT_EQ(half.got(), 2) << "the pull did not stop where intended";
+  }
+  EXPECT_TRUE(partial.empty())
+      << "an interrupted pull left a truncated segment in the caller's buffer";
+
+  std::unique_ptr<sync::Transport> t =
+      sync::NewTcpTransport("127.0.0.1", relay_.port());
+  sync::Client c(TestVault(), ReplicaIdFromSeed(25), &keys, log.get(), t.get());
+  std::string whole;
+  ASSERT_EQ(c.PullSegment(id, &whole), sync::SyncStatus::kOk);
+  EXPECT_EQ(whole, body);
+}
+
 }  // namespace umbra
