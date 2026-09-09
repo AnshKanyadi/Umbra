@@ -1299,5 +1299,83 @@ TEST(Replication, WhatCompactionRetiredIsNotWantedOnceItsReplacementIsHeld) {
   for (const SegmentId& id : order) EXPECT_FALSE(b.index->Wants(id));
 }
 
+// A PULLER KILLED PARTWAY MUST NOT COME BACK CALLING ITSELF COMPLETE.
+//
+// The fold is rebuilt at Open from what is on disk, which is right for
+// everything a device HOLDS and silently wrong for everything it has only been
+// TOLD ABOUT. Applying a kAdd for a segment whose bytes have not arrived
+// touches nothing on disk, so a restart forgets it -- and the client's cursor
+// is durable and per operation (src/sync/client.cc:216), so that operation is
+// never offered again. The device then reports an index it knows to be whole
+// and is not.
+//
+// Measured against three containers before this was fixed: a cold pull of a
+// 2000 segment index, killed at 1662, restarted, applied nothing, fetched
+// nothing, and printed "complete: yes" while missing 339 segments. Search
+// answered from 83% of the vault and said nothing about the rest, which is the
+// exact failure Phase 4 spent its time avoiding.
+TEST(Replication, ARestartRemembersSegmentsWhoseBytesNeverArrived) {
+  Device a;
+  ASSERT_NO_FATAL_FAILURE(a.Open(0xA1));
+  for (uint8_t i = 0; i < 4; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+        a.IndexNote(static_cast<uint8_t>(i + 1), kTopics[i % 4]));
+  }
+
+  Device b;
+  ASSERT_NO_FATAL_FAILURE(b.Open(0xB2));
+  ASSERT_GT(Ship(&a, &b), 0u);
+  const std::size_t wanted = b.index->Missing().size();
+  ASSERT_GT(wanted, 1u);
+  EXPECT_FALSE(b.index->Complete());
+
+  // One segment's bytes arrive. The rest do not, and the process dies: the
+  // operations that named them were consumed and will not be sent again.
+  const SegmentId first = b.index->MissingInFetchOrder().front();
+  const std::string sealed = a.SealedBytes(first);
+  ASSERT_FALSE(sealed.empty());
+  ASSERT_EQ(b.index->AdoptSegment(sealed), IndexStatus::kOk);
+  ASSERT_NO_FATAL_FAILURE(b.Reopen());
+
+  EXPECT_EQ(b.index->Missing().size(), wanted - 1)
+      << "a restart forgot segments it had been told about and not yet fetched";
+  EXPECT_FALSE(b.index->Complete())
+      << "an index missing bytes reported itself complete";
+
+  // And the rest still arrive, which is the point of remembering them.
+  EXPECT_EQ(ShipSegments(&a, &b), wanted - 1);
+  EXPECT_TRUE(b.index->Complete());
+  EXPECT_EQ(b.index->Stats().segments, a.index->Stats().segments);
+
+  // A second restart, now that everything is held: the journal has served its
+  // purpose and the disk can rebuild the fold on its own.
+  ASSERT_NO_FATAL_FAILURE(b.Reopen());
+  EXPECT_TRUE(b.index->Complete());
+  EXPECT_EQ(b.index->Stats().segments, a.index->Stats().segments);
+}
+
+// A TOMBSTONE THAT ARRIVES BEFORE ITS SEGMENT SURVIVES A RESTART TOO.
+//
+// Same journal, a case with teeth of its own: a deletion made on another device
+// that this one has not yet fetched the bytes for. Forgetting it means the
+// passage comes back from the dead when the segment finally arrives.
+TEST(Replication, ATombstoneSurvivesARestartBeforeItsSegmentArrives) {
+  Device a;
+  ASSERT_NO_FATAL_FAILURE(a.Open(0xA1));
+  ASSERT_NO_FATAL_FAILURE(a.IndexNote(1, kTopics[0]));
+  ASSERT_NO_FATAL_FAILURE(a.IndexNote(1, kTopics[1]));  // rewrites the object
+
+  Device b;
+  ASSERT_NO_FATAL_FAILURE(b.Open(0xB2));
+  ASSERT_GT(Ship(&a, &b), 0u);
+  ASSERT_NO_FATAL_FAILURE(b.Reopen());
+  ASSERT_GT(ShipSegments(&a, &b), 0u);
+
+  EXPECT_EQ(b.index->Stats().tombstoned, a.index->Stats().tombstoned)
+      << "a tombstone that arrived before its segment was lost on restart, so "
+         "a deleted passage came back";
+  EXPECT_EQ(b.index->Stats().vectors, a.index->Stats().vectors);
+}
+
 }  // namespace ai
 }  // namespace umbra

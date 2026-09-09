@@ -63,6 +63,33 @@ uint32_t GetU32(const char* p) {
          static_cast<uint32_t>(static_cast<uint8_t>(p[3]));
 }
 
+// 'w' || replica(16) || counter(8) -> encoded operation. A MANIFEST OPERATION
+// FROM A PEER THAT THE DISK CANNOT RE-DERIVE.
+//
+// The fold is rebuilt at Open from what is on disk, which is right for
+// everything this device HOLDS and silently wrong for everything it has only
+// been TOLD ABOUT. A kAdd for a segment whose bytes have not arrived leaves no
+// trace anywhere: kill a puller partway and it comes back having forgotten that
+// the other segments exist, while its cursor says it already consumed those
+// operations. It then reports a complete index. Measured: killed at 1662 of
+// 2000 segments, it restarted, applied nothing, fetched nothing, and said
+// "complete: yes" while missing 339.
+//
+// So the operations that the disk cannot reconstruct are journalled here and
+// replayed at Open. The mirror of the 'p' prefix, which holds what this device
+// produced and has not yet published.
+constexpr char kWantedPrefix = 'w';
+
+std::string WantedKey(const OpId& id) {
+  std::string k(1, kWantedPrefix);
+  k.append(reinterpret_cast<const char*>(id.replica.bytes.data()),
+           id.replica.bytes.size());
+  for (int i = 7; i >= 0; --i) {
+    k.push_back(static_cast<char>((id.counter >> (i * 8)) & 0xFF));
+  }
+  return k;
+}
+
 // The last counter this device PUBLISHED, which anchors the back-pointer
 // chain. Kept apart from the counter high-water mark because reopening an
 // index advances that mark without publishing anything.
@@ -272,6 +299,33 @@ struct Index::Impl {
     (void)db->Write(batch, &seq);
   }
 
+  // Journal an operation the disk cannot re-derive, and forget the ones it can.
+  void RememberWanted(const ManifestOp& op) {
+    const std::string key = WantedKey(op.id);
+    const std::string value = EncodeManifestOp(op);
+    basalt::WriteBatch batch;
+    batch.Set(basalt::Slice(key), basalt::Slice(value));
+    basalt::wal::SeqNum seq = 0;
+    if (!db->Write(batch, &seq).ok()) return;
+    // SYNCED, BECAUSE THE CURSOR THAT CONSUMED THIS OPERATION IS ALREADY
+    // DURABLE. The client persists its cursor per operation
+    // (src/sync/client.cc:216) and will never hand this one over again, so a
+    // journal entry lost to a crash is an operation lost for good.
+    basalt::wal::SeqNum watermark = 0;
+    (void)db->Sync(&watermark);
+  }
+
+  void ForgetWanted(const std::vector<OpId>& ids) {
+    if (ids.empty()) return;
+    basalt::WriteBatch batch;
+    std::vector<std::string> keys;
+    keys.reserve(ids.size());
+    for (const OpId& id : ids) keys.push_back(WantedKey(id));
+    for (const std::string& k : keys) batch.Delete(basalt::Slice(k));
+    basalt::wal::SeqNum seq = 0;
+    (void)db->Write(batch, &seq);
+  }
+
   void MarkAnnounced(const SegmentId& id) {
     const std::string key = AnnouncedKey(id);
     basalt::WriteBatch batch;
@@ -458,6 +512,41 @@ IndexStatus Index::Open(const std::string& dir, const VaultKeys* keys,
       (void)im.manifest->Apply(t);
     }
   }
+  // AND THE OPERATIONS THE DISK COULD NOT SAY AGAIN ARE REPLAYED. See
+  // kWantedPrefix: the fold above knows only what this device HOLDS, so
+  // without this a puller that died partway came back having forgotten that
+  // the segments it had not reached yet exist -- and its cursor, which is
+  // durable and per operation, would never offer them again.
+  {
+    std::vector<ManifestOp> replay;
+    const std::string lo(1, kWantedPrefix);
+    const std::string hi(1, kWantedPrefix + 1);
+    basalt::IterOptions o;
+    o.lower = basalt::Bound::At(basalt::Slice(lo));
+    o.upper = basalt::Bound::At(basalt::Slice(hi));
+    std::unique_ptr<basalt::Iterator> it = im.db->NewIter(o);
+    for (bool ok = it->First(); ok; ok = it->Next()) {
+      ManifestOp op;
+      if (!DecodeManifestOp(it->Value().ToString(), &op)) continue;
+      replay.push_back(op);
+    }
+    const basalt::Status err = it->Error();
+    (void)it->Close();
+    if (!err.ok()) return IndexStatus::kStoreFailed;
+    for (const ManifestOp& op : replay) (void)im.manifest->Apply(op);
+
+    // What the disk can now derive on its own goes: a kAdd or a tombstone for a
+    // segment that has since arrived is rebuilt from the segment record and the
+    // tombstone keys. A retirement is derivable from nothing and stays.
+    std::vector<OpId> done;
+    for (const ManifestOp& op : replay) {
+      if (op.kind == ManifestOpKind::kRetire) continue;
+      if (!im.Present(op.segment)) continue;
+      done.push_back(op.id);
+    }
+    im.ForgetWanted(done);
+  }
+
   // A SEGMENT NOBODY HAS BEEN TOLD ABOUT IS ANNOUNCED NOW.
   //
   // The fold above is reconstructed for local use and says nothing about what
@@ -984,6 +1073,14 @@ ManifestApply Index::ApplyManifestOp(const ManifestOp& op) {
   // this point is what would open the window where the index is quietly
   // incomplete; they are dropped by Compact, which knows the replacement is in
   // hand because it just wrote it, or by Prune once the replacement arrives.
+
+  // JOURNALLED IF THE DISK CANNOT SAY IT AGAIN. See kWantedPrefix. An operation
+  // about a segment this device holds is re-derivable from the segment file and
+  // its tombstone keys; one about a segment it does not hold, and every
+  // retirement, is not.
+  if (!im.Present(op.segment) || op.kind == ManifestOpKind::kRetire) {
+    im.RememberWanted(op);
+  }
   return a;
 }
 
