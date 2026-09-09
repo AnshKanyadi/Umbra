@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <mutex>
 
 #include "basalt/caps.h"
 #include "basalt/db.h"
@@ -147,6 +148,29 @@ const char* StoreStatusName(StoreStatus s) {
 struct Store::Impl {
   std::unique_ptr<basalt::Env> env;
   std::unique_ptr<basalt::DB> db;
+  // ONE CALLER AT A TIME, BECAUSE THAT IS THE CONTRACT.
+  //
+  // The server runs a detached thread per connection (server.cc:153) and every
+  // one of them lands here on a single DB. Basalt promises exactly this much
+  // concurrency, in its own words: "TSan observed no data race across two
+  // authored interleaving patterns (concurrent MemTable Add and Get; concurrent
+  // DB Write and Sync across a flush); this is not a proof of race-freedom"
+  // (third_party/basalt/src/concurrency_claim.h). Two concurrent Syncs are not
+  // in that claim, and Basalt does not merely leave them undefined -- it
+  // enforces the precondition with a SingleCaller guard that ABORTS.
+  //
+  // Which is what happened the first time two devices synced at once against a
+  // relay on a real network: the process died on
+  // single_caller.h:29 CHECK failed: !held_->exchange(true), the clients
+  // reported an ordinary empty round, and the vault silently stopped
+  // replicating. Localhost never showed it because no test had ever run two
+  // clients against one relay at the same time.
+  //
+  // A reader-writer lock would be the tempting refinement. It would be a claim
+  // Basalt has not made: concurrent readers against a flush that replaces the
+  // memtable underneath them is not one of the two authored patterns. Serialise
+  // everything until that sentence changes.
+  mutable std::mutex mu;
 };
 
 Store::Store() : impl_(new Impl()) {}
@@ -168,6 +192,7 @@ StoreStatus Store::Open(const std::string& dir, std::unique_ptr<Store>* out) {
 }
 
 StoreStatus Store::Push(const PushRequest& req) {
+  const std::lock_guard<std::mutex> held(impl_->mu);
   if (req.blobs.empty()) return StoreStatus::kOk;
   basalt::WriteBatch batch;
   std::vector<std::string> keys;
@@ -189,6 +214,7 @@ StoreStatus Store::Push(const PushRequest& req) {
 }
 
 StoreStatus Store::Fetch(const FetchRequest& req, BlobsResponse* out) {
+  const std::lock_guard<std::mutex> held(impl_->mu);
   const uint32_t limit =
       req.limit == 0 ? kMaxFetchBlobs : std::min(req.limit, kMaxFetchBlobs);
   // `after` is exclusive. UINT64_MAX would overflow to zero and fetch
@@ -231,6 +257,7 @@ StoreStatus Store::Fetch(const FetchRequest& req, BlobsResponse* out) {
 }
 
 StoreStatus Store::PutReport(const PutReportRequest& req) {
+  const std::lock_guard<std::mutex> held(impl_->mu);
   basalt::WriteBatch batch;
   const std::string key = ReportKey(req.vault, req.report.device);
   const std::string value = BlobValue(req.report.epoch, req.report.sealed);
@@ -241,6 +268,7 @@ StoreStatus Store::PutReport(const PutReportRequest& req) {
 }
 
 StoreStatus Store::PutEnvelope(const PutEnvelopeRequest& req) {
+  const std::lock_guard<std::mutex> held(impl_->mu);
   basalt::WriteBatch batch;
   const std::string key = EnvelopeKey(req.vault, req.envelope.tag);
   batch.Set(basalt::Slice(key), basalt::Slice(req.envelope.body));
@@ -251,6 +279,7 @@ StoreStatus Store::PutEnvelope(const PutEnvelopeRequest& req) {
 
 StoreStatus Store::GetEnvelopes(const GetEnvelopesRequest& req,
                                 EnvelopesResponse* out) {
+  const std::lock_guard<std::mutex> held(impl_->mu);
   std::array<uint8_t, 32> lo_tag{};
   std::array<uint8_t, 32> hi_tag{};
   hi_tag.fill(0xFF);
@@ -280,6 +309,7 @@ StoreStatus Store::GetEnvelopes(const GetEnvelopesRequest& req,
 }
 
 StoreStatus Store::PutSegment(const PutSegmentRequest& req) {
+  const std::lock_guard<std::mutex> held(impl_->mu);
   basalt::WriteBatch batch;
   const std::string piece = SegmentPieceKey(req.vault, req.segment, req.offset);
   batch.Set(basalt::Slice(piece), basalt::Slice(req.chunk));
@@ -298,6 +328,7 @@ StoreStatus Store::PutSegment(const PutSegmentRequest& req) {
 
 StoreStatus Store::GetSegment(const GetSegmentRequest& req,
                               SegmentResponse* out) {
+  const std::lock_guard<std::mutex> held(impl_->mu);
   out->found = false;
   out->offset = req.offset;
   out->total = 0;
@@ -349,6 +380,7 @@ StoreStatus Store::GetSegment(const GetSegmentRequest& req,
 
 StoreStatus Store::ListSegments(const ListSegmentsRequest& req,
                                 SegmentListResponse* out) {
+  const std::lock_guard<std::mutex> held(impl_->mu);
   std::array<uint8_t, 32> hi_seg{};
   hi_seg.fill(0xFF);
   std::string lo = SegmentSizeKey(req.vault, req.after);
@@ -392,6 +424,7 @@ StoreStatus Store::ListSegments(const ListSegmentsRequest& req,
 
 StoreStatus Store::GetReports(const GetReportsRequest& req,
                               ReportsResponse* out) {
+  const std::lock_guard<std::mutex> held(impl_->mu);
   ReplicaId lo_dev;
   ReplicaId hi_dev;
   for (std::size_t i = 0; i < hi_dev.bytes.size(); ++i) hi_dev.bytes[i] = 0xFF;
@@ -424,12 +457,14 @@ StoreStatus Store::GetReports(const GetReportsRequest& req,
 }
 
 StoreStatus Store::Sync() {
+  const std::lock_guard<std::mutex> held(impl_->mu);
   basalt::wal::SeqNum w = 0;
   const basalt::Status s = impl_->db->Sync(&w);
   return s.ok() ? StoreStatus::kOk : StoreStatus::kWriteFailed;
 }
 
 std::size_t Store::BlobCount() const {
+  const std::lock_guard<std::mutex> held(impl_->mu);
   basalt::IterOptions o;
   std::unique_ptr<basalt::Iterator> it = impl_->db->NewIter(o);
   std::size_t n = 0;

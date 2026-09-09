@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -1320,6 +1321,97 @@ TEST(SegmentTransfer, AnInterruptedPullLeavesNoPartialState) {
   std::string whole;
   ASSERT_EQ(c.PullSegment(id, &whole), sync::SyncStatus::kOk);
   EXPECT_EQ(whole, body);
+}
+
+// EIGHT DEVICES SYNCING AT ONCE, WHICH IS WHERE THE RELAY DIED.
+//
+// The server runs a detached thread per connection (relay/server.cc:153), so
+// two devices that sync at the same moment are two threads inside one Basalt
+// DB. Basalt's contract allows one writer and one syncer and enforces the rest
+// with an abort, so the relay did not misbehave subtly: it died on
+// single_caller.h:29 the first time two containers pushed together, and both
+// clients printed an ordinary "0 pushed, 0 applied, 0 devices" round and
+// exited zero.
+//
+// Nothing here asserts a schedule -- an unsynchronised test cannot. What it
+// asserts is that the process survives and every byte written is readable
+// afterwards, run over enough threads and rounds to make the old build abort
+// reliably. It does: the pre-fix binary dies in under a second.
+TEST(RelayEndToEnd, ManyDevicesSyncingAtOnceDoNotKillTheRelay) {
+  TempDir dir;
+  RunningRelay relay_(dir.path());
+
+  constexpr int kDevices = 8;
+  constexpr int kRounds = 12;
+  std::atomic<int> failures(0);
+  std::vector<std::thread> threads;
+  for (int d = 0; d < kDevices; ++d) {
+    threads.emplace_back([&relay_, &failures, d] {
+      std::unique_ptr<sync::Transport> t =
+          sync::NewTcpTransport("127.0.0.1", relay_.port());
+      for (int r = 0; r < kRounds; ++r) {
+        relay::PutSegmentRequest ps;
+        ps.vault = TestVault();
+        ps.segment.fill(0);
+        // Never all zero: ListSegments takes an all-zero `after` as the
+        // start of the range and excludes it, so an all-zero id is unlistable.
+        // A real segment id is a BLAKE2b digest and will not be all zero.
+        ps.segment[0] = static_cast<uint8_t>(d + 1);
+        ps.segment[1] = static_cast<uint8_t>(r + 1);
+        ps.offset = 0;
+        ps.total = 64;
+        ps.chunk = PatternedBytes(64, static_cast<uint8_t>(d * 31 + r));
+        if (!t->PutSegment(ps)) ++failures;
+
+        relay::PutReportRequest pr;
+        pr.vault = TestVault();
+        pr.report.device.bytes.fill(static_cast<uint8_t>(d));
+        pr.report.epoch = 0;
+        pr.report.sealed = "report";
+        if (!t->PutReport(pr)) ++failures;
+
+        relay::GetReportsRequest gr;
+        gr.vault = TestVault();
+        relay::ReportsResponse rr;
+        if (!t->GetReports(gr, &rr)) ++failures;
+
+        relay::ListSegmentsRequest ls;
+        ls.vault = TestVault();
+        relay::SegmentListResponse lr;
+        if (!t->ListSegments(ls, &lr)) ++failures;
+      }
+    });
+  }
+  for (std::thread& t : threads) t.join();
+  EXPECT_EQ(failures.load(), 0);
+
+  // Alive, and holding what it was told. A relay that survived by dropping
+  // writes would pass the line above and fail this one.
+  std::unique_ptr<sync::Transport> t =
+      sync::NewTcpTransport("127.0.0.1", relay_.port());
+  relay::ListSegmentsRequest ls;
+  ls.vault = TestVault();
+  relay::SegmentListResponse lr;
+  ASSERT_TRUE(t->ListSegments(ls, &lr));
+  EXPECT_EQ(lr.segments.size(), static_cast<std::size_t>(kDevices * kRounds));
+  relay::GetReportsRequest gr;
+  gr.vault = TestVault();
+  relay::ReportsResponse rr;
+  ASSERT_TRUE(t->GetReports(gr, &rr));
+  EXPECT_EQ(rr.reports.size(), static_cast<std::size_t>(kDevices));
+  for (int d = 0; d < kDevices; ++d) {
+    for (int r = 0; r < kRounds; ++r) {
+      relay::GetSegmentRequest gs;
+      gs.vault = TestVault();
+      gs.segment.fill(0);
+      gs.segment[0] = static_cast<uint8_t>(d + 1);
+      gs.segment[1] = static_cast<uint8_t>(r + 1);
+      gs.offset = 0;
+      relay::SegmentResponse sr;
+      ASSERT_TRUE(t->GetSegment(gs, &sr));
+      EXPECT_EQ(sr.chunk, PatternedBytes(64, static_cast<uint8_t>(d * 31 + r)));
+    }
+  }
 }
 
 }  // namespace umbra
