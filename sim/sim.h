@@ -229,6 +229,12 @@ struct Result {
   std::size_t deliveries = 0;
   std::size_t crashes = 0;
   std::size_t restarts = 0;
+  // Index replication counters, so a schedule can say it reached the case it
+  // was written for rather than merely running.
+  std::size_t manifest_ops = 0;
+  std::size_t segments_adopted = 0;
+  std::size_t segments_refused = 0;
+  std::size_t retirements_held = 0;
   std::size_t max_partition_steps = 0;
   std::size_t tombstones_dropped = 0;
   std::size_t tree_ops = 0;
@@ -293,10 +299,27 @@ enum class Adversarial : uint8_t {
   // A replica is torn down mid run and rebuilt from its own durable logs, then
   // keeps working. The path a real client takes on every start.
   kRestartFromLog,
+
+  // ----------------------------------------------------------------- index
+  // Phase 5: the vector index replicates as sealed segments plus manifest
+  // operations. These are about the manifest lattice and the retirement safety
+  // condition, not about vectors -- the segments here are ids and sizes,
+  // because what is under test is who is allowed to stop using one.
+  //
+  // A device pulls a segment whose manifest entry has not arrived.
+  kIndexSegmentBeforeManifest,
+  // A relay serves a manifest that is a correct prefix and claims no more.
+  kIndexStaleManifest,
+  // Two devices compact at the same time from the same view.
+  kIndexConcurrentCompaction,
+  // A device on a different embedding model is offered new segments.
+  kIndexForeignModel,
+  // A segment arrives damaged and must be refused rather than adopted.
+  kIndexCorruptedSegment,
 };
 
 const char* AdversarialName(Adversarial a);
-constexpr std::size_t kAdversarialCount = 19;
+constexpr std::size_t kAdversarialCount = 24;
 
 // True when a schedule never has a replica insert into text it received from
 // another, which is the condition under which every run must still be

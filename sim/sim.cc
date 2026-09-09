@@ -1,5 +1,7 @@
 #include "sim.h"
 
+#include "umbra/ai/manifest.h"
+
 #include <algorithm>
 #include <sstream>
 
@@ -79,6 +81,16 @@ const char* AdversarialName(Adversarial a) {
       return "relay-stale-view";
     case Adversarial::kRestartFromLog:
       return "restart-from-log";
+    case Adversarial::kIndexSegmentBeforeManifest:
+      return "index-segment-before-manifest";
+    case Adversarial::kIndexStaleManifest:
+      return "index-stale-manifest";
+    case Adversarial::kIndexConcurrentCompaction:
+      return "index-concurrent-compaction";
+    case Adversarial::kIndexForeignModel:
+      return "index-foreign-model";
+    case Adversarial::kIndexCorruptedSegment:
+      return "index-corrupted-segment";
     case Adversarial::kTreeRandom:
       return "tree-random";
   }
@@ -249,6 +261,11 @@ bool ScheduleRequiresContiguousRuns(Adversarial a) {
     case Adversarial::kClockSkew:
     case Adversarial::kRelayStaleView:
     case Adversarial::kRestartFromLog:
+    case Adversarial::kIndexSegmentBeforeManifest:
+    case Adversarial::kIndexStaleManifest:
+    case Adversarial::kIndexConcurrentCompaction:
+    case Adversarial::kIndexForeignModel:
+    case Adversarial::kIndexCorruptedSegment:
       return false;
   }
   return false;
@@ -1859,6 +1876,329 @@ void RunRestartFromLog(Sim* s) {
   }
 }
 
+// ------------------------------------------------------------------- index
+//
+// PHASE 5 SCHEDULES. What is modelled here is the manifest lattice and the
+// retirement safety condition, not the vectors: a "segment" is an id, a size
+// and a bag of bytes whose hash is checked. That is deliberate -- what can go
+// wrong when an index replicates is who stops using a segment and when, and
+// putting real embeddings in the simulator would make it slow without making it
+// sharper.
+
+namespace {
+
+// One device's view of the index: the fold of every manifest operation it has
+// seen, and the segments whose bytes it actually holds.
+// The model the index schedules pretend to use. Fixed, because what is under
+// test is the manifest and not the embeddings.
+ai::ModelDescriptor SimModel() {
+  ai::ModelDescriptor d;
+  d.family = "umbra-sim";
+  d.version = "1";
+  d.dimension = 64;
+  d.quantisation = "none";
+  d.pooling = "sum";
+  d.normalised = true;
+  return d;
+}
+
+struct IndexPeer {
+  std::unique_ptr<ai::ManifestDoc> manifest;
+  std::set<ai::SegmentId> present;
+  uint64_t counter = 0;
+
+  bool Present(const ai::SegmentId& id) const { return present.count(id) != 0; }
+
+  ai::ManifestOp Make(ai::ManifestOpKind kind, const ReplicaId& who) {
+    ai::ManifestOp op;
+    op.kind = kind;
+    op.id.replica = who;
+    op.id.counter = ++counter;
+    op.prev = op.id.counter - 1;
+    return op;
+  }
+};
+
+ai::SegmentId SegmentFromSeed(uint64_t seed) {
+  ai::SegmentId id;
+  for (std::size_t i = 0; i < id.bytes.size(); ++i) {
+    id.bytes[i] = static_cast<uint8_t>((seed >> ((i % 8) * 8)) & 0xFF);
+  }
+  id.bytes[31] = static_cast<uint8_t>(seed & 0xFF);
+  return id;
+}
+
+// The live set a device would search, under the safety condition.
+std::vector<ai::SegmentId> LiveFor(const IndexPeer& p) {
+  return p.manifest->Live(
+      [&p](const ai::SegmentId& id) { return p.Present(id); });
+}
+
+std::string StateOf(const IndexPeer& p) {
+  std::string out;
+  for (const ai::SegmentId& id : LiveFor(p)) {
+    out += id.Short();
+    const ai::SegmentState* st = p.manifest->Get(id);
+    out += ":" + std::to_string(st == nullptr ? 0 : st->dead.size());
+    out += ";";
+  }
+  return out;
+}
+
+}  // namespace
+
+// A SEGMENT ARRIVES BEFORE THE OPERATION THAT NAMES IT, and the operation
+// arrives before the bytes, in both directions, repeatedly. Neither order may
+// change where a device ends up.
+void RunIndexSegmentBeforeManifest(Sim* s) {
+  const ai::EmbeddingModelId model = ai::ComputeModelId(SimModel());
+  std::vector<IndexPeer> peers(s->replicas.size());
+  for (IndexPeer& p : peers) p.manifest.reset(new ai::ManifestDoc(model));
+
+  std::vector<ai::ManifestOp> published;
+  for (int round = 0; round < 12; ++round) {
+    const std::size_t who =
+        static_cast<std::size_t>(s->rng.Below(s->replicas.size()));
+    ai::ManifestOp add =
+        peers[who].Make(ai::ManifestOpKind::kAdd, s->replicas[who].id);
+    add.segment = SegmentFromSeed(static_cast<uint64_t>(round) * 7919 + who);
+    add.count = 1 + static_cast<uint32_t>(s->rng.Below(40));
+    add.bytes = add.count * 400;
+    add.model = model;
+    (void)peers[who].manifest->Apply(add);
+    peers[who].present.insert(add.segment);
+    published.push_back(add);
+    ++s->result.manifest_ops;
+
+    // Deliver to everyone else, with the bytes and the operation in an order
+    // the schedule chooses rather than a fixed one.
+    for (std::size_t j = 0; j < peers.size(); ++j) {
+      if (j == who) continue;
+      const bool bytes_first = s->rng.Chance(50);
+      if (bytes_first) {
+        peers[j].present.insert(add.segment);
+        ++s->result.segments_adopted;
+        (void)peers[j].manifest->Apply(add);
+      } else {
+        (void)peers[j].manifest->Apply(add);
+        peers[j].present.insert(add.segment);
+        ++s->result.segments_adopted;
+      }
+    }
+  }
+
+  // Everyone saw the same operations and holds the same bytes, so everyone must
+  // agree on what is live.
+  const std::string reference = StateOf(peers[0]);
+  for (std::size_t i = 1; i < peers.size(); ++i) {
+    if (StateOf(peers[i]) != reference) {
+      s->result.failure = "index peers disagree after the same operations: " +
+                          StateOf(peers[i]) + " against " + reference;
+      return;
+    }
+  }
+}
+
+// A RELAY THAT SERVES A CORRECT PREFIX OF THE MANIFEST. Nothing it says is
+// false; it is simply behind. A device holding a stale manifest must not
+// conclude anything is missing that is not, and must not call itself complete.
+void RunIndexStaleManifest(Sim* s) {
+  const ai::EmbeddingModelId model = ai::ComputeModelId(SimModel());
+  IndexPeer writer;
+  writer.manifest.reset(new ai::ManifestDoc(model));
+  IndexPeer reader;
+  reader.manifest.reset(new ai::ManifestDoc(model));
+
+  std::vector<ai::ManifestOp> published;
+  for (int round = 0; round < 16; ++round) {
+    ai::ManifestOp add =
+        writer.Make(ai::ManifestOpKind::kAdd, s->replicas[0].id);
+    add.segment = SegmentFromSeed(static_cast<uint64_t>(round) * 104729 + 3);
+    add.count = 1 + static_cast<uint32_t>(s->rng.Below(20));
+    add.bytes = add.count * 512;
+    add.model = model;
+    (void)writer.manifest->Apply(add);
+    writer.present.insert(add.segment);
+    published.push_back(add);
+    ++s->result.manifest_ops;
+  }
+
+  // The relay serves a prefix, of a length it chooses.
+  const std::size_t served =
+      static_cast<std::size_t>(s->rng.Below(published.size() + 1));
+  for (std::size_t i = 0; i < served; ++i) {
+    (void)reader.manifest->Apply(published[i]);
+  }
+
+  // Everything the reader believes exists must really exist, and it must not
+  // believe it has everything unless it does.
+  for (const ai::SegmentId& id : reader.manifest->Wanted()) {
+    if (writer.manifest->Get(id) == nullptr) {
+      s->result.failure = "a stale manifest named a segment nobody published";
+      return;
+    }
+  }
+  const std::size_t known = reader.manifest->Wanted().size();
+  if (known > published.size()) {
+    s->result.failure = "a stale manifest knew more than was ever published";
+    return;
+  }
+  if (served < published.size() && known == published.size()) {
+    s->result.failure =
+        "a device served a strict prefix reported the whole manifest";
+    return;
+  }
+}
+
+// TWO DEVICES COMPACT FROM THE SAME VIEW. Input selection is a pure function of
+// the manifest, so they must choose the same inputs -- which is what makes the
+// outputs the same segment and the two operations one.
+void RunIndexConcurrentCompaction(Sim* s) {
+  const ai::EmbeddingModelId model = ai::ComputeModelId(SimModel());
+  IndexPeer a;
+  a.manifest.reset(new ai::ManifestDoc(model));
+  IndexPeer b;
+  b.manifest.reset(new ai::ManifestDoc(model));
+
+  std::vector<ai::SegmentId> live;
+  for (int round = 0; round < 10; ++round) {
+    ai::ManifestOp add = a.Make(ai::ManifestOpKind::kAdd, s->replicas[0].id);
+    add.segment = SegmentFromSeed(static_cast<uint64_t>(round) * 15485863 + 11);
+    add.count = 1 + static_cast<uint32_t>(s->rng.Below(50));
+    add.bytes = add.count * 400;
+    add.model = model;
+    (void)a.manifest->Apply(add);
+    (void)b.manifest->Apply(add);
+    a.present.insert(add.segment);
+    b.present.insert(add.segment);
+    live.push_back(add.segment);
+    ++s->result.manifest_ops;
+  }
+
+  const ai::CompactionPlan pa =
+      ai::PlanCompaction(*a.manifest, LiveFor(a), 2, 10, 4);
+  // The same manifest, the live set in a different order, which is what two
+  // devices with different insertion histories would hand it.
+  std::vector<ai::SegmentId> shuffled = LiveFor(b);
+  for (std::size_t i = shuffled.size(); i > 1; --i) {
+    const std::size_t j = static_cast<std::size_t>(s->rng.Below(i));
+    std::swap(shuffled[i - 1], shuffled[j]);
+  }
+  const ai::CompactionPlan pb =
+      ai::PlanCompaction(*b.manifest, shuffled, 2, 10, 4);
+
+  if (pa.inputs != pb.inputs) {
+    s->result.failure =
+        "two devices with one manifest chose different compaction inputs, so "
+        "their outputs would be two segments rather than one";
+    return;
+  }
+}
+
+// A DEVICE ON A DIFFERENT MODEL. Its manifest must refuse every operation and
+// it must not go looking for segments it could never use.
+void RunIndexForeignModel(Sim* s) {
+  ai::ModelDescriptor other = SimModel();
+  other.dimension += 128;
+  const ai::EmbeddingModelId mine = ai::ComputeModelId(SimModel());
+  const ai::EmbeddingModelId theirs = ai::ComputeModelId(other);
+
+  IndexPeer peer;
+  peer.manifest.reset(new ai::ManifestDoc(mine));
+  for (int round = 0; round < 12; ++round) {
+    ai::ManifestOp add = peer.Make(ai::ManifestOpKind::kAdd, s->replicas[0].id);
+    add.segment = SegmentFromSeed(static_cast<uint64_t>(round) * 2654435761u);
+    add.count = 1 + static_cast<uint32_t>(s->rng.Below(30));
+    add.model = theirs;
+    const ai::ManifestApply r = peer.manifest->Apply(add);
+    ++s->result.manifest_ops;
+    if (r != ai::ManifestApply::kModelMismatch) {
+      s->result.failure = "a foreign model's segment was absorbed";
+      return;
+    }
+    ++s->result.segments_refused;
+  }
+  if (!peer.manifest->Wanted().empty()) {
+    s->result.failure =
+        "a device is fetching segments from a model it cannot "
+        "read";
+    return;
+  }
+  if (peer.manifest->refused_model() == 0) {
+    s->result.failure =
+        "refusals were not counted, so a device could not say "
+        "why its index is empty";
+    return;
+  }
+}
+
+// RETIREMENT UNDER PARTIAL DELIVERY. The condition under test is the one stated
+// in manifest.h: a retired segment stays live until its replacement is here.
+void RunIndexCorruptedSegment(Sim* s) {
+  const ai::EmbeddingModelId model = ai::ComputeModelId(SimModel());
+  IndexPeer peer;
+  peer.manifest.reset(new ai::ManifestDoc(model));
+
+  std::vector<ai::SegmentId> inputs;
+  for (int i = 0; i < 6; ++i) {
+    ai::ManifestOp add = peer.Make(ai::ManifestOpKind::kAdd, s->replicas[0].id);
+    add.segment = SegmentFromSeed(static_cast<uint64_t>(i) * 999983 + 5);
+    add.count = 10;
+    add.model = model;
+    (void)peer.manifest->Apply(add);
+    peer.present.insert(add.segment);
+    inputs.push_back(add.segment);
+    ++s->result.manifest_ops;
+  }
+
+  // A compaction elsewhere produces a replacement this device does not have --
+  // because the transfer failed, or the bytes arrived damaged and were refused.
+  const ai::SegmentId replacement = SegmentFromSeed(0xDEADBEEFull);
+  ai::ManifestOp add = peer.Make(ai::ManifestOpKind::kAdd, s->replicas[1].id);
+  add.segment = replacement;
+  add.count = 60;
+  add.model = model;
+  (void)peer.manifest->Apply(add);
+  ++s->result.manifest_ops;
+  for (const ai::SegmentId& id : inputs) {
+    ai::ManifestOp r =
+        peer.Make(ai::ManifestOpKind::kRetire, s->replicas[1].id);
+    r.segment = id;
+    r.superseded_by = replacement;
+    (void)peer.manifest->Apply(r);
+    ++s->result.manifest_ops;
+  }
+  ++s->result.segments_refused;
+
+  // EVERY INPUT MUST STILL BE LIVE. This is the whole safety condition: the
+  // device was told they are retired and it does not have what replaces them.
+  const std::vector<ai::SegmentId> live = LiveFor(peer);
+  for (const ai::SegmentId& id : inputs) {
+    if (std::find(live.begin(), live.end(), id) == live.end()) {
+      s->result.failure =
+          "a segment was dropped while its replacement was missing, so the "
+          "index is silently incomplete";
+      return;
+    }
+  }
+  s->result.retirements_held += inputs.size();
+
+  // And once the replacement is here, they go.
+  peer.present.insert(replacement);
+  const std::vector<ai::SegmentId> after = LiveFor(peer);
+  for (const ai::SegmentId& id : inputs) {
+    if (std::find(after.begin(), after.end(), id) != after.end()) {
+      s->result.failure =
+          "a retirement never took effect, so the index only grows";
+      return;
+    }
+  }
+  if (std::find(after.begin(), after.end(), replacement) == after.end()) {
+    s->result.failure = "the replacement is not live";
+    return;
+  }
+}
+
 Result RunSchedule(uint64_t seed, const Config& cfg, Adversarial adversarial) {
   Sim s(seed, cfg);
   s.require_contiguous_runs = ScheduleRequiresContiguousRuns(adversarial);
@@ -1919,6 +2259,21 @@ Result RunSchedule(uint64_t seed, const Config& cfg, Adversarial adversarial) {
       break;
     case Adversarial::kRestartFromLog:
       RunRestartFromLog(&s);
+      break;
+    case Adversarial::kIndexSegmentBeforeManifest:
+      RunIndexSegmentBeforeManifest(&s);
+      break;
+    case Adversarial::kIndexStaleManifest:
+      RunIndexStaleManifest(&s);
+      break;
+    case Adversarial::kIndexConcurrentCompaction:
+      RunIndexConcurrentCompaction(&s);
+      break;
+    case Adversarial::kIndexForeignModel:
+      RunIndexForeignModel(&s);
+      break;
+    case Adversarial::kIndexCorruptedSegment:
+      RunIndexCorruptedSegment(&s);
       break;
   }
   if (!s.result.failure.empty()) {
