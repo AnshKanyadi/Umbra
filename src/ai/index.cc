@@ -912,8 +912,30 @@ IndexStatus Index::Compact(uint32_t min_segments,
     // A COMPACTION THAT PRODUCES AN EXISTING SEGMENT IS A NO-OP, not a bug: the
     // segment is content-addressed, so rebuilding the same live set gives the
     // same id. Rewriting the manifest in that case would churn for nothing.
-    if (im.segments.count(new_id) != 0 && chosen.size() == 1 &&
-        chosen[0] == new_id) {
+    //
+    // AND IF THAT EXISTING SEGMENT CARRIES TOMBSTONES, ADOPTING IT DESTROYS THE
+    // INDEX. This guard used to require chosen.size() == 1, which let the
+    // dangerous case straight through. Found by following docs/USING.md on a
+    // real vault: build, compact, build, compact left an index reporting three
+    // vectors, all dead, zero objects, and a search that answered nothing.
+    //
+    // The sequence: the rebuild re-adds each note as its own segment and
+    // tombstones the copies inside the compacted one -- correctly, they are
+    // superseded. Compacting again gathers exactly the live vectors, which are
+    // byte-for-byte what the first compaction produced, so Seal returns THE
+    // SAME ID. Its slots are all tombstoned, and tombstones are grow-only by
+    // design, so the resurrected segment comes back dead.
+    //
+    // Refusing is the fix, not clearing the tombstones: on a second device the
+    // same id names the same bytes in the same slots, so a tombstone on it is
+    // that device saying the vector is deleted. Dropping it here would resolve
+    // a lattice by forgetting half of it. Refusing leaves the index exactly as
+    // it was -- larger than it needs to be, and correct.
+    const std::map<SegmentId, Loaded>::const_iterator existing =
+        im.segments.find(new_id);
+    if (existing != im.segments.end() &&
+        (existing->second.dead_count > 0 ||
+         std::find(chosen.begin(), chosen.end(), new_id) != chosen.end())) {
       return IndexStatus::kOk;
     }
     if (!WriteFileAtomically(im.PathFor(new_id), sealed)) {

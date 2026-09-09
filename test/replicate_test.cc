@@ -1379,5 +1379,72 @@ TEST(Replication, ATombstoneSurvivesARestartBeforeItsSegmentArrives) {
   EXPECT_EQ(b.index->Stats().vectors, a.index->Stats().vectors);
 }
 
+// COMPACT, REINDEX, COMPACT MUST NOT EMPTY THE INDEX.
+//
+// Compaction is content addressed, so merging the same live set twice produces
+// the same segment id. Between the two merges a reindex re-adds each note as
+// its own segment and tombstones the copies inside the compacted one --
+// correctly, they are superseded. The second merge then gathers exactly the
+// live vectors, which are byte for byte what the first merge produced, so Seal
+// hands back an id whose every slot is already tombstoned. Tombstones are
+// grow-only, so adopting it resurrects a segment that is entirely dead.
+//
+// Found by following docs/USING.md against a real Obsidian vault: build,
+// compact, build, compact reported "3 vectors (3 tombstoned), objects 0" and a
+// search that answered nothing at all. The index destroyed itself and said so
+// only in --stats.
+TEST(Replication, CompactingTwiceAroundAReindexDoesNotEmptyTheIndex) {
+  Device a;
+  ASSERT_NO_FATAL_FAILURE(a.Open(0xA1));
+  for (uint8_t i = 0; i < 3; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+        a.IndexNote(static_cast<uint8_t>(i + 1), kTopics[i % 4]));
+  }
+  const uint32_t objects = a.index->Stats().objects;
+  ASSERT_EQ(objects, 3u);
+
+  uint32_t merged = 0;
+  uint32_t reclaimed = 0;
+  ASSERT_EQ(a.index->Compact(2, 10, &merged, &reclaimed), IndexStatus::kOk);
+  ASSERT_GT(merged, 1u);
+  ASSERT_EQ(a.index->Stats().objects, objects);
+  ASSERT_EQ(a.index->SegmentIds().size(), 1u);
+
+  // REOPENED BETWEEN THE STEPS, WHICH IS WHAT THE COMMAND LINE DOES. Every
+  // umbra_ai invocation opens the index fresh, and a retirement is not
+  // reconstructible from what is on disk (ADR 0008) -- so after a restart the
+  // compacted segment no longer supersedes its inputs and all of them are live
+  // again. Without this the planner excludes the re-added segments as
+  // superseded, chooses nothing, and the bug never fires.
+  ASSERT_NO_FATAL_FAILURE(a.Reopen());
+
+  // The same notes again, unchanged. This tombstones the compacted copies and
+  // re-adds each note as its own segment.
+  for (uint8_t i = 0; i < 3; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+        a.IndexNote(static_cast<uint8_t>(i + 1), kTopics[i % 4]));
+  }
+  ASSERT_EQ(a.index->Stats().objects, objects);
+  ASSERT_GT(a.index->Stats().tombstoned, 0u);
+
+  // And the merge that used to destroy everything.
+  ASSERT_NO_FATAL_FAILURE(a.Reopen());
+  ASSERT_EQ(a.index->Compact(2, 10, &merged, &reclaimed), IndexStatus::kOk);
+  EXPECT_EQ(a.index->Stats().objects, objects)
+      << "compaction adopted a segment whose slots were already tombstoned, so "
+         "every vector came back dead and the index answers nothing";
+
+  // Live vectors, not merely present ones: an index of three dead vectors
+  // reports three vectors and retrieves none.
+  const IndexStats st = a.index->Stats();
+  EXPECT_GT(st.vectors, st.tombstoned)
+      << st.tombstoned << " of " << st.vectors << " vectors are dead";
+
+  // A restart must not resurrect it either: the fold is rebuilt from disk and
+  // the tombstone keys are on disk.
+  ASSERT_NO_FATAL_FAILURE(a.Reopen());
+  EXPECT_EQ(a.index->Stats().objects, objects);
+}
+
 }  // namespace ai
 }  // namespace umbra
