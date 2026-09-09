@@ -63,6 +63,27 @@ uint32_t GetU32(const char* p) {
          static_cast<uint32_t>(static_cast<uint8_t>(p[3]));
 }
 
+// The last counter this device PUBLISHED, which anchors the back-pointer
+// chain. Kept apart from the counter high-water mark because reopening an
+// index advances that mark without publishing anything.
+std::string PublishedKey() { return std::string(1, kMetaPrefix) + "published"; }
+
+std::string Counter8(uint64_t v) {
+  std::string out;
+  for (int i = 7; i >= 0; --i) {
+    out.push_back(static_cast<char>((v >> (i * 8)) & 0xFF));
+  }
+  return out;
+}
+
+bool ReadCounter8(const std::string& v, uint64_t* out) {
+  if (v.size() != 8) return false;
+  uint64_t n = 0;
+  for (std::size_t i = 0; i < 8; ++i) n = (n << 8) | static_cast<uint8_t>(v[i]);
+  *out = n;
+  return true;
+}
+
 std::string AnnouncedKey(const SegmentId& id) {
   std::string k(1, kAnnouncedPrefix);
   k.append(reinterpret_cast<const char*>(id.bytes.data()), id.bytes.size());
@@ -230,13 +251,23 @@ struct Index::Impl {
     (void)manifest->Apply(op);
     pending.push_back(op);
     if (op.kind == ManifestOpKind::kAdd) MarkAnnounced(op.segment);
-    std::string key(1, kPendingPrefix);
-    for (int i = 7; i >= 0; --i) {
-      key.push_back(static_cast<char>((op.id.counter >> (i * 8)) & 0xFF));
-    }
+    const std::string key =
+        std::string(1, kPendingPrefix) + Counter8(op.id.counter);
     const std::string value = EncodeManifestOp(op);
     basalt::WriteBatch batch;
     batch.Set(basalt::Slice(key), basalt::Slice(value));
+    // AND THE CHAIN HEAD, IN THE SAME BATCH. A puller verifies that each
+    // operation's back-pointer names the one before it, starting from zero, so
+    // the value this device must remember across a restart is the counter of
+    // the last operation it PUBLISHED. That is not the same number as the
+    // counter high-water mark below: reopening an index burns counters
+    // reconstructing the local fold, and a chain anchored to a burnt counter
+    // points at an operation no peer has ever seen. Same batch as the operation
+    // because a chain head that outlives its operation, or the reverse, is a
+    // chain nobody can follow.
+    const std::string head_key = PublishedKey();
+    const std::string head = Counter8(op.id.counter);
+    batch.Set(basalt::Slice(head_key), basalt::Slice(head));
     basalt::wal::SeqNum seq = 0;
     (void)db->Write(batch, &seq);
   }
@@ -260,10 +291,7 @@ struct Index::Impl {
   // keyed by (object, replica, counter), so a reissued counter is a lost write
   // and not a conflict -- the same defect Vault::ApplyTreeOp had.
   void SaveCounter() {
-    std::string value;
-    for (int i = 7; i >= 0; --i) {
-      value.push_back(static_cast<char>((counter >> (i * 8)) & 0xFF));
-    }
+    const std::string value = Counter8(counter);
     const std::string key = std::string(1, kMetaPrefix) + "counter";
     basalt::WriteBatch batch;
     batch.Set(basalt::Slice(key), basalt::Slice(value));
@@ -439,19 +467,35 @@ IndexStatus Index::Open(const std::string& dir, const VaultKeys* keys,
   // before they reached a relay. Either way the peers cannot know it exists,
   // and the only device that can tell them is this one.
   //
-  // This runs before the counter is recovered so the operations it makes get
-  // counters above anything already published.
+  // THE COUNTER AND THE CHAIN HEAD ARE RECOVERED FROM THE STORE, not restarted,
+  // and they are two different numbers.
+  //
+  // The counter is a high-water mark for issuing ids: a device that reissued
+  // one after a restart would produce two manifest operations with a single id,
+  // and the oplog is keyed by (object, replica, counter), so the second would
+  // overwrite the first. That is the defect Vault::ApplyTreeOp had, and it is
+  // worth not making twice. The fold above burns counters for the same reason
+  // -- its reconstructed operations must not collide with published ones.
+  //
+  // The chain head is what a puller verifies against, and it must name an
+  // operation that actually reached a relay. Anchoring the chain to the counter
+  // instead cost a whole afternoon: with two real devices the puller reported
+  // chain-broken and applied nothing, because the first operation this device
+  // published pointed back at a counter burnt reconstructing a local fold.
   {
-    const std::string key = std::string(1, kMetaPrefix) + "counter";
+    const std::string counter_key = std::string(1, kMetaPrefix) + "counter";
+    const std::string head_key = PublishedKey();
     std::string held;
-    if (im.db->Get(basalt::Slice(key), &held).ok() && held.size() == 8) {
-      uint64_t stored = 0;
-      for (std::size_t i = 0; i < 8; ++i) {
-        stored = (stored << 8) | static_cast<uint8_t>(held[i]);
-      }
-      if (stored > im.counter) im.counter = stored;
+    uint64_t stored = 0;
+    if (im.db->Get(basalt::Slice(counter_key), &held).ok() &&
+        ReadCounter8(held, &stored) && stored > im.counter) {
+      im.counter = stored;
     }
-    im.prev = im.counter;
+    uint64_t published = 0;
+    if (im.db->Get(basalt::Slice(head_key), &held).ok()) {
+      (void)ReadCounter8(held, &published);
+    }
+    im.prev = published;
   }
   for (const std::pair<const SegmentId, Loaded>& kv : im.segments) {
     if (im.Announced(kv.first)) continue;
@@ -470,24 +514,6 @@ IndexStatus Index::Open(const std::string& dir, const VaultKeys* keys,
     }
   }
   im.SaveCounter();
-
-  // THE PUBLISHED COUNTER IS RECOVERED FROM THE STORE, not restarted. A device
-  // that reissued counters after a restart would produce two different manifest
-  // operations with one id, and the oplog is keyed by (object, replica,
-  // counter) -- so the second would overwrite the first. That is the same
-  // defect Vault::ApplyTreeOp had, and it is worth not making twice.
-  {
-    const std::string key = std::string(1, kMetaPrefix) + "counter";
-    std::string held;
-    if (im.db->Get(basalt::Slice(key), &held).ok() && held.size() == 8) {
-      uint64_t stored = 0;
-      for (std::size_t i = 0; i < 8; ++i) {
-        stored = (stored << 8) | static_cast<uint8_t>(held[i]);
-      }
-      if (stored > im.counter) im.counter = stored;
-    }
-    im.prev = im.counter;
-  }
 
   *out = std::move(idx);
   return IndexStatus::kOk;

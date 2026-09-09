@@ -160,6 +160,33 @@ std::size_t Ship(Device* from, Device* to) {
   return ops.size();
 }
 
+// SHIP THE WAY A CLIENT SHIPS, verifying the back-pointer chain instead of
+// trusting it. `Ship` above applies operations straight across, which is what a
+// test wants when the subject is the fold -- and it is exactly why no test
+// caught a device whose chain pointed at an operation it had never published.
+// Client::FetchObjectWith refuses that (src/sync/client.cc:189) and returns
+// chain-broken; a cursor of zero here means the same thing.
+struct Chain {
+  uint64_t cursor = 0;
+  std::size_t applied = 0;
+  bool broken = false;
+};
+
+Chain ShipChecked(Device* from, Device* to, uint64_t cursor = 0) {
+  Chain c;
+  c.cursor = cursor;
+  for (const ManifestOp& op : from->index->TakePending()) {
+    if (op.prev != c.cursor) {
+      c.broken = true;
+      return c;
+    }
+    (void)to->index->ApplyManifestOp(op);
+    c.cursor = op.id.counter;
+    ++c.applied;
+  }
+  return c;
+}
+
 // Move the bytes of every segment the destination is missing.
 std::size_t ShipSegments(Device* from, Device* to) {
   std::size_t moved = 0;
@@ -1049,6 +1076,137 @@ TEST(Replication, ASegmentPresentWithoutAnAnnouncementIsPublished) {
     (void)b.index->ApplyManifestOp(op);
   }
   EXPECT_EQ(b.index->Missing().size(), 1u);
+}
+
+// THE CHAIN SURVIVES A RESTART, which is where it broke.
+//
+// Reopening an index rebuilds the manifest fold by replaying the segments on
+// disk, and those reconstructed operations burn counters so they cannot collide
+// with published ones (src/ai/index.cc:407). The chain head is a different
+// number: the counter of the last operation that actually reached a relay. It
+// used to be set from the counter, so the first operation published after a
+// restart pointed back at a counter no peer had ever seen, and a real puller
+// answered chain-broken and applied nothing.
+//
+// Nothing caught this for two phases because both "devices" in the driver
+// derived one replica id from their index path, so the puller recognised every
+// operation as its own and never verified a chain at all.
+TEST(Replication, TheBackPointerChainSurvivesARestart) {
+  Device a;
+  ASSERT_NO_FATAL_FAILURE(a.Open(0xA1));
+  Device b;
+  ASSERT_NO_FATAL_FAILURE(b.Open(0xB2));
+
+  ASSERT_NO_FATAL_FAILURE(a.IndexNote(1, kTopics[0]));
+  const Chain first = ShipChecked(&a, &b);
+  EXPECT_FALSE(first.broken) << "the very first operation broke the chain";
+  EXPECT_GT(first.applied, 0u);
+
+  // The restart, and then more work. A device that indexes again after being
+  // reopened is the ordinary case, not an exotic one.
+  ASSERT_NO_FATAL_FAILURE(a.Reopen());
+  ASSERT_NO_FATAL_FAILURE(a.IndexNote(2, kTopics[1]));
+  const Chain second = ShipChecked(&a, &b, first.cursor);
+  EXPECT_FALSE(second.broken)
+      << "a restart left the chain pointing at an operation the peer never saw";
+  EXPECT_GT(second.applied, 0u);
+
+  // And a second restart, because the chain head is persisted by the operation
+  // that advances it -- a value written once at open would survive one restart
+  // and not two.
+  ASSERT_NO_FATAL_FAILURE(a.Reopen());
+  ASSERT_NO_FATAL_FAILURE(a.IndexNote(3, kTopics[2]));
+  const Chain third = ShipChecked(&a, &b, second.cursor);
+  EXPECT_FALSE(third.broken) << "the chain head did not survive two restarts";
+  EXPECT_GT(third.applied, 0u);
+}
+
+// A DEVICE THAT PULLS BEFORE IT PUBLISHES STILL CHAINS FROM ZERO.
+//
+// Adopted segments are replayed into the fold at open exactly like locally
+// built ones, so a device that pulled ten segments and then indexed one note of
+// its own had burnt ten counters and anchored its first published operation to
+// the tenth. Its peer had seen none of them.
+TEST(Replication, APullerThatLaterPublishesChainsFromZero) {
+  Device a;
+  ASSERT_NO_FATAL_FAILURE(a.Open(0xA1));
+  Device b;
+  ASSERT_NO_FATAL_FAILURE(b.Open(0xB2));
+
+  for (uint8_t i = 0; i < 4; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+        a.IndexNote(static_cast<uint8_t>(i + 1), kTopics[i % 4]));
+  }
+  ASSERT_GT(Ship(&a, &b), 0u);
+  ASSERT_GT(ShipSegments(&a, &b), 0u);
+
+  // B has never published anything, so its chain must start at zero no matter
+  // how many of A's segments it is now carrying.
+  ASSERT_NO_FATAL_FAILURE(b.Reopen());
+  ASSERT_NO_FATAL_FAILURE(b.IndexNote(40, kTopics[0]));
+  Device c;
+  ASSERT_NO_FATAL_FAILURE(c.Open(0xC3));
+  const Chain fresh = ShipChecked(&b, &c);
+  EXPECT_FALSE(fresh.broken)
+      << "a device that pulled before it published anchored its first "
+         "operation to a counter burnt by the segments it adopted";
+  EXPECT_GT(fresh.applied, 0u);
+}
+
+// AN INDEX BUILT BEFORE MANIFEST OPERATIONS EXISTED PUBLISHES A FOLLOWABLE
+// CHAIN. The announce-on-open path (src/ai/index.cc:441) is the recovery for a
+// segment nobody has been told about, and it runs after the fold has already
+// burnt a counter per segment. This is the shape that failed against a live
+// relay with a 24 MB index: ten operations pushed, zero applied.
+TEST(Replication, AnAnnouncedLegacyIndexPublishesAFollowableChain) {
+  Device a;
+  ASSERT_NO_FATAL_FAILURE(a.Open(0xA1));
+  for (uint8_t i = 0; i < 4; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+        a.IndexNote(static_cast<uint8_t>(i + 1), kTopics[i % 4]));
+  }
+  // Drop what it was going to publish, and the record that it ever announced
+  // anything: a store from before announcements existed.
+  (void)a.index->TakePending();
+  a.index.reset();
+  {
+    std::unique_ptr<basalt::Env> env = basalt::NewPosixEnv();
+    std::unique_ptr<basalt::DB> db;
+    const basalt::wal::Caps caps;
+    ASSERT_TRUE(
+        basalt::DB::Open(env.get(), a.dir.path() + "/manifest", caps, &db)
+            .ok());
+    basalt::WriteBatch batch;
+    basalt::IterOptions o;
+    const std::string lo(1, 'a');
+    const std::string hi(1, 'b');
+    o.lower = basalt::Bound::At(basalt::Slice(lo));
+    o.upper = basalt::Bound::At(basalt::Slice(hi));
+    std::unique_ptr<basalt::Iterator> it = db->NewIter(o);
+    for (bool ok = it->First(); ok; ok = it->Next()) {
+      batch.Delete(it->Key());
+    }
+    ASSERT_TRUE(it->Close().ok());
+    const std::string head = std::string(1, 'm') + "published";
+    batch.Delete(basalt::Slice(head));
+    basalt::wal::SeqNum seq = 0;
+    ASSERT_TRUE(db->Write(batch, &seq).ok());
+    basalt::wal::SeqNum watermark = 0;
+    ASSERT_TRUE(db->Sync(&watermark).ok());
+  }
+  ASSERT_NO_FATAL_FAILURE(a.Reopen());
+
+  Device b;
+  ASSERT_NO_FATAL_FAILURE(b.Open(0xB2));
+  const Chain c = ShipChecked(&a, &b);
+  EXPECT_FALSE(c.broken)
+      << "a legacy index announced itself with a chain no peer could follow";
+  EXPECT_GT(c.applied, 0u);
+  // And what it announced is what it holds: the peer now knows about every
+  // segment and can fetch the bytes.
+  EXPECT_EQ(b.index->Missing().size(), a.index->Stats().segments);
+  EXPECT_EQ(ShipSegments(&a, &b), a.index->Stats().segments);
+  EXPECT_EQ(b.index->Stats().segments, a.index->Stats().segments);
 }
 
 }  // namespace ai
