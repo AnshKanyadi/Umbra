@@ -69,25 +69,35 @@ std::string FirstSegment(const std::string& index_dir) {
 }
 
 // Flip one byte in place. Without a shell: see the note on RemoveTree.
+//
+// The handle is closed by a guard rather than at each early return: fclose
+// returns a value that cert-err33-c requires be used, and four scattered
+// close-and-return paths were four places to get that wrong.
+class FileHandle {
+ public:
+  explicit FileHandle(std::FILE* f) : f_(f) {}
+  ~FileHandle() {
+    if (f_ != nullptr) {
+      const int rc = std::fclose(f_);
+      (void)rc;
+    }
+  }
+  FileHandle(const FileHandle&) = delete;
+  FileHandle& operator=(const FileHandle&) = delete;
+  std::FILE* get() const { return f_; }
+
+ private:
+  std::FILE* f_;
+};
+
 bool FlipByteAt(const std::string& path, long offset) {
-  std::FILE* f = std::fopen(path.c_str(), "r+b");
-  if (f == nullptr) return false;
-  if (std::fseek(f, offset, SEEK_SET) != 0) {
-    std::fclose(f);
-    return false;
-  }
-  const int c = std::fgetc(f);
-  if (c == EOF) {
-    std::fclose(f);
-    return false;
-  }
-  if (std::fseek(f, offset, SEEK_SET) != 0) {
-    std::fclose(f);
-    return false;
-  }
-  const bool ok = std::fputc(c ^ 0x40, f) != EOF;
-  std::fclose(f);
-  return ok;
+  FileHandle f(std::fopen(path.c_str(), "r+b"));
+  if (f.get() == nullptr) return false;
+  if (std::fseek(f.get(), offset, SEEK_SET) != 0) return false;
+  const int c = std::fgetc(f.get());
+  if (c == EOF) return false;
+  if (std::fseek(f.get(), offset, SEEK_SET) != 0) return false;
+  return std::fputc(c ^ 0x40, f.get()) != EOF;
 }
 
 class TempDir {
