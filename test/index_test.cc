@@ -178,9 +178,20 @@ TEST(Index, RecallAgainstBruteForce) {
   uint32_t reclaimed = 0;
   ASSERT_EQ(idx->Compact(2, 20, &merged, &reclaimed), IndexStatus::kOk);
 
+  // TWO NUMBERS, BECAUSE ONE OF THEM IS MISLEADING ON THIS CORPUS.
+  //
+  // Identity recall asks "did the graph return the same slots brute force
+  // did". On a corpus with exact ties -- and this one has many, because six
+  // topics repeat across two hundred notes -- two different slots can hold
+  // vectors at identical distance, so the graph returning one and brute force
+  // the other counts as a miss while the answer is exactly as good.
+  //
+  // Score recall asks the question that matters: were the results returned as
+  // NEAR as the true top k. Both are printed. Neither is quietly preferred.
   const uint32_t k = 10;
   std::size_t hit = 0;
   std::size_t total = 0;
+  std::size_t as_good = 0;
   for (uint32_t qi = 0; qi < 40; ++qi) {
     Vector q;
     ASSERT_EQ(
@@ -198,17 +209,38 @@ TEST(Index, RecallAgainstBruteForce) {
     for (const SearchHit& h : approx) {
       if (want.count({h.segment.Hex(), h.slot}) != 0) ++hit;
     }
+    if (!exact.empty()) {
+      const float floor_score = exact.back().score;
+      for (const SearchHit& h : approx) {
+        // A small tolerance: the two paths accumulate the same dot product in
+        // the same order, but the sort is over floats and an exact compare
+        // would make this brittle for no gain.
+        if (h.score >= floor_score - 1e-6f) ++as_good;
+      }
+    }
     total += want.size();
   }
   ASSERT_GT(total, 0u);
   const double recall = static_cast<double>(hit) / static_cast<double>(total);
-  std::printf("recall@%u against brute force: %.4f over %zu results\n", k,
-              recall, total);
-  // A FLOOR, NOT A TARGET. It is set low enough that only a broken graph fails
-  // it -- an unreachable region, a search that never leaves the entry point --
-  // rather than at a number chosen to look good. The measured value is printed
-  // so a regression shows as a number rather than as a pass.
-  EXPECT_GT(recall, 0.80);
+  const double score_recall =
+      static_cast<double>(as_good) / static_cast<double>(total);
+  std::printf(
+      "recall@%u against brute force: identity %.4f, score %.4f, over %zu "
+      "results\n",
+      k, recall, score_recall, total);
+  // FLOORS, NOT TARGETS, and set from what is actually measured rather than
+  // from what sounds respectable. Both read 1.0000 on this corpus at ef 64.
+  //
+  // They started at 0.80 because the first version of the graph could not do
+  // better: back-link pruning kept the nearest M instead of applying the
+  // diversity heuristic, so in a cluster of near-identical vectors a late
+  // arrival lost every in-edge and became unreachable. Recall sat at 0.84 for
+  // every ef from 16 to 512, which is the signature of a connectivity bug
+  // rather than a beam that is too narrow -- a wider search cannot reach a node
+  // nothing points at. This test is what found it, and the floors are now where
+  // a return of that bug fails rather than passes.
+  EXPECT_GT(recall, 0.95);
+  EXPECT_GT(score_recall, 0.99);
 }
 
 // EDITING ONE NOTE MUST NOT REINDEX THE VAULT.

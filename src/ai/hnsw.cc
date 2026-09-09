@@ -166,16 +166,17 @@ std::vector<Neighbour> HnswGraph::SearchLayer(const float* query,
   return out;
 }
 
-void HnswGraph::Connect(uint32_t node, uint32_t layer,
-                        const std::vector<Neighbour>& candidates) {
-  const uint32_t width = LayerWidth(layer);
-  const uint32_t base = LayerBase(node, layer);
-
-  // THE NEIGHBOUR HEURISTIC, NOT SIMPLY THE TOP M. Taking the M nearest gives a
-  // graph where every node points into the same dense cluster and long edges
-  // never get made, so a search that starts on the wrong side of the space has
-  // no way across. A candidate is kept only if it is nearer to the node than to
-  // any neighbour already kept, which is what preserves those long edges.
+// THE NEIGHBOUR HEURISTIC, NOT SIMPLY THE TOP M. Taking the M nearest gives a
+// graph where every node points into the same dense cluster and long edges
+// never get made, so a search that starts on the wrong side of the space has no
+// way across. A candidate is kept only if it is nearer to `node` than to any
+// neighbour already kept, which is what preserves those long edges.
+//
+// Used for BOTH the forward edges and the pruning of a full neighbour's list.
+// Using it for one and not the other is what orphaned nodes; see Connect.
+std::vector<Neighbour> HnswGraph::Select(
+    uint32_t node, const std::vector<Neighbour>& candidates,
+    uint32_t width) const {
   std::vector<Neighbour> kept;
   for (const Neighbour& c : candidates) {
     if (c.id == node) continue;
@@ -201,7 +202,15 @@ void HnswGraph::Connect(uint32_t node, uint32_t layer,
     }
     if (!already) kept.push_back(c);
   }
+  return kept;
+}
 
+void HnswGraph::Connect(uint32_t node, uint32_t layer,
+                        const std::vector<Neighbour>& candidates) {
+  const uint32_t width = LayerWidth(layer);
+  const uint32_t base = LayerBase(node, layer);
+
+  const std::vector<Neighbour> kept = Select(node, candidates, width);
   for (uint32_t i = 0; i < width; ++i) {
     adjacency_[base + i] = (i < kept.size()) ? kept[i].id : UINT32_MAX;
   }
@@ -218,8 +227,16 @@ void HnswGraph::Connect(uint32_t node, uint32_t layer,
       adjacency_[kbase + filled] = node;
       continue;
     }
-    // Full: rebuild that node's list from its current neighbours plus this one,
-    // keeping the nearest by the same rule.
+    // Full: rebuild that node's list from its current neighbours plus this one.
+    //
+    // BY THE SAME HEURISTIC, NOT BY SCORE. Pruning to the nearest M here was a
+    // real defect and a subtle one: forward edges kept diversity, back edges
+    // did not, so in a cluster of near-identical vectors every late arrival was
+    // the worst neighbour of everything it pointed at and lost all of its
+    // in-edges. Those nodes then had out-edges and no way in -- unreachable
+    // from the entry point, and no amount of beam width finds them. It showed
+    // up as recall stuck at 0.84 whether ef was 16 or 512, which is the shape
+    // of a connectivity bug rather than a search-width one.
     std::vector<Neighbour> merged;
     const float* kv = vectors_ + (static_cast<std::size_t>(k.id) * dimension_);
     for (uint32_t i = 0; i < width; ++i) {
@@ -235,8 +252,9 @@ void HnswGraph::Connect(uint32_t node, uint32_t layer,
     self.score = static_cast<float>(Score(kv, node));
     merged.push_back(self);
     std::sort(merged.begin(), merged.end(), SortNearer);
+    const std::vector<Neighbour> pruned = Select(k.id, merged, width);
     for (uint32_t i = 0; i < width; ++i) {
-      adjacency_[kbase + i] = (i < merged.size()) ? merged[i].id : UINT32_MAX;
+      adjacency_[kbase + i] = (i < pruned.size()) ? pruned[i].id : UINT32_MAX;
     }
   }
 }

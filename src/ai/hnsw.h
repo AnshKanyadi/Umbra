@@ -131,6 +131,9 @@ class HnswGraph {
                                      uint32_t ef, uint32_t layer,
                                      std::vector<uint32_t>* stamps,
                                      uint32_t stamp) const;
+  std::vector<Neighbour> Select(uint32_t node,
+                                const std::vector<Neighbour>& candidates,
+                                uint32_t width) const;
   void Connect(uint32_t node, uint32_t layer,
                const std::vector<Neighbour>& candidates);
 };
