@@ -215,7 +215,22 @@ jobs:
         with:
           fetch-depth: 0
 
-      - run: sudo apt-get update && sudo apt-get install -y clang-format
+      # THE RUNNER'S THIRD PARTY APT LISTS ARE NOT THIS BUILD'S BUSINESS.
+      # `apt-get update` exits non-zero if ANY configured repository serves a
+      # bad index, and the GitHub image ships Google Chrome's and Microsoft's.
+      # Both lint lanes failed twice in a row on "Hash Sum mismatch ...
+      # dl.google.com/linux/chrome-stable" -- a repo this project does not use,
+      # for a package it does not install -- so neither tool was ever installed
+      # and neither lane said anything about the code.
+      #
+      # Named files, not a glob: on noble the Ubuntu archive itself lives under
+      # sources.list.d, and removing it would turn this into "Unable to locate
+      # package", which is a worse failure wearing the same clothes.
+      - run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          sudo apt-get install -y clang-format
 
       # The merge base, not the base tip: comparing against the tip would
       # attribute every line the base moved on since the branch started to this
@@ -285,7 +300,22 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - run: sudo apt-get update && sudo apt-get install -y clang-tidy cmake
+      # THE RUNNER'S THIRD PARTY APT LISTS ARE NOT THIS BUILD'S BUSINESS.
+      # `apt-get update` exits non-zero if ANY configured repository serves a
+      # bad index, and the GitHub image ships Google Chrome's and Microsoft's.
+      # Both lint lanes failed twice in a row on "Hash Sum mismatch ...
+      # dl.google.com/linux/chrome-stable" -- a repo this project does not use,
+      # for a package it does not install -- so neither tool was ever installed
+      # and neither lane said anything about the code.
+      #
+      # Named files, not a glob: on noble the Ubuntu archive itself lives under
+      # sources.list.d, and removing it would turn this into "Unable to locate
+      # package", which is a worse failure wearing the same clothes.
+      - run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          sudo apt-get install -y clang-tidy cmake
 
       - name: resolve the merge base
         id: base
