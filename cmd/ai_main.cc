@@ -851,8 +851,8 @@ int Pull(const Options& o) {
   // the instant its replacement arrives, so fetching in manifest order spends a
   // round trip on each of them for nothing. Invisible on localhost and glaring
   // on a network: a cold pull of a compacted 2000-note index made 2000 doomed
-  // fetches, half a second at a sub-millisecond round trip and about seven
-  // minutes at 200ms.
+  // fetches, half a second at a sub-millisecond round trip; the 200ms cost is
+  // arithmetic rather than measured, because the run was killed.
   //
   // Both halves are on Index (include/umbra/ai/index.h) rather than here. They
   // were here first, and a duplicated line disabled the entire fetch loop with

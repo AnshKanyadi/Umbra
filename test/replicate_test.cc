@@ -1220,7 +1220,9 @@ TEST(Replication, AnAnnouncedLegacyIndexPublishesAFollowableChain) {
 //
 // Free on localhost, ruinous on a network: a cold pull of a compacted
 // 2000-note index made 2000 doomed fetches, half a second at a sub-millisecond
-// round trip and about seven minutes at 200ms. cmd/ai_main.cc orders the fetch
+// round trip. The cost at 200ms is arithmetic, not measured: 2000 fetches at
+// two round trips each is minutes, and the run was killed rather than waited
+// out. cmd/ai_main.cc orders the fetch
 // so replacements come first; this pins the property that makes that possible.
 TEST(Replication, WhatCompactionRetiredIsNotWantedOnceItsReplacementIsHeld) {
   Device a;
