@@ -1080,7 +1080,14 @@ int main(int argc, char** argv) {
     // to say so: --once in a cron entry or a shell && chain is the whole
     // audience for this. --watch keeps going, because a relay that comes back
     // is the ordinary case there.
-    if (!watch) return unreachable ? 1 : 0;
+    //
+    // EXCEPT AFTER --create, WHICH ASKED FOR A VAULT AND GOT ONE. The round it
+    // runs afterwards is a convenience, and on one machine there is nothing to
+    // reach yet -- so a vault that was created successfully must not report
+    // failure. Found by following docs/USING.md: step three ended in exit 1
+    // with the vault sitting there, correctly made, which stops any `set -e`
+    // script and tells a first-time user their vault did not work.
+    if (!watch) return (unreachable && mode != Mode::kCreate) ? 1 : 0;
     struct timespec ts;
     ts.tv_sec = interval;
     ts.tv_nsec = 0;
