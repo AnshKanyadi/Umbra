@@ -10,6 +10,7 @@
 // same vectors produce the same bytes.
 #include "umbra/ai/index.h"
 
+#include <dirent.h>
 #include <ftw.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -45,6 +46,48 @@ void RemoveTree(const std::string& path) {
   // FTW_DEPTH so a directory is visited after its contents; FTW_PHYS so a
   // symlink is unlinked rather than followed out of the temporary directory.
   (void)::nftw(path.c_str(), RemoveEntry, 16, FTW_DEPTH | FTW_PHYS);
+}
+
+// The first segment file in an index directory, by name so the choice is
+// stable. Used by the tests that damage one.
+std::string FirstSegment(const std::string& index_dir) {
+  const std::string dir = index_dir + "/segments";
+  DIR* d = ::opendir(dir.c_str());
+  if (d == nullptr) return std::string();
+  std::vector<std::string> names;
+  struct dirent* e = nullptr;
+  while ((e = ::readdir(d)) != nullptr) {
+    const std::string name = e->d_name;
+    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".seg") == 0) {
+      names.push_back(name);
+    }
+  }
+  ::closedir(d);
+  if (names.empty()) return std::string();
+  std::sort(names.begin(), names.end());
+  return dir + "/" + names.front();
+}
+
+// Flip one byte in place. Without a shell: see the note on RemoveTree.
+bool FlipByteAt(const std::string& path, long offset) {
+  std::FILE* f = std::fopen(path.c_str(), "r+b");
+  if (f == nullptr) return false;
+  if (std::fseek(f, offset, SEEK_SET) != 0) {
+    std::fclose(f);
+    return false;
+  }
+  const int c = std::fgetc(f);
+  if (c == EOF) {
+    std::fclose(f);
+    return false;
+  }
+  if (std::fseek(f, offset, SEEK_SET) != 0) {
+    std::fclose(f);
+    return false;
+  }
+  const bool ok = std::fputc(c ^ 0x40, f) != EOF;
+  std::fclose(f);
+  return ok;
 }
 
 class TempDir {
@@ -532,12 +575,9 @@ TEST(Index, RefusesASegmentThatWasAlteredOnDisk) {
     }
   }
   // Flip a byte deep inside one segment file.
-  const std::string seg_dir = dir.path() + "/segments";
-  const std::string cmd =
-      "f=$(ls " + seg_dir +
-      "/*.seg | head -1); printf 'X' | dd of=\"$f\" bs=1 seek=200 conv=notrunc "
-      "status=none";
-  ASSERT_EQ(std::system(cmd.c_str()), 0);
+  const std::string victim = FirstSegment(dir.path());
+  ASSERT_FALSE(victim.empty());
+  ASSERT_TRUE(FlipByteAt(victim, 200));
 
   std::unique_ptr<Index> idx;
   EXPECT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
@@ -558,9 +598,9 @@ TEST(Index, ReportsAMissingSegmentRatherThanSearchingWithoutIt) {
                 IndexStatus::kOk);
     }
   }
-  const std::string cmd =
-      "rm -f $(ls " + dir.path() + "/segments/*.seg | head -1)";
-  ASSERT_EQ(std::system(cmd.c_str()), 0);
+  const std::string victim = FirstSegment(dir.path());
+  ASSERT_FALSE(victim.empty());
+  ASSERT_EQ(::unlink(victim.c_str()), 0);
   std::unique_ptr<Index> idx;
   EXPECT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(), &idx),
             IndexStatus::kSegmentLost);
