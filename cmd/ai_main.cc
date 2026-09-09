@@ -179,7 +179,7 @@ struct Options {
   std::string generator;
   std::string question;
   std::string eval_file;
-  float floor = 0.25f;
+  float floor = 0.60f;
   bool build = false;
   bool stats = false;
   bool compact = false;

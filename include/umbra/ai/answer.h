@@ -40,16 +40,17 @@
 // ---------------------------------------------------------------------------
 // THE RELEVANCE FLOOR IS PER MODEL, AND MEASURED
 //
-// Similarity scores are not comparable between models. Measured on the same
-// three-document probe: all-minilm separates the relevant passage from an
-// unrelated one 0.48 to 0.01, while nomic-embed-text puts them at 0.79 and
-// 0.52. A single hard-coded floor would be far too strict for one and useless
-// for the other.
+// Similarity scores are not comparable between models, and the difference is
+// categorical rather than marginal. On the eval corpus, nomic-embed-text
+// answers ALL THREE questions the vault cannot answer at any floor up to 0.50,
+// because its scores sit in a narrow band; at 0.60 it refuses all three and
+// gives up nothing. all-minilm never reaches that point at all: its best
+// refusal behaviour costs a false refusal.
 //
 // So the floor travels with the model in AnswerOptions, its default is
 // documented as measured rather than chosen, and a caller using a different
 // model is expected to measure. A floor that has not been measured is a number
-// that decides when to refuse to answer, on no evidence.
+// deciding when to refuse to answer, on no evidence.
 #ifndef UMBRA_AI_ANSWER_H_
 #define UMBRA_AI_ANSWER_H_
 
@@ -131,15 +132,19 @@ struct AnswerOptions {
   // How many passages to retrieve, and the per-segment beam.
   uint32_t k = 6;
   uint32_t ef = 64;
-  // THE FLOOR. Measured for all-minilm on the fixture corpus; a caller using
-  // another model must measure its own. See the note at the top of this file.
+  // THE FLOOR, MEASURED. 0.60 is where nomic-embed-text refuses all three
+  // unanswerable questions in test/fixtures/eval and still returns 11/14 at
+  // rank one -- see the sweep in ADR 0007. A caller using a different model
+  // MUST measure its own: at this same floor all-minilm returns almost
+  // nothing, and at all-minilm's floor of 0.25 nomic answers every question it
+  // should decline.
   //
   // COSINE RUNS FROM -1 TO 1, so the value that disables this is -1.0 and NOT
   // zero. Zero is already a meaningful floor -- it discards everything
   // negatively correlated with the query, which is most of a corpus -- and
   // setting it there expecting "no filtering" is a mistake that looks like
   // retrieval finding nothing.
-  float min_score = 0.25f;
+  float min_score = 0.60f;
   // A passage this far below the best one is dropped even if it clears the
   // floor, so one strong hit is not padded out with six weak ones. A fraction
   // of the best score, so -1.0 disables it.

@@ -46,12 +46,12 @@ The design is one pinned model whose identity is part of the index. Which model
 is a quality question, answered by measurement in item 5 rather than by
 reputation here.
 
-**Available and measured on this machine** (via the ADR 0008 interface):
+**Available and measured on this machine:**
 
 | | dims | disk | status |
 |---|---|---|---|
 | `all-minilm` (all-MiniLM-L6-v2) | 384 | ~46 MB | Present. 256-token window. |
-| `nomic-embed-text-v1.5` | 768 | ~274 MB | Present. 8192-token window. |
+| `nomic-embed-text-v1.5` | 768 | ~274 MB | **Chosen**, at a floor of 0.60. See the measurement below. |
 
 **Wanted and not obtainable here.** `bge-small-en-v1.5` is the model this would
 otherwise default to -- 384 dimensions with a 512-token window that matches the
@@ -109,17 +109,48 @@ This also settles what happens on upgrade: a new model is a new index identity,
 built alongside the old one and swapped when complete. The old segments stay
 readable until the swap, so search keeps working while the rebuild runs.
 
-## Throughput and what a cold index costs
+## What the measurement said, and which model it chose
 
-To be measured against the fixture corpus and a synthetic vault of a few
-thousand notes, and reported in item 6 with the machine named. Numbers are not
-carried here until they exist; a table of plausible-looking figures in an ADR is
-worse than an empty section, because it reads as measured.
+Measured on the ten-note eval corpus in `test/fixtures/eval` with seventeen
+questions, fourteen answerable and three that the vault deliberately cannot
+answer. `hit@k` counts a question correct when a **passage containing the
+expected sentence** is in the top k -- not merely the right file, because the
+whole argument for byte ranges is that the second is a weaker claim.
 
-What is already known from the design: chunks are capped at 1536 bytes, a few
-thousand notes is roughly ten to thirty thousand chunks at typical note lengths,
-and the index is 384 × 4 bytes per vector plus the graph, so the vector data
-alone for 30k chunks is about 46 MB before quantisation.
+Sweeping the relevance floor:
+
+| model | floor | hit@1 | hit@3 | MRR | refusals (3 are correct) |
+|---|---|---|---|---|---|
+| all-minilm | 0.10 | 12/14 | 13/14 | 0.893 | 1, of which 1 correct |
+| all-minilm | **0.25** | 11/14 | 12/14 | 0.821 | 4, of which 3 correct |
+| all-minilm | 0.40 | 7/14 | 7/14 | 0.500 | 8, of which 3 correct |
+| nomic-embed-text | 0.25 | 11/14 | 13/14 | 0.857 | **0, of which 0 correct** |
+| nomic-embed-text | 0.50 | 11/14 | 13/14 | 0.857 | **0, of which 0 correct** |
+| nomic-embed-text | **0.60** | 11/14 | 13/14 | 0.857 | 3, of which 3 correct |
+| nomic-embed-text | 0.70 | 8/14 | 8/14 | 0.571 | 8, of which 3 correct |
+
+**The decisive column is the last one.** nomic-embed-text at any floor up to
+0.50 answers all three questions the vault cannot answer -- the exact failure
+this feature is designed to prevent -- because its scores are compressed into a
+narrow band. At 0.60 it refuses all three correctly and gives up nothing:
+11/14 and 13/14, the same as at 0.25.
+
+all-minilm never reaches that. Its best refusal-correct setting (0.20-0.25)
+costs a false refusal, and its best retrieval setting (0.10) answers two of the
+three it should decline.
+
+**So: `nomic-embed-text` at a floor of 0.60**, which is the opposite of what the
+reputation ordering would have predicted and is the reason this was left to
+measurement. The cost is real and is stated: 768 dimensions rather than 384, so
+the index is 15.4x the source rather than 8.8x, and embedding runs at 28 chunks
+per second rather than 37.
+
+**The sample is small and the difference between 11/14 and 12/14 is one
+question.** Seventeen questions over ten notes is enough to catch a broken
+configuration and not enough to rank two working ones by a point of MRR. What it
+does show clearly, because the effect is categorical rather than marginal, is
+that the floor has to be tuned per model: a single default would have been
+either useless or far too strict for one of these two.
 
 ## Consequences
 
