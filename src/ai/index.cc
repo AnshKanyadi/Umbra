@@ -39,6 +39,15 @@ constexpr char kMetaPrefix = 'm';       // 'm' || name         -> value
 // exited, and the next process published ten segments and zero operations --
 // so the segments were on the relay and nothing said they existed.
 constexpr char kPendingPrefix = 'p';
+// 'a' || segment id -> empty. A SEGMENT THIS DEVICE HAS ANNOUNCED, either
+// because it made the kAdd or because it adopted the segment from a peer that
+// had. Without it a device cannot tell "everyone knows about this segment" from
+// "I have it and nobody has been told", and the two look identical on disk.
+//
+// The 24 MB transfer found the difference: an index built before manifest
+// operations existed pushed its segments and published nothing, so the peer
+// learned of no segments and called itself complete.
+constexpr char kAnnouncedPrefix = 'a';
 
 void PutU32(std::string* out, uint32_t v) {
   out->push_back(static_cast<char>((v >> 24) & 0xFF));
@@ -52,6 +61,12 @@ uint32_t GetU32(const char* p) {
          (static_cast<uint32_t>(static_cast<uint8_t>(p[1])) << 16) |
          (static_cast<uint32_t>(static_cast<uint8_t>(p[2])) << 8) |
          static_cast<uint32_t>(static_cast<uint8_t>(p[3]));
+}
+
+std::string AnnouncedKey(const SegmentId& id) {
+  std::string k(1, kAnnouncedPrefix);
+  k.append(reinterpret_cast<const char*>(id.bytes.data()), id.bytes.size());
+  return k;
 }
 
 std::string SegmentKey(const SegmentId& id) {
@@ -214,6 +229,7 @@ struct Index::Impl {
   void Emit(const ManifestOp& op) {
     (void)manifest->Apply(op);
     pending.push_back(op);
+    if (op.kind == ManifestOpKind::kAdd) MarkAnnounced(op.segment);
     std::string key(1, kPendingPrefix);
     for (int i = 7; i >= 0; --i) {
       key.push_back(static_cast<char>((op.id.counter >> (i * 8)) & 0xFF));
@@ -223,6 +239,20 @@ struct Index::Impl {
     batch.Set(basalt::Slice(key), basalt::Slice(value));
     basalt::wal::SeqNum seq = 0;
     (void)db->Write(batch, &seq);
+  }
+
+  void MarkAnnounced(const SegmentId& id) {
+    const std::string key = AnnouncedKey(id);
+    basalt::WriteBatch batch;
+    batch.Set(basalt::Slice(key), basalt::Slice(""));
+    basalt::wal::SeqNum seq = 0;
+    (void)db->Write(batch, &seq);
+  }
+
+  bool Announced(const SegmentId& id) const {
+    const std::string key = AnnouncedKey(id);
+    std::string held;
+    return db->Get(basalt::Slice(key), &held).ok();
   }
 
   // THE PUBLISHED COUNTER IS PERSISTED, so a restart continues the sequence
@@ -400,6 +430,47 @@ IndexStatus Index::Open(const std::string& dir, const VaultKeys* keys,
       (void)im.manifest->Apply(t);
     }
   }
+  // A SEGMENT NOBODY HAS BEEN TOLD ABOUT IS ANNOUNCED NOW.
+  //
+  // The fold above is reconstructed for local use and says nothing about what
+  // the vault knows. A segment that is present and unannounced is one this
+  // device holds and has never published -- an index built before manifest
+  // operations existed, or one whose pending operations were taken and lost
+  // before they reached a relay. Either way the peers cannot know it exists,
+  // and the only device that can tell them is this one.
+  //
+  // This runs before the counter is recovered so the operations it makes get
+  // counters above anything already published.
+  {
+    const std::string key = std::string(1, kMetaPrefix) + "counter";
+    std::string held;
+    if (im.db->Get(basalt::Slice(key), &held).ok() && held.size() == 8) {
+      uint64_t stored = 0;
+      for (std::size_t i = 0; i < 8; ++i) {
+        stored = (stored << 8) | static_cast<uint8_t>(held[i]);
+      }
+      if (stored > im.counter) im.counter = stored;
+    }
+    im.prev = im.counter;
+  }
+  for (const std::pair<const SegmentId, Loaded>& kv : im.segments) {
+    if (im.Announced(kv.first)) continue;
+    ManifestOp add = im.Make(ManifestOpKind::kAdd);
+    add.segment = kv.first;
+    add.count = kv.second.segment->count();
+    add.bytes = kv.second.bytes;
+    add.model = model;
+    im.Emit(add);
+    for (uint32_t slot = 0; slot < kv.second.dead.size(); ++slot) {
+      if (!kv.second.dead[slot]) continue;
+      ManifestOp t = im.Make(ManifestOpKind::kTombstone);
+      t.segment = kv.first;
+      t.slot = slot;
+      im.Emit(t);
+    }
+  }
+  im.SaveCounter();
+
   // THE PUBLISHED COUNTER IS RECOVERED FROM THE STORE, not restarted. A device
   // that reissued counters after a restart would produce two different manifest
   // operations with one id, and the oplog is keyed by (object, replica,
@@ -943,6 +1014,12 @@ IndexStatus Index::AdoptSegment(const std::string& sealed) {
   PutU32(&value, static_cast<uint32_t>(sealed.size()));
   keep_alive.push_back(SegmentKey(id));
   batch.Set(basalt::Slice(keep_alive.back()), basalt::Slice(value));
+  // ADOPTED MEANS SOMEBODY ELSE ANNOUNCED IT, and the marker goes in the SAME
+  // batch as the segment record. Written after the sync instead, it was not
+  // durable, so a restart re-announced every segment this device had ever
+  // adopted -- harmless in the lattice and noise on the relay.
+  keep_alive.push_back(AnnouncedKey(id));
+  batch.Set(basalt::Slice(keep_alive.back()), basalt::Slice(""));
   for (uint32_t i = 0; i < loaded.segment->count(); ++i) {
     keep_alive.push_back(ObjectKey(loaded.segment->entry(i).object, id, i));
     batch.Set(basalt::Slice(keep_alive.back()), basalt::Slice(""));

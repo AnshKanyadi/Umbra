@@ -147,20 +147,52 @@ VaultKeys KeysFor(const std::string& passphrase) {
   return k;
 }
 
-// A DRIVER'S IDENTITY, DERIVED FROM ITS INDEX DIRECTORY. A real client uses the
-// device id it enrolled with (cmd/sync_main.cc); this tool has no enrolment, so
-// it takes a stable id from the path it was pointed at -- stable across runs,
-// different between two index directories on one machine, which is what makes
-// two --index dirs behave as two devices for testing.
-ReplicaId ReplicaForIndex(const std::string& dir) {
-  ReplicaId r;
-  uint8_t digest[16];
-  crypto_generichash(digest, sizeof(digest),
-                     reinterpret_cast<const unsigned char*>(dir.data()),
-                     dir.size(), nullptr, 0);
-  std::memcpy(r.bytes.data(), digest, r.bytes.size());
-  return r;
+// THIS DEVICE'S IDENTITY, WHICH IS NOT WHERE ITS INDEX LIVES.
+//
+// The first version hashed the index directory, and it was wrong in both
+// directions: two index directories on one machine looked like two devices, and
+// the same device at a different path looked like a stranger. It made the
+// two-device end-to-end a fiction -- the "devices" were two folders sharing a
+// kernel, a clock and a filesystem.
+//
+// Identity comes from the device keypair, exactly as cmd/sync_main.cc derives
+// it, and lives beside the VAULT rather than the index: one device, one
+// identity, shared by both tools for a given vault. `DeviceKeyPair::Replica()`
+// hashes the public key, so the id is derived from the thing that makes the
+// device a device.
+//
+// THE INVARIANT THIS ASSUMES: one device keeps one index per vault. Two index
+// directories for one vault on one machine would now share a replica id and
+// each keep its own manifest counter, and the oplog is keyed by
+// (object, replica, counter) -- so the second index's operations would overwrite
+// the first's rather than conflict with them. That configuration was previously
+// meaningful and is now a mistake; it is stated here rather than defended
+// against, because the defence is a second identity and a second identity is
+// what this replaced.
+DeviceKeyPair LoadOrCreateDeviceKeys(const std::string& vault) {
+  const std::string path = vault + "/.umbra/device";
+  std::string existing;
+  DeviceKeyPair d;
+  if (ReadWholeFile(path, &existing) &&
+      existing.size() == kPublicKeyBytes + SecretKey::size()) {
+    std::memcpy(d.public_key.data(), existing.data(), kPublicKeyBytes);
+    std::memcpy(d.secret_key.data(), existing.data() + kPublicKeyBytes,
+                SecretKey::size());
+    return d;
+  }
+  d = NewDeviceKeyPair();
+  (void)MakeDirs(vault + "/.umbra");
+  std::string bytes;
+  bytes.append(reinterpret_cast<const char*>(d.public_key.data()),
+               kPublicKeyBytes);
+  bytes.append(reinterpret_cast<const char*>(d.secret_key.data()),
+               SecretKey::size());
+  (void)WriteWholeFile(path, bytes);
+  (void)::chmod(path.c_str(), 0600);
+  return d;
 }
+
+ReplicaId ReplicaFor(const Options& o);
 
 std::unique_ptr<Embedder> MakeEmbedder(const std::string& model,
                                        uint32_t hashing_dim) {
@@ -213,6 +245,14 @@ struct Options {
   bool compact = false;
 };
 
+ReplicaId ReplicaFor(const Options& o) {
+  // Falls back to the index directory only when there is no vault to anchor to,
+  // which is --stats and --compact. Those are local and never publish, so the
+  // id they use never reaches another device.
+  const std::string anchor = o.vault.empty() ? o.index_dir : o.vault;
+  return LoadOrCreateDeviceKeys(anchor).Replica();
+}
+
 int Build(const Options& o) {
   std::vector<std::string> files;
   ListMarkdown(o.vault, "", &files);
@@ -224,7 +264,7 @@ int Build(const Options& o) {
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
   std::unique_ptr<Index> index;
   if (Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
-                  ReplicaForIndex(o.index_dir), &index) != IndexStatus::kOk) {
+                  ReplicaFor(o), &index) != IndexStatus::kOk) {
     std::fprintf(stderr, "cannot open the index at %s\n", o.index_dir.c_str());
     return 1;
   }
@@ -375,7 +415,7 @@ int Ask(const Options& o) {
   {
     const IndexStatus s =
         Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
-                    ReplicaForIndex(o.index_dir), &index);
+                    ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));
@@ -444,7 +484,7 @@ int Eval(const Options& o) {
   {
     const IndexStatus s =
         Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
-                    ReplicaForIndex(o.index_dir), &index);
+                    ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));
@@ -572,7 +612,7 @@ bool OpenRelay(const Options& o, VaultKeys keys, RelayHandle* h) {
   h->keys = keys;
   const SecretKey vid = DeriveSubkey(h->keys.root(), 1, "umbVault");
   std::memcpy(h->vault.bytes.data(), vid.data(), h->vault.bytes.size());
-  h->me = ReplicaForIndex(o.index_dir);
+  h->me = ReplicaFor(o);
 
   if (OpLog::OpenEncrypted(o.index_dir + "/oplog", &h->keys, &h->log) !=
       LogStatus::kOk) {
@@ -592,7 +632,7 @@ int Push(const Options& o) {
   {
     const IndexStatus s =
         Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
-                    ReplicaForIndex(o.index_dir), &index);
+                    ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index: %s\n", IndexStatusName(s));
       return 1;
@@ -687,7 +727,7 @@ int Pull(const Options& o) {
   {
     const IndexStatus s =
         Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
-                    ReplicaForIndex(o.index_dir), &index);
+                    ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index: %s\n", IndexStatusName(s));
       return 1;
@@ -818,7 +858,7 @@ int Stats(const Options& o) {
   std::unique_ptr<Index> index;
   const IndexStatus s =
       Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
-                  ReplicaForIndex(o.index_dir), &index);
+                  ReplicaFor(o), &index);
   if (s != IndexStatus::kOk) {
     std::fprintf(stderr, "cannot open the index: %s\n", IndexStatusName(s));
     return 1;
@@ -843,7 +883,7 @@ int CompactCommand(const Options& o) {
   {
     const IndexStatus s =
         Index::Open(o.index_dir, &keys, 0, e->id(), e->dimension(),
-                    ReplicaForIndex(o.index_dir), &index);
+                    ReplicaFor(o), &index);
     if (s != IndexStatus::kOk) {
       std::fprintf(stderr, "cannot open the index at %s: %s\n",
                    o.index_dir.c_str(), IndexStatusName(s));

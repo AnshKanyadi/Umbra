@@ -20,6 +20,9 @@
 
 #include <gtest/gtest.h>
 
+#include "basalt/db.h"
+#include "basalt/posix_env.h"
+#include "basalt/slice.h"
 #include "umbra/ai/answer.h"
 #include "umbra/ai/chunk.h"
 #include "umbra/ai/embed.h"
@@ -954,6 +957,98 @@ TEST(Replication, ReindexingChangedContentStillTombstonesTheOld) {
       << "an edited note kept its old chunks live, so search returns text the "
          "vault no longer holds";
   EXPECT_EQ(after.objects, 1u);
+}
+
+// A SEGMENT NOBODY HAS BEEN TOLD ABOUT GETS ANNOUNCED.
+//
+// The 24 MB transfer found this: an index built before manifest operations
+// existed pushed its segments to the relay and published nothing, so the second
+// device learned of no segments, pulled nothing, and reported itself complete.
+// The bytes were there and no operation said so.
+//
+// The same shape happens without any legacy data: pending operations are taken
+// and then lost before they reach a relay.
+TEST(Replication, AnUnannouncedSegmentIsAnnouncedOnOpen) {
+  Device a;
+  ASSERT_NO_FATAL_FAILURE(a.Open(0xA1));
+  ASSERT_NO_FATAL_FAILURE(a.IndexNote(1, kTopics[0]));
+  ASSERT_NO_FATAL_FAILURE(a.IndexNote(2, kTopics[1]));
+
+  // The operations are taken and thrown away, as a crash between taking and
+  // pushing would do.
+  const std::vector<ManifestOp> lost = a.index->TakePending();
+  ASSERT_FALSE(lost.empty());
+  ASSERT_TRUE(a.index->TakePending().empty());
+
+  // A device that has already announced does not announce again.
+  ASSERT_NO_FATAL_FAILURE(a.Reopen());
+  const std::vector<ManifestOp> after_clean = a.index->TakePending();
+  EXPECT_TRUE(after_clean.empty())
+      << "a segment that had been announced was announced a second time";
+
+  // Now the same situation as the legacy index: the segments are present and
+  // the announcement markers are not.
+  Device b;
+  ASSERT_NO_FATAL_FAILURE(b.Open(0xB2));
+  for (const SegmentId& id : a.index->SegmentIds()) {
+    ASSERT_EQ(b.index->AdoptSegment(a.SealedBytes(id)), IndexStatus::kOk);
+  }
+  // Adoption marks them announced, because whoever we took them from said so.
+  ASSERT_NO_FATAL_FAILURE(b.Reopen());
+  EXPECT_TRUE(b.index->TakePending().empty())
+      << "an adopted segment was re-announced";
+}
+
+// The legacy shape directly: segments on disk that the store has no
+// announcement for.
+TEST(Replication, ASegmentPresentWithoutAnAnnouncementIsPublished) {
+  Device a;
+  ASSERT_NO_FATAL_FAILURE(a.Open(0xA1));
+  ASSERT_NO_FATAL_FAILURE(a.IndexNote(1, kTopics[0]));
+  const std::vector<SegmentId> ids = a.index->SegmentIds();
+  ASSERT_EQ(ids.size(), 1u);
+  (void)a.index->TakePending();
+
+  // Remove the announcement marker the way an index written by older code
+  // would never have had one.
+  a.index.reset();
+  {
+    std::unique_ptr<basalt::Env> env = basalt::NewPosixEnv();
+    std::unique_ptr<basalt::DB> db;
+    const basalt::wal::Caps caps;
+    ASSERT_TRUE(
+        basalt::DB::Open(env.get(), a.dir.path() + "/manifest", caps, &db)
+            .ok());
+    std::string key(1, 'a');
+    key.append(reinterpret_cast<const char*>(ids[0].bytes.data()),
+               ids[0].bytes.size());
+    basalt::WriteBatch batch;
+    batch.Delete(basalt::Slice(key));
+    basalt::wal::SeqNum seq = 0;
+    ASSERT_TRUE(db->Write(batch, &seq).ok());
+    basalt::wal::SeqNum watermark = 0;
+    (void)db->Sync(&watermark);
+  }
+
+  ASSERT_EQ(Index::Open(a.dir.path(), &a.keys, 0, a.embedder->id(),
+                        a.embedder->dimension(), a.replica, &a.index),
+            IndexStatus::kOk);
+  const std::vector<ManifestOp> republished = a.index->TakePending();
+  ASSERT_FALSE(republished.empty())
+      << "a segment on disk that nobody had been told about stayed a secret";
+  bool saw_add = false;
+  for (const ManifestOp& op : republished) {
+    if (op.kind == ManifestOpKind::kAdd && op.segment == ids[0]) saw_add = true;
+  }
+  EXPECT_TRUE(saw_add);
+
+  // And a peer given those operations wants that segment.
+  Device b;
+  ASSERT_NO_FATAL_FAILURE(b.Open(0xB2));
+  for (const ManifestOp& op : republished) {
+    (void)b.index->ApplyManifestOp(op);
+  }
+  EXPECT_EQ(b.index->Missing().size(), 1u);
 }
 
 }  // namespace ai
