@@ -124,14 +124,49 @@ Recall against exhaustive search, 4000 vectors, `k` = 10:
 
 `ef` = 64 is the default: the point where recall stops improving.
 
-Cold index of a synthetic 3000-note vault and the eval corpus are reported in
-the phase report with the full breakdown.
+Cold index of a synthetic 3000-note vault, 7.4 MB over 3000 files:
+
+| | |
+|---|---|
+| chunks | 13,838 (4.6 per file, 535 bytes each) |
+| chunking | 1.9s |
+| embedding | 181.5s (76 chunks/s) |
+| indexing | 24.7s |
+| compaction, 3000 segments into one | 114.1s |
+| **total** | **323.5s** |
+| index on disk | 28.1 MB, 3.8x the source |
+| of which raw float32 | 21.3 MB |
+
+Embedding dominates and is the backend's cost, not this store's. Opening the
+resulting index takes about 1.8 seconds; a query over 13,846 vectors, including
+embedding the query, takes 0.07 seconds.
+
+## Compaction is all-or-nothing, and that is a real limitation
+
+Measured on a 3000-note vault (13,838 vectors): reindexing **one** note costs
+0.15 seconds -- eight chunks embedded and stored, with nothing else touched,
+which is the incremental property working. Compacting afterwards costs **103
+seconds**, because `Compact` merges every chosen segment into one and that means
+rebuilding the whole graph.
+
+Running compaction automatically after a build therefore destroys the very
+property the store was designed for, and the first version of the driver tool
+did exactly that. It is now an explicit command.
+
+**The fix is tiered compaction** -- merge small segments with small segments and
+leave the large one alone, so most merges are cheap and the expensive one is
+rare. That is how LSM engines solve the identical problem, and Basalt underneath
+already does it. It is **not built here**: what exists is a single-level merge
+with two thresholds, eight segments or twenty per cent dead, both of which are
+arguable rather than derived.
+
+Until it is built, the operational shape is: index incrementally and freely,
+compact deliberately and rarely.
 
 ## Consequences
 
-- **Search cost grows with segment count**, so compaction is not optional. It
-  runs at eight segments or at twenty per cent dead, and both thresholds are
-  arguable rather than derived.
+- **Search cost grows with segment count**, so compaction is not optional even
+  though it is expensive.
 - **Distances are accumulated in double.** Over 768 terms a float accumulator
   loses enough to reorder near-ties, and a ranking that changes when someone
   enables vectorisation is not a ranking.

@@ -161,6 +161,7 @@ void Usage() {
                "umbra_ai --vault DIR --index DIR [--model NAME] COMMAND\n"
                "\n"
                "  --build              chunk, embed and index the vault\n"
+               "                       add --compact to merge segments after\n"
                "  --ask QUESTION       retrieve and answer\n"
                "  --eval FILE          run a question set and report\n"
                "  --stats              what the index holds\n"
@@ -256,11 +257,23 @@ int Build(const Options& o) {
     }
   }
 
-  const auto k0 = std::chrono::steady_clock::now();
+  // COMPACTION IS NOT PART OF A BUILD, because it is O(the whole index) and a
+  // build can be one file. Measured: reindexing a single note into a
+  // 13,838-vector index costs 0.14s to chunk, embed and store -- and 103s if a
+  // compaction follows it, because merging 145 segments rebuilds the entire
+  // graph. Running it automatically would destroy the incremental property the
+  // store was designed for.
+  //
+  // So it is an explicit command (--compact), and the operator decides when to
+  // pay for it. See ADR 0005 on why compaction is all-or-nothing today.
+  double compact_seconds = 0;
   uint32_t merged = 0;
   uint32_t reclaimed = 0;
-  (void)index->Compact(8, 20, &merged, &reclaimed);
-  const double compact_seconds = Since(k0);
+  if (o.compact) {
+    const auto k0 = std::chrono::steady_clock::now();
+    (void)index->Compact(8, 20, &merged, &reclaimed);
+    compact_seconds = Since(k0);
+  }
 
   const double total = Since(t0);
   const IndexStats st = index->Stats();
@@ -590,7 +603,7 @@ int main(int argc, char** argv) {
     Usage();
     return 2;
   }
-  if (o.build) return Build(o);
+  if (o.build) return Build(o);  // --compact modifies it rather than replacing
   if (!o.question.empty()) return Ask(o);
   if (!o.eval_file.empty()) return Eval(o);
   if (o.stats) return Stats(o);
