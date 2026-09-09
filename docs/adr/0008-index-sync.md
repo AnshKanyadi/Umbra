@@ -103,8 +103,22 @@ existing connection.
 the obvious fix — raising `kMaxFrameBytes` — is the wrong one: that limit is
 what stops a hostile relay making a client reserve memory on *any* response, and
 relaxing it everywhere to accommodate one message type spends the guarantee on
-all of them. Pieces at a fixed offset keep one bound, make a partial transfer
-resume, and let a relay waste a client's bandwidth but not its address space.
+all of them. Pieces at a fixed offset keep one bound and let a relay waste a
+client's bandwidth but not its address space.
+
+**Pieces do not buy a resume, and an earlier draft of this section said they
+did.** Neither direction restarts where it stopped. `Client::PushSegment`
+always begins at offset 0 and re-sends every piece; `Client::PullSegment`
+discards whatever arrived on any failure, deliberately, because a truncated
+segment that looks like a segment is worse than no segment. The *wire format*
+could support resume — pieces are keyed by offset and every piece repeats the
+total, so the relay can already say how much of a segment it holds — but no
+client asks it. Measured in containers: a 7.3 MB segment, killed 12s into a 20s
+transfer, left zero bytes on disk and refetched all 7,313,170 of them. On a
+24 MB segment over a bad link that is the whole segment, every time. Named here
+rather than fixed, because the fix is a client that tracks its own partial and
+resumes into it, and that is a change to how a partial is stored, not a
+tweak.
 
 **The relay never reassembles.** It hands back the piece stored at the requested
 offset and lets the client stitch, because reassembling would mean holding a
@@ -140,6 +154,11 @@ Three defects the unit tests did not reach and the end-to-end did:
   reports a complete index because, as far as it has been told, it is. That is
   correct and it is worth stating: completeness is relative to what a device has
   been told exists.
+- **An interrupted segment transfer costs the whole segment again.** No
+  corruption and nothing partial survives — that part was verified by killing a
+  client mid-transfer — but the bytes already moved are thrown away. The cost
+  is bounded by one segment, which is an argument for compaction producing
+  several medium segments rather than one enormous one.
 - **A retired segment a device never replaces stays on its disk.** That device
   is not syncing, and its index being larger than necessary is the least of what
   is wrong.

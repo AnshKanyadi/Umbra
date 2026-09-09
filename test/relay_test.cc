@@ -1140,7 +1140,7 @@ TEST(SegmentTransfer, RefusesAPieceLargerThanAChunk) {
 // The client is killed mid-push: some pieces are on the relay and some are not.
 // A second client must be able to finish the job, and a puller must not be able
 // to read a half-written segment as if it were whole.
-TEST(SegmentTransfer, AnInterruptedPushResumesWithoutRefetchingEverything) {
+TEST(SegmentTransfer, AnInterruptedPushIsRetriedFromTheStart) {
   TempDir dir;
   RunningRelay relay_(dir.path() + "/relay");
   VaultKeys keys;
@@ -1223,13 +1223,22 @@ TEST(SegmentTransfer, AnInterruptedPushResumesWithoutRefetchingEverything) {
   EXPECT_TRUE(partial.empty())
       << "a failed pull left bytes behind for a caller to misuse";
 
-  // The push is retried and finishes. Pushing is idempotent, so the piece that
-  // did land is simply written again rather than skipped -- which is the honest
-  // cost of resuming without a protocol for asking what the relay already has.
-  std::unique_ptr<sync::Transport> t3 =
-      sync::NewTcpTransport("127.0.0.1", relay_.port());
-  sync::Client finisher(TestVault(), dev, &keys, log.get(), t3.get());
+  // The push is retried and finishes -- from offset 0, re-sending the piece
+  // that already landed. Pushing is idempotent so this is correct, and it is
+  // the whole segment's bandwidth again.
+  //
+  // ASSERTED RATHER THAN ASSUMED, because this test was called
+  // "...ResumesWithoutRefetchingEverything" and refetches everything. If chunk
+  // level resume is ever built, this is the line that says so.
+  DyingTransport counting(sync::NewTcpTransport("127.0.0.1", relay_.port()),
+                          1000);
+  sync::Client finisher(TestVault(), dev, &keys, log.get(), &counting);
   ASSERT_EQ(finisher.PushSegment(id, body), sync::SyncStatus::kOk);
+  const int pieces = static_cast<int>((size + relay::kSegmentChunkBytes - 1) /
+                                      relay::kSegmentChunkBytes);
+  EXPECT_EQ(counting.sent(), pieces)
+      << "the retry sent " << counting.sent() << " of " << pieces
+      << " pieces, so something now resumes and the docs say it does not";
   ASSERT_EQ(relay_.store()->Sync(), relay::StoreStatus::kOk);
 
   std::string whole;

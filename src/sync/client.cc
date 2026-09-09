@@ -242,6 +242,21 @@ SyncStatus Client::CollectEnvelopes(std::vector<relay::Envelope>* out) {
   return SyncStatus::kOk;
 }
 
+// NO CHUNK LEVEL RESUME, IN EITHER DIRECTION. Worth stating where the loop is,
+// because the chunking looks like it buys one and does not.
+//
+// What chunking buys is a bound: a 25 MB segment crossing an 8 MB frame limit
+// without raising that limit for every other message. What it does not buy is
+// restarting where an interrupted transfer stopped. This loop always begins at
+// offset 0 and re-sends every piece; PullSegment below discards what arrived on
+// any failure, deliberately, because a partial segment that looks like a
+// segment is worse than none.
+//
+// The wire format could support resume -- pieces are keyed by offset and every
+// piece repeats the total, so the relay can already say how much it holds --
+// but no client asks. Measured: a 7.3 MB segment killed 12s into a 20s transfer
+// left 0 bytes on disk and refetched all 7,313,170 of them, in 20.5s again. On
+// a 24 MB segment over a bad link that is the whole segment, every time.
 SyncStatus Client::PushSegment(const std::array<uint8_t, 32>& id,
                                const std::string& sealed) {
   if (sealed.empty()) return SyncStatus::kLocalError;
@@ -273,6 +288,10 @@ SyncStatus Client::PullSegment(const std::array<uint8_t, 32>& id,
   //
   // A guard rather than a clear before each return, because there are six
   // returns and the seventh is the one somebody forgets.
+  //
+  // This is also why there is no resume: the next attempt starts at offset 0.
+  // See PushSegment above for what that costs and why the wire format could
+  // support better.
   class Guard {
    public:
     explicit Guard(std::string* s) : s_(s) {}
