@@ -11,6 +11,8 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <memory>
 #include <set>
 #include <string>
