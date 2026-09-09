@@ -48,9 +48,68 @@ bool SaveEpochWraps(const std::string& dir,
                     const std::map<Epoch, std::string>& wraps);
 bool SaveEpochWrap(const std::string& dir, const VaultKeys& keys, Epoch e);
 
-// `<vault>/.umbra/device`, mode 0600. This device's identity, which is not
-// where its index happens to live.
-DeviceKeyPair LoadOrCreateDeviceKeys(const std::string& dir);
+// ---------------------------------------------------------------- identity
+//
+// THE DEVICE KEY DOES NOT LIVE IN THE VAULT, AND IT IS THE ONLY FILE THAT MOVED.
+//
+// `.umbra/` holds four things and exactly one of them is a plaintext secret:
+// `salt` is public by construction, `epochs` is wrapped under a root only the
+// passphrase derives, `log/` is sealed, and `device` is a raw X25519 private
+// key. A vault folder is the sort of thing iCloud or Obsidian Sync watches, so
+// that one file is a leak path for the material the whole design protects --
+// and copying a vault clones the identity, which is how two "devices" in an
+// earlier end-to-end test turned out to be one.
+//
+// Salt and epoch wraps stay in the vault deliberately. They are what makes
+// passphrase-only recovery work when every device is gone, and a user who backs
+// up the vault folder must not silently stop backing up their ability to
+// recover it.
+//
+// FUTURE WORK, BEHIND THIS SAME SEAM: the macOS Keychain is the right home for
+// a private key and would make the identity survive a vault rename, which this
+// scheme does not. It is platform-specific and a real dependency, so it belongs
+// as another implementation of StateDirFor/LoadDeviceKeys rather than instead
+// of them.
+
+// Where this machine keeps its state for one vault: a directory named for the
+// vault's resolved path, under a root that is per-user rather than per-vault.
+//
+// An explicit override is that directory itself, taken verbatim, because that
+// is what lets a moved vault be pointed back at the identity it already had.
+// The default keying is what keeps one identity per vault.
+std::string StateDirFor(const std::string& vault,
+                        const std::string& override_dir);
+
+enum class DeviceKeyStatus : uint8_t {
+  kOk,
+  kMissing,     // this machine has no identity for this vault
+  kUnreadable,  // it has one and it is the wrong size or unopenable
+};
+
+DeviceKeyStatus LoadDeviceKeys(const std::string& state_dir,
+                               DeviceKeyPair* out);
+
+// Mints one. Only two callers may: creating a vault and joining one. Everything
+// else must fail instead, because a fresh identity is indistinguishable from a
+// stranger to every other device in the vault.
+bool CreateDeviceKeys(const std::string& state_dir, DeviceKeyPair* out);
+
+// Moves a pre-existing `<vault>/.umbra/device` to the state directory, once.
+// Not minting: it preserves the identity a vault already had, and takes the
+// secret out of the synced folder, which is the point. Returns true if it moved
+// one, and prints what it did.
+bool AdoptLegacyDeviceKey(const std::string& vault,
+                          const std::string& state_dir);
+
+// Loads the identity, adopting a legacy one if that is what is there. On a miss
+// it prints the explanation below and returns false. It never mints.
+bool RequireDeviceKeys(const std::string& vault, const std::string& state_dir,
+                       DeviceKeyPair* out);
+
+// What a user sees when this machine has no identity for this vault. It has to
+// carry its weight: the reflex on reading it is that the vault is broken.
+void ExplainMissingIdentity(const std::string& vault,
+                            const std::string& state_dir);
 
 // The passphrase, from a file, the environment, or a prompt with echo off.
 // Never from an argument vector: that is visible in `ps` and in shell history.

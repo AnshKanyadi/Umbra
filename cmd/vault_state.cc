@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#include <sodium.h>
 #include <iostream>
 
 namespace umbra {
@@ -157,28 +159,199 @@ bool SaveEpochWrap(const std::string& dir, const VaultKeys& keys, Epoch e) {
   return true;
 }
 
-DeviceKeyPair LoadOrCreateDeviceKeys(const std::string& dir) {
-  const std::string path = dir + "/.umbra/device";
-  std::string existing;
-  DeviceKeyPair d;
-  if (ReadWholeFile(path, &existing) &&
-      existing.size() == kPublicKeyBytes + SecretKey::size()) {
-    std::memcpy(d.public_key.data(), existing.data(), kPublicKeyBytes);
-    std::memcpy(d.secret_key.data(), existing.data() + kPublicKeyBytes,
-                SecretKey::size());
-    return d;
+namespace {
+
+std::string DefaultStateRoot() {
+  const char* home = std::getenv("HOME");
+  const std::string h = (home != nullptr && *home != '\0') ? home : ".";
+#if defined(__APPLE__)
+  return h + "/Library/Application Support/Umbra";
+#else
+  const char* xdg = std::getenv("XDG_STATE_HOME");
+  if (xdg != nullptr && *xdg != '\0') return std::string(xdg) + "/umbra";
+  return h + "/.local/state/umbra";
+#endif
+}
+
+// The vault's resolved path, so a symlink and its target are one vault rather
+// than two identities. A path that does not resolve is used as given: the
+// caller is about to fail on it for a better reason than this.
+std::string ResolvedPath(const std::string& path) {
+  char buf[4096];
+  if (::realpath(path.c_str(), buf) != nullptr) return std::string(buf);
+  return path;
+}
+
+std::string DeviceKeyPath(const std::string& state_dir) {
+  return state_dir + "/device";
+}
+
+}  // namespace
+
+std::string StateDirFor(const std::string& vault,
+                        const std::string& override_dir) {
+  // AN EXPLICIT --state-dir IS THE DIRECTORY ITSELF, not a root to key under.
+  //
+  // It was a root at first, and that made the recovery this scheme promises
+  // impossible: the per-vault name is a hash of the vault's path, so after a
+  // rename the old identity sits under the OLD hash and no root override finds
+  // it. Taking the path verbatim is what lets someone who moved a vault point
+  // at the identity it already had.
+  //
+  // The one-identity-per-vault invariant is kept by the DEFAULT keying. Pointing
+  // two vaults at one directory on purpose is now possible, and is a choice
+  // rather than an accident -- one physical device holding one identity across
+  // two vaults is coherent, unlike two devices sharing one.
+  if (!override_dir.empty()) return override_dir;
+  const std::string root = DefaultStateRoot();
+  const std::string resolved = ResolvedPath(vault);
+  uint8_t digest[16];
+  crypto_generichash(digest, sizeof(digest),
+                     reinterpret_cast<const unsigned char*>(resolved.data()),
+                     resolved.size(), nullptr, 0);
+  std::string hex;
+  for (unsigned char b : digest) {
+    static const char* kHex = "0123456789abcdef";
+    hex.push_back(kHex[b >> 4]);
+    hex.push_back(kHex[b & 0x0F]);
   }
-  d = NewDeviceKeyPair();
-  (void)MakeDirs(dir + "/.umbra");
+  return root + "/devices/" + hex;
+}
+
+DeviceKeyStatus LoadDeviceKeys(const std::string& state_dir,
+                               DeviceKeyPair* out) {
+  std::string bytes;
+  if (!ReadWholeFile(DeviceKeyPath(state_dir), &bytes)) {
+    return DeviceKeyStatus::kMissing;
+  }
+  if (bytes.size() != kPublicKeyBytes + SecretKey::size()) {
+    return DeviceKeyStatus::kUnreadable;
+  }
+  std::memcpy(out->public_key.data(), bytes.data(), kPublicKeyBytes);
+  std::memcpy(out->secret_key.data(), bytes.data() + kPublicKeyBytes,
+              SecretKey::size());
+  return DeviceKeyStatus::kOk;
+}
+
+namespace {
+
+bool WriteDeviceKey(const std::string& state_dir, const DeviceKeyPair& d) {
+  if (!MakeDirs(state_dir)) return false;
   std::string bytes;
   bytes.append(reinterpret_cast<const char*>(d.public_key.data()),
                kPublicKeyBytes);
   bytes.append(reinterpret_cast<const char*>(d.secret_key.data()),
                SecretKey::size());
-  (void)WriteWholeFile(path, bytes);
+  const std::string path = DeviceKeyPath(state_dir);
+  if (!WriteWholeFile(path, bytes)) return false;
   // The secret half of a device identity. Not 0644.
-  (void)::chmod(path.c_str(), 0600);
-  return d;
+  return ::chmod(path.c_str(), 0600) == 0;
+}
+
+}  // namespace
+
+bool CreateDeviceKeys(const std::string& state_dir, DeviceKeyPair* out) {
+  *out = NewDeviceKeyPair();
+  if (!WriteDeviceKey(state_dir, *out)) {
+    std::fprintf(stderr, "cannot write the device key under %s\n",
+                 state_dir.c_str());
+    return false;
+  }
+  return true;
+}
+
+bool AdoptLegacyDeviceKey(const std::string& vault,
+                          const std::string& state_dir) {
+  const std::string legacy = vault + "/.umbra/device";
+  std::string bytes;
+  if (!ReadWholeFile(legacy, &bytes)) return false;
+  if (bytes.size() != kPublicKeyBytes + SecretKey::size()) return false;
+
+  DeviceKeyPair d;
+  std::memcpy(d.public_key.data(), bytes.data(), kPublicKeyBytes);
+  std::memcpy(d.secret_key.data(), bytes.data() + kPublicKeyBytes,
+              SecretKey::size());
+  if (!WriteDeviceKey(state_dir, d)) {
+    std::fprintf(stderr,
+                 "found a device key in the vault but cannot write it to %s. "
+                 "Leaving it where it is.\n",
+                 state_dir.c_str());
+    return false;
+  }
+  // COPIED FIRST, THEN REMOVED. The other order loses the identity if the write
+  // fails, and the identity is the thing that cannot be regenerated.
+  if (::unlink(legacy.c_str()) != 0) {
+    std::fprintf(stderr,
+                 "moved this device's key to %s but could not remove the copy "
+                 "at %s -- delete it by hand; a private key in a synced folder "
+                 "is what this move exists to avoid.\n",
+                 state_dir.c_str(), legacy.c_str());
+    return true;
+  }
+  std::printf(
+      "moved this device's key out of the vault, to\n"
+      "  %s\n"
+      "A vault folder is often synced, and that file is the one plaintext "
+      "secret in it.\n",
+      state_dir.c_str());
+  return true;
+}
+
+void ExplainMissingIdentity(const std::string& vault,
+                            const std::string& state_dir) {
+  std::fprintf(
+      stderr,
+      "no device identity on this machine for the vault at\n"
+      "  %s\n"
+      "\n"
+      "NOTHING IS LOST AND THE VAULT IS NOT DAMAGED. Its notes, its keys and\n"
+      "its history are exactly where they were, and your passphrase still\n"
+      "decrypts all of it. What is missing is only this machine's membership\n"
+      "of the vault -- a private key, held outside the vault folder on\n"
+      "purpose, because that folder is often synced and a copied key would\n"
+      "make two machines into one device.\n"
+      "\n"
+      "Umbra will not act on the vault from this machine until it has one.\n"
+      "That is a refusal to guess rather than a failure: everything Umbra\n"
+      "writes is signed by this identity, and inventing a new one would sign\n"
+      "as a device the vault has never admitted. No other device would trust\n"
+      "it and this one could not read what it had been sent.\n"
+      "\n"
+      "The key belongs here:\n"
+      "  %s\n"
+      "and that directory has none. Most often the vault was moved or renamed\n"
+      "since it was enrolled, or this is a new machine, or the state\n"
+      "directory was not carried over.\n"
+      "\n"
+      "IF YOU MOVED OR RENAMED THE VAULT and still have the old state\n"
+      "directory, point at it and nothing needs re-enrolling:\n"
+      "  --state-dir PATH\n"
+      "\n"
+      "OTHERWISE enrol this machine from a device already in the vault:\n"
+      "  umbra_sync --dir %s --pass-file FILE --enrol --vault VAULT_ID\n"
+      "and approve it there. Enrolling makes a new identity, which is the\n"
+      "one command allowed to.\n",
+      vault.c_str(), state_dir.c_str(), vault.c_str());
+}
+
+bool RequireDeviceKeys(const std::string& vault, const std::string& state_dir,
+                       DeviceKeyPair* out) {
+  DeviceKeyStatus st = LoadDeviceKeys(state_dir, out);
+  if (st == DeviceKeyStatus::kMissing &&
+      AdoptLegacyDeviceKey(vault, state_dir)) {
+    st = LoadDeviceKeys(state_dir, out);
+  }
+  if (st == DeviceKeyStatus::kOk) return true;
+  if (st == DeviceKeyStatus::kUnreadable) {
+    std::fprintf(stderr,
+                 "the device key at %s/device is not a device key. Refusing to "
+                 "replace it: if it is the only copy, a new one is a new "
+                 "device and this one can no longer read what it was sent.\n",
+                 state_dir.c_str());
+    return false;
+  }
+  ExplainMissingIdentity(vault, state_dir);
+  return false;
 }
 
 bool ReadPassphraseFromFile(const std::string& path, std::string* out) {

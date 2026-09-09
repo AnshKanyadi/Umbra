@@ -8,14 +8,38 @@ Written for macOS. Nothing is assumed to be installed.
 
 ## Read this before you point it at real notes
 
-One thing is worth knowing before you start, and one is worth knowing about
-where the keys live.
+Two things are worth knowing before you start: where the keys live, and what
+that means if you ever restore or move the vault.
 
-**Umbra writes into your vault folder.** Indexing creates
-`<vault>/.umbra/device`, a keypair that is this device's identity, mode 0600.
-Creating a vault also writes `<vault>/.umbra/salt` and `<vault>/.umbra/epochs`.
-If the folder is an Obsidian vault that something else syncs, that hidden folder
-syncs with it.
+**Umbra writes into your vault folder, but not its device key.** Creating a
+vault adds `<vault>/.umbra/` holding `salt`, `epochs` and `log/`. All three are
+safe to sync: an Argon2id salt is public by construction, the epoch keys are
+wrapped under a root only your passphrase derives, and the log is sealed. They
+stay in the vault on purpose — they are what lets your passphrase recover the
+vault when every device is gone, so a backup of the folder is a real backup.
+
+This machine's **device key** is the one plaintext secret, and it is deliberately
+kept somewhere else:
+
+```
+~/Library/Application Support/Umbra/devices/<name derived from the vault path>
+```
+
+A vault folder is the sort of thing iCloud or Obsidian Sync watches, and a
+copied private key makes two machines into one device. Override the location
+with `--state-dir PATH`, which both `umbra_sync` and `umbra_ai` accept and which
+names the directory itself.
+
+**What this changes about restoring.** Restoring a vault folder onto a new Mac
+no longer brings the identity with it. The passphrase still decrypts everything,
+but that machine is not a member of the vault until you enrol it from a device
+that is. Same if you move or rename the vault: the identity is filed under the
+old path, and Umbra will say so and stop rather than quietly minting a new one.
+If you still have the old state directory, point at it with `--state-dir` and
+nothing needs re-enrolling.
+
+Only two commands ever make an identity: `umbra_sync --create` and
+`umbra_sync --enrol`. Everything else fails and explains when there is none.
 
 **The index is sealed with your vault's keys.** `umbra_ai` reads the salt and
 the wrapped epoch keys from `<vault>/.umbra`, exactly as `umbra_sync` does, so
@@ -284,11 +308,6 @@ What the index holds, at any point:
   --stats
 ```
 
-## Keeping it current
-
-There is no watcher wired into `umbra_ai` yet. Re-run `--build` after you have
-written notes; unchanged notes cost a re-embed but do not duplicate anything.
-
 ## If something goes wrong
 
 **`cannot reach a local Ollama for nomic-embed-text`** — Ollama is not running,
@@ -317,7 +336,27 @@ built by a version of `umbra_ai` that derived its own keys rather than the
 vault's. Those segments were sealed under a key that was never secret. Delete
 the index directory and rebuild it.
 
+**`no device identity on this machine for the vault at ...`** — this machine
+has no device key for that vault. Nothing is lost; the message explains the two
+ways forward. Most often the vault was moved or renamed, in which case
+`--state-dir` pointed at the old directory restores it without re-enrolling.
+
 **`cannot open the index at <dir>: model-mismatch`** — you changed `--model`.
 An index is bound to the model that built it, because vectors from two models
 are not comparable, and it refuses to open rather than mixing them. Use a
 separate `--index` directory per model.
+
+## Known limits
+
+- **A vault rename orphans the device identity.** The state directory is named
+  from the vault's path, so moving the folder means re-enrolling unless you pass
+  `--state-dir`. Filing the key under something stabler — the macOS Keychain is
+  the obvious candidate, and the right home for a private key regardless — would
+  fix this. It is platform-specific and a real dependency, so it belongs behind
+  the same `--state-dir` seam as another place to look rather than a rewrite of
+  how identity works.
+- **There is no watcher wired into `umbra_ai`.** Re-run `--build` after you
+  have written notes; unchanged notes cost a re-embed but do not duplicate
+  anything.
+- **An interrupted segment transfer restarts from the beginning.** See
+  ADR 0008; it costs at most one segment.

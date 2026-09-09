@@ -312,6 +312,7 @@ add_executable(umbra_test
   test/relay_test.cc
   test/oplog_test.cc
   test/converge_test.cc
+  test/vault_state_test.cc
 )
 # umbra::sodium is linked into the TEST but not exposed by the library.
 #
@@ -321,8 +322,12 @@ add_executable(umbra_test
 # match, which is not the claim being made.
 # umbra_relay explicitly: relay_test.cc runs a real store and a real server, so
 # the test binary needs the half the client does not.
+# umbra_cmd_state: the device identity and where it lives are the two binaries'
+# shared state, and "never mints an identity on a miss" is a claim worth a test
+# rather than a comment.
 target_link_libraries(umbra_test PRIVATE umbra_testing umbra_sim umbra_relay
-                                         umbra::sodium gtest_main)
+                                         umbra_cmd_state umbra::sodium
+                                         gtest_main)
 target_include_directories(umbra_test PRIVATE src src/watcher src/crdt src/crypto src/sync src/ai)
 target_compile_options(umbra_test PRIVATE ${UMBRA_CXX_FLAGS})
 target_compile_definitions(umbra_test PRIVATE ${UMBRA_SANITIZER_DEFINE})
@@ -349,7 +354,7 @@ target_compile_options(umbra_relay PRIVATE ${UMBRA_CXX_FLAGS})
 # the bug this library exists to make impossible.
 add_library(umbra_cmd_state STATIC cmd/vault_state.cc)
 target_include_directories(umbra_cmd_state PUBLIC cmd)
-target_link_libraries(umbra_cmd_state PUBLIC umbra)
+target_link_libraries(umbra_cmd_state PUBLIC umbra umbra::sodium)
 target_compile_options(umbra_cmd_state PRIVATE ${UMBRA_CXX_FLAGS})
 
 add_executable(umbra_sync cmd/sync_main.cc)

@@ -182,6 +182,7 @@ void Usage() {
       "  --relay HOST:PORT    where the vault's relay is\n"
       "  --pass-file PATH     the vault passphrase, or UMBRA_PASSPHRASE,\n"
       "                       or a prompt. Never an argument.\n"
+      "  --state-dir PATH     where this machine keeps its device key\n"
       "\n"
       "  --model NAME         all-minilm, nomic-embed-text, or\n"
       "                       hashing for the deterministic stand-in\n"
@@ -204,6 +205,8 @@ struct Options {
   bool stats = false;
   bool compact = false;
   // Never a --pass flag: an argument vector is visible in `ps`.
+  // Taken verbatim when given: the directory holding this machine's key.
+  std::string state_dir;
   std::string pass_file;
 };
 
@@ -228,10 +231,20 @@ VaultKeys VaultKeysFor(const Options& o) {
 }
 
 ReplicaId ReplicaFor(const Options& o) {
-  // No fallback any more: main() refuses every command without a --vault, so
-  // there is always a vault to anchor to. The fallback used to be for --stats,
-  // which now needs the vault anyway to decrypt what it is reporting on.
-  return cmdstate::LoadOrCreateDeviceKeys(o.vault).Replica();
+  // NEVER MINTS. umbra_ai is not one of the two commands that may make a device
+  // a member of a vault -- creating and joining are umbra_sync's -- so a
+  // missing identity here is a state to explain, not one to paper over. An
+  // invented replica id would sign manifest operations as a device the vault
+  // has never enrolled, and every peer would carry them as a stranger's.
+  //
+  // main() refuses every command without a --vault, so there is always a vault
+  // to anchor to.
+  DeviceKeyPair d;
+  if (!cmdstate::RequireDeviceKeys(
+          o.vault, cmdstate::StateDirFor(o.vault, o.state_dir), &d)) {
+    std::exit(1);
+  }
+  return d.Replica();
 }
 
 int Build(const Options& o) {
@@ -908,7 +921,10 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     const char* next = (i + 1 < argc) ? argv[i + 1] : nullptr;
-    if (a == "--pass-file" && next) {
+    if (a == "--state-dir" && next) {
+      o.state_dir = next;
+      ++i;
+    } else if (a == "--pass-file" && next) {
       o.pass_file = next;
       ++i;
     } else if (a == "--vault" && next) {

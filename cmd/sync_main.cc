@@ -40,7 +40,6 @@ namespace {
 // The vault state helpers now live in one place, shared with umbra_ai so the
 // two cannot derive different keys for the same vault. See cmd/vault_state.h.
 using ::umbra::cmdstate::LoadEpochWraps;
-using ::umbra::cmdstate::LoadOrCreateDeviceKeys;
 using ::umbra::cmdstate::LoadOrCreateSalt;
 using ::umbra::cmdstate::MakeDirs;
 using ::umbra::cmdstate::PromptForPassphrase;
@@ -201,6 +200,7 @@ void Usage() {
       "umbra_sync --dir PATH --relay HOST:PORT [--pass-file PATH]\n"
       "           [--create | --enrol | --approve DEVICE | --revoke DEVICE]\n"
       "           [--vault HEX] [--code NNNNNN] [--once | --watch]\n"
+      "           [--state-dir PATH]\n"
       "           [--interval SECONDS] [-v]\n"
       "\n"
       "  --create   start a new vault in this folder\n"
@@ -226,6 +226,9 @@ void Usage() {
 int main(int argc, char** argv) {
   std::string dir;
   std::string relay = "127.0.0.1:9000";
+  // Taken verbatim when given: this is the directory holding this machine's
+  // key for this vault, which is how a moved vault is pointed back at its own.
+  std::string state_dir_override;
   std::string pass;
   Mode mode = Mode::kSync;
   std::string target;
@@ -241,6 +244,9 @@ int main(int argc, char** argv) {
     const char* next = (i + 1 < argc) ? argv[i + 1] : nullptr;
     if (a == "--dir" && next) {
       dir = next;
+      ++i;
+    } else if (a == "--state-dir" && next) {
+      state_dir_override = next;
       ++i;
     } else if (a == "--relay" && next) {
       relay = next;
@@ -360,7 +366,28 @@ int main(int argc, char** argv) {
   }
   const double key_seconds = SecondsSince(key_start);
 
-  const DeviceKeyPair device = LoadOrCreateDeviceKeys(root);
+  // THE IDENTITY IS MINTED ONLY BY THE TWO COMMANDS THAT MAY MINT ONE.
+  //
+  // Creating a vault and joining one are the moments a device legitimately
+  // becomes a member. Every other mode -- a sync round, --approve, --revoke --
+  // is run by a device that is already a member, so a missing key there means
+  // something is wrong and a fresh one would silently make this machine a
+  // stranger to every other device in the vault. It fails and explains instead.
+  const std::string state_dir = cmdstate::StateDirFor(root, state_dir_override);
+  DeviceKeyPair device;
+  if (mode == Mode::kCreate || mode == Mode::kEnrol) {
+    if (cmdstate::LoadDeviceKeys(state_dir, &device) !=
+        cmdstate::DeviceKeyStatus::kOk) {
+      (void)cmdstate::AdoptLegacyDeviceKey(root, state_dir);
+      if (cmdstate::LoadDeviceKeys(state_dir, &device) !=
+              cmdstate::DeviceKeyStatus::kOk &&
+          !cmdstate::CreateDeviceKeys(state_dir, &device)) {
+        return 1;
+      }
+    }
+  } else if (!cmdstate::RequireDeviceKeys(root, state_dir, &device)) {
+    return 1;
+  }
   // ONE IDENTITY, NOT TWO. keys.h derives the replica id from the public key
   // precisely so a device cannot have a network identity and a CRDT identity
   // that disagree.
