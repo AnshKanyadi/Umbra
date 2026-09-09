@@ -84,7 +84,7 @@ class FileHandle {
   }
   FileHandle(const FileHandle&) = delete;
   FileHandle& operator=(const FileHandle&) = delete;
-  std::FILE* get() const { return f_; }
+  std::FILE* Get() const { return f_; }
 
  private:
   std::FILE* f_;
@@ -92,12 +92,12 @@ class FileHandle {
 
 bool FlipByteAt(const std::string& path, long offset) {
   FileHandle f(std::fopen(path.c_str(), "r+b"));
-  if (f.get() == nullptr) return false;
-  if (std::fseek(f.get(), offset, SEEK_SET) != 0) return false;
-  const int c = std::fgetc(f.get());
+  if (f.Get() == nullptr) return false;
+  if (std::fseek(f.Get(), offset, SEEK_SET) != 0) return false;
+  const int c = std::fgetc(f.Get());
   if (c == EOF) return false;
-  if (std::fseek(f.get(), offset, SEEK_SET) != 0) return false;
-  return std::fputc(c ^ 0x40, f.get()) != EOF;
+  if (std::fseek(f.Get(), offset, SEEK_SET) != 0) return false;
+  return std::fputc(c ^ 0x40, f.Get()) != EOF;
 }
 
 class TempDir {
