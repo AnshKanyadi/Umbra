@@ -5,6 +5,8 @@
 // skips when none is running.
 #include "umbra/ai/answer.h"
 
+#include <ftw.h>
+
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -19,6 +21,22 @@ namespace umbra {
 namespace ai {
 namespace {
 
+// REMOVING A DIRECTORY WITHOUT A SHELL. std::system spawns a command
+// processor, which clang-tidy flags (cert-env33-c) and which is genuinely worse
+// here: it depends on a shell being present, on rm accepting these flags, and
+// on the path surviving quoting. nftw walks the tree and unlinks as it goes.
+int RemoveEntry(const char* path, const struct stat*, int type, struct FTW*) {
+  if (type == FTW_DP) return ::rmdir(path);
+  return ::remove(path);
+}
+
+void RemoveTree(const std::string& path) {
+  if (path.empty()) return;
+  // FTW_DEPTH so a directory is visited after its contents; FTW_PHYS so a
+  // symlink is unlinked rather than followed out of the temporary directory.
+  (void)::nftw(path.c_str(), RemoveEntry, 16, FTW_DEPTH | FTW_PHYS);
+}
+
 class TempDir {
  public:
   TempDir() {
@@ -26,13 +44,7 @@ class TempDir {
     const char* p = ::mkdtemp(t);
     path_ = (p != nullptr) ? p : "";
   }
-  ~TempDir() {
-    // ASSIGNED, NOT CAST TO VOID. GCC's warn_unused_result is not silenced by
-    // a (void) cast, so the idiom clang accepts is a build error there.
-    if (path_.empty()) return;
-    const int rc = std::system(("rm -rf '" + path_ + "'").c_str());
-    (void)rc;
-  }
+  ~TempDir() { RemoveTree(path_); }
   const std::string& path() const { return path_; }
 
  private:

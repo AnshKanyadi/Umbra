@@ -14,6 +14,7 @@
 #include "basalt/db.h"
 #include "basalt/posix_env.h"
 #include "basalt/slice.h"
+#include "keyspace.h"
 
 namespace umbra {
 namespace ai {
@@ -229,7 +230,7 @@ IndexStatus Index::Open(const std::string& dir, const VaultKeys* keys,
   // Load every segment the manifest names, then apply the tombstones.
   {
     const std::string lo(1, kSegmentPrefix);
-    const std::string hi(1, kSegmentPrefix + 1);
+    const std::string hi = PrefixUpperBound(lo);
     basalt::IterOptions o;
     o.lower = basalt::Bound::At(basalt::Slice(lo));
     o.upper = basalt::Bound::At(basalt::Slice(hi));
@@ -267,7 +268,7 @@ IndexStatus Index::Open(const std::string& dir, const VaultKeys* keys,
   }
   {
     const std::string lo(1, kTombstonePrefix);
-    const std::string hi(1, kTombstonePrefix + 1);
+    const std::string hi = PrefixUpperBound(lo);
     basalt::IterOptions o;
     o.lower = basalt::Bound::At(basalt::Slice(lo));
     o.upper = basalt::Bound::At(basalt::Slice(hi));
@@ -312,11 +313,10 @@ IndexStatus Index::PutObject(const ObjectId& object,
     std::string lo(1, kObjectPrefix);
     lo.append(reinterpret_cast<const char*>(object.bytes.data()),
               object.bytes.size());
-    std::string hi = lo;
-    hi.push_back('\xff');
+    const std::string hi = PrefixUpperBound(lo);
     basalt::IterOptions o;
     o.lower = basalt::Bound::At(basalt::Slice(lo));
-    o.upper = basalt::Bound::At(basalt::Slice(hi));
+    if (!hi.empty()) o.upper = basalt::Bound::At(basalt::Slice(hi));
     std::unique_ptr<basalt::Iterator> it = im.db->NewIter(o);
     for (bool ok = it->First(); ok; ok = it->Next()) {
       const std::string k = it->Key().ToString();

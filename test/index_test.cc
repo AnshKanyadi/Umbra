@@ -10,6 +10,7 @@
 // same vectors produce the same bytes.
 #include "umbra/ai/index.h"
 
+#include <ftw.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -22,12 +23,29 @@
 
 #include <gtest/gtest.h>
 
+#include "keyspace.h"
 #include "umbra/ai/chunk.h"
 #include "umbra/ai/embed.h"
 
 namespace umbra {
 namespace ai {
 namespace {
+
+// REMOVING A DIRECTORY WITHOUT A SHELL. std::system spawns a command
+// processor, which clang-tidy flags (cert-env33-c) and which is genuinely worse
+// here: it depends on a shell being present, on rm accepting these flags, and
+// on the path surviving quoting. nftw walks the tree and unlinks as it goes.
+int RemoveEntry(const char* path, const struct stat*, int type, struct FTW*) {
+  if (type == FTW_DP) return ::rmdir(path);
+  return ::remove(path);
+}
+
+void RemoveTree(const std::string& path) {
+  if (path.empty()) return;
+  // FTW_DEPTH so a directory is visited after its contents; FTW_PHYS so a
+  // symlink is unlinked rather than followed out of the temporary directory.
+  (void)::nftw(path.c_str(), RemoveEntry, 16, FTW_DEPTH | FTW_PHYS);
+}
 
 class TempDir {
  public:
@@ -36,14 +54,7 @@ class TempDir {
     const char* p = ::mkdtemp(t);
     path_ = (p != nullptr) ? p : "";
   }
-  ~TempDir() {
-    if (path_.empty()) return;
-    // Assigned rather than cast to void: GCC's warn_unused_result is not
-    // silenced by a (void) cast.
-    const std::string cmd = "rm -rf '" + path_ + "'";
-    const int rc = std::system(cmd.c_str());
-    (void)rc;
-  }
+  ~TempDir() { RemoveTree(path_); }
   const std::string& path() const { return path_; }
 
  private:
@@ -737,6 +748,61 @@ TEST(Segment, SealingIsReproducible) {
   EXPECT_EQ(s1, s2) << "sealing is not reproducible, so segments cannot be "
                        "content addressed";
   EXPECT_EQ(i1, i2);
+}
+
+// THE BUG THIS HELPER EXISTS FOR.
+//
+// The index's object keys are 'o' || object(16) || segment(32) || slot(4), and
+// the first upper bound used for that scan was the prefix with 0xFF appended.
+// That excludes every key whose segment id begins with 0xFF -- about one
+// segment in 256 -- so deleting or re-indexing such an object left its old
+// chunks live and still answering queries.
+//
+// It could not be reached on demand from outside, because a segment id is a
+// content hash. It appeared as an object count of 21 where 20 was expected, on
+// Linux and not on macOS: the two produce slightly different vectors, hence
+// different ids, so one drew a 0xFF and the other did not. A test that waited
+// for that coincidence would usually prove nothing, so the arithmetic is tested
+// directly with the input that breaks it.
+TEST(Keyspace, PrefixUpperBoundCoversKeysStartingWithFF) {
+  // The case that was wrong. Everything from "ab" must sort below the bound,
+  // including a continuation of 0xFF.
+  const std::string prefix = "ab";
+  const std::string bound = PrefixUpperBound(prefix);
+  ASSERT_FALSE(bound.empty());
+  EXPECT_EQ(bound, "ac");
+
+  const std::string ff_key = prefix + std::string(1, '\xff') + "rest";
+  EXPECT_LT(ff_key, bound)
+      << "a key whose next byte is 0xFF fell outside the scan";
+  EXPECT_GT(ff_key, prefix);
+
+  // The naive bound, for contrast: this is what the index used to do.
+  const std::string naive = prefix + std::string(1, '\xff');
+  EXPECT_FALSE(ff_key < naive)
+      << "the naive bound would have excluded this key, which is the bug";
+}
+
+TEST(Keyspace, PrefixUpperBoundHandlesTrailingFF) {
+  EXPECT_EQ(PrefixUpperBound(std::string("a\xff", 2)), "b");
+  EXPECT_EQ(PrefixUpperBound(std::string("a\xff\xff", 3)), "b");
+  // A prefix of all 0xFF has no successor. Empty means "scan to the end", and a
+  // caller that read it as "scan nothing" would silently return no rows.
+  EXPECT_TRUE(PrefixUpperBound(std::string("\xff\xff", 2)).empty());
+  EXPECT_TRUE(PrefixUpperBound("").empty());
+}
+
+TEST(Keyspace, PrefixUpperBoundIsExclusiveAndTight) {
+  const std::string prefix = "obj";
+  const std::string bound = PrefixUpperBound(prefix);
+  // Everything with the prefix is inside.
+  for (int b = 0; b < 256; ++b) {
+    const std::string k = prefix + std::string(1, static_cast<char>(b));
+    EXPECT_GE(k, prefix);
+    EXPECT_LT(k, bound) << "byte " << b << " fell outside the range";
+  }
+  // And the next prefix is outside, so the scan does not bleed into it.
+  EXPECT_FALSE(std::string("obk") < bound);
 }
 
 }  // namespace ai
