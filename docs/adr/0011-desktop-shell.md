@@ -79,26 +79,55 @@ That line is why this was done first. A correctly signed app from a paid
 developer account is still rejected on another person's machine. Signing is
 necessary and is not sufficient; notarization is not a polish step.
 
-## What notarization still needs
+## The loop, closed and timed
 
-Submitting requires credentials that are deliberately not in this repository and
-were not available to generate:
+Submitted, accepted, stapled, and Gatekeeper now says yes:
+
+```
+$ xcrun notarytool submit Umbra_0.0.1_aarch64.dmg --keychain-profile umbra --wait
+  status: Accepted                                   # 23 seconds, round trip
+
+$ xcrun stapler staple Umbra_0.0.1_aarch64.dmg
+The staple and validate action worked!
+
+$ spctl -a -t open --context context:primary-signature -vvv Umbra_0.0.1_aarch64.dmg
+accepted
+source=Notarized Developer ID
+```
+
+**23 seconds.** That is fast enough that notarization belongs in CI on the
+release job rather than as a manual step someone forgets. It needs the App Store
+Connect API key form of the credential rather than a keychain profile, because a
+runner has no keychain to read.
+
+**STAPLE THE APP, NOT ONLY THE DISK IMAGE.** Stapling the DMG leaves the bundle
+inside it without a ticket:
+
+```
+$ xcrun stapler validate Umbra.app
+Umbra.app does not have a ticket stapled to it.
+```
+
+It still passes Gatekeeper while the DMG is mounted, because the check can go
+online or read the image's ticket -- so this is invisible in testing and
+appears on someone else's machine, offline, after they have dragged the app to
+Applications. `stapler` will attach a ticket to the `.app` directly once the
+submission is accepted; both were stapled here and both validate.
+
+The release order is therefore: build signed, submit, staple the `.app`, staple
+the `.dmg`, verify both with `spctl`.
+
+## What notarization needs
+
+Credentials are deliberately not in this repository. One of:
 
 - an **app-specific password** from appleid.apple.com, plus the Apple ID and
   team id, stored once with `xcrun notarytool store-credentials`, or
 - an **App Store Connect API key** (`.p8` plus key id and issuer id), which is
   the better choice for CI because it is scoped and revocable
 
-Then, per release:
-
-```sh
-xcrun notarytool submit Umbra_0.0.1_aarch64.dmg --keychain-profile umbra --wait
-xcrun stapler staple Umbra_0.0.1_aarch64.dmg
-spctl -a -t open --context context:primary-signature -vvv Umbra_0.0.1_aarch64.dmg
-```
-
-Apple's service typically answers in minutes. Stapling is what makes the app
-open on a machine that is offline or has never seen it.
+Stapling is what makes the app open on a machine that is offline or has never
+seen it before.
 
 ## Consequences
 
