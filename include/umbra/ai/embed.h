@@ -148,6 +148,21 @@ std::unique_ptr<Embedder> NewOllamaEmbedder(const std::string& model,
 // mistaken for a measurement of retrieval quality.
 std::unique_ptr<Embedder> NewHashingEmbedder(uint32_t dimension);
 
+// A REAL MODEL, IN PROCESS, WITH NOTHING INSTALLED.
+//
+// Loads a GGUF through llama.cpp: no daemon, no HTTP, no network. This is what
+// lets a desktop app search on first launch instead of asking the user to go
+// and install Ollama first.
+//
+// The descriptor's dimension is discovered from the weights and overwrites
+// whatever is passed, for the same reason the Ollama backend discovers it. Pass
+// the family and version you intend to record in the index identity: on
+// all-MiniLM-L6-v2 this produces vectors that agree with Ollama's to 1e-4, so
+// declaring the same descriptor keeps existing indexes readable.
+std::unique_ptr<Embedder> NewLocalEmbedder(const std::string& gguf_path,
+                                           const ModelDescriptor& descriptor,
+                                           EmbedStatus* status);
+
 // Cosine similarity of two unit vectors, which is their dot product. Both must
 // have the same width; mismatched widths return 0 rather than reading past an
 // end.

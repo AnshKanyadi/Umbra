@@ -85,6 +85,9 @@ jobs:
       - name: the basalt submodule is present
         run: test -f third_party/basalt/CMakeLists.txt
 
+      - name: the llama.cpp submodule is present
+        run: test -f third_party/llama.cpp/CMakeLists.txt
+
       - name: configure
         run: cmake -S . -B build -DUMBRA_SANITIZER=${{ matrix.lane.sanitizer }}
 
@@ -95,6 +98,21 @@ jobs:
 
       - name: run
         run: env ${{ matrix.lane.opts }} ./build/umbra_test
+
+      # THE LOCAL EMBEDDER IS COMPILED, NOT INSTRUMENTED.
+      #
+      # umbra_local_embed pulls in llama.cpp, which is deliberately kept out of
+      # umbra_test: GGML trips UBSan's pointer-overflow check on every embed
+      # (`nullptr + 96` in ggml.c), and this build runs
+      # -fno-sanitize-recover=all. Suppressing that check would weaken it over
+      # our own code to accommodate a dependency the tests never call.
+      #
+      # So it is built on the clean lane only, on all three platforms, which is
+      # what stops the integration rotting without pretending it is covered.
+      # See CMakeLists.txt and ADR 0010.
+      - name: the local embedder still builds
+        if: matrix.lane.sanitizer == 'none'
+        run: cmake --build build --target umbra_ai -j "$(getconf _NPROCESSORS_ONLN)"
 
   # THE CONVERGENCE SWEEP, ITS OWN LANE.
   #

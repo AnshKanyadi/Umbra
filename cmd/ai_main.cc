@@ -155,6 +155,30 @@ ReplicaId ReplicaFor(const Options& o);
 std::unique_ptr<Embedder> MakeEmbedder(const std::string& model,
                                        uint32_t hashing_dim) {
   if (model == "hashing") return NewHashingEmbedder(hashing_dim);
+#if defined(UMBRA_HAVE_LLAMA)
+  // A PATH MEANS A LOCAL MODEL, no daemon and no network. Phase 6 needs search
+  // to work on a machine where nothing has been installed; this is that path.
+  // The descriptor is declared to match what the Ollama backend records for the
+  // same weights, because the vectors agree to 1e-4 and an index built either
+  // way must stay readable by the other.
+  if (model.find('/') != std::string::npos ||
+      model.rfind(".gguf") != std::string::npos) {
+    ModelDescriptor d;
+    d.family = "all-minilm";
+    d.version = "resolved-by-backend";
+    d.quantisation = "unknown";
+    d.pooling = "backend";
+    d.normalised = true;
+    EmbedStatus st = EmbedStatus::kOk;
+    std::unique_ptr<Embedder> local = NewLocalEmbedder(model, d, &st);
+    if (local == nullptr) {
+      std::fprintf(stderr, "cannot load the model at %s: %s\n", model.c_str(),
+                   EmbedStatusName(st));
+      std::exit(1);
+    }
+    return local;
+  }
+#endif
   EmbedStatus st = EmbedStatus::kOk;
   std::unique_ptr<Embedder> e =
       NewOllamaEmbedder(model, "127.0.0.1", 11434, &st);
@@ -186,7 +210,8 @@ void Usage() {
       "                       or a prompt. Never an argument.\n"
       "  --state-dir PATH     where this machine keeps its device key\n"
       "\n"
-      "  --model NAME         all-minilm, nomic-embed-text, or\n"
+      "  --model NAME         all-minilm, nomic-embed-text, a path to a\n"
+      "                       .gguf for a local model with no daemon, or\n"
       "                       hashing for the deterministic stand-in\n"
       "  --generator NAME     an Ollama chat model for --ask\n"
       "  --floor F            the relevance floor, cosine\n");

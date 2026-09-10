@@ -1,3 +1,6 @@
 [submodule "third_party/basalt"]
 	path = third_party/basalt
 	url = https://github.com/AnshKanyadi/basalt
+[submodule "third_party/llama.cpp"]
+	path = third_party/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp
