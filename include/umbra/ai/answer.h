@@ -40,9 +40,37 @@
 // the precision-leaning one, because a refusal is visible and recoverable --
 // the passages are printed underneath it -- and a fabrication is neither.
 //
+// A SECOND PASS WAS BUILT, MEASURED, AND NOT SHIPPED. Do not rebuild it without
+// reading this.
+//
+// The shape was the obvious one: after the answer is generated, a second call
+// receives only the claims and the passages they cite -- no question, no
+// citation markers, no sign that it wrote the text -- and judges each claim as
+// SUPPORTED or NOT-SUPPORTED. Entailment rather than generation. An unsupported
+// claim downgraded the answer to kUngrounded.
+//
+// Over the same 45 questions, with and without, in one session:
+//
+//                    answered      fabrications through
+//   single pass      25/28 (89%)   3/17 (18%)
+//   with verifier    18/28 (64%)   1/17  (6%)
+//
+// It destroyed SEVEN real answers to catch TWO fabrications. On the algorithms
+// corpus it was pure loss: nothing caught, three good answers marked
+// ungrounded. And it did not catch the case that motivated it -- the fabricated
+// paragraph about monotonic stacks survived, because the sentence quoted a
+// fragment that really is in the cited passage ("a move operation that would
+// create a cycle is ignored") and wrapped it in an invented conclusion.
+// Entailment judged by the same model turns out to be presence-checking.
+//
+// Latency was NOT the reason. It cost 4% (2.88s -> 2.99s), not the doubling
+// everyone including me predicted: a verifier emits one short line per claim,
+// and generation time goes on output tokens. The cost was recall, and recall is
+// where every attempt at this has ended up.
+//
 // So an answer remains a MODEL'S CLAIM ABOUT PASSAGES, and the passages are
-// shown so the claim can be checked. Anything stronger needs a check that does
-// not consult the same model that wrote the answer.
+// shown so the claim can be checked. Anything stronger needs a judge that is
+// not this model -- a different and larger one, or a person.
 //
 // THE MODEL'S VERDICT IS READ FROM A TOKEN, NOT FROM ITS PROSE. The prompt has
 // always told the model to decline when the passages fall short, and a small

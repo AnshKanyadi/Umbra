@@ -404,9 +404,12 @@ separate `--index` directory per model.
   the same `--state-dir` seam as another place to look rather than a rewrite of
   how identity works.
 - **A local model can still fabricate.** The verdict contract catches most of
-  it and is measured, not assumed; the numbers and the four prompt wordings
-  behind them are in `include/umbra/ai/answer.h`. Closing the gap needs a check
-  that does not ask the same model that wrote the answer — which is not built.
+  it and is measured, not assumed. A second entailment pass over the generated
+  claims was built and measured too, and not shipped: it destroyed seven real
+  answers to catch two fabrications, and missed the case that motivated it. The
+  numbers, the four prompt wordings, and why the second pass failed are in
+  `include/umbra/ai/answer.h`. Closing the gap needs a judge that is not the
+  model that wrote the answer.
 - **There is no watcher wired into `umbra_ai`.** Re-run `--build` after you
   have written notes; unchanged notes cost a re-embed but do not duplicate
   anything.
