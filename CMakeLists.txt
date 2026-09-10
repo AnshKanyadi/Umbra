@@ -143,6 +143,32 @@ set(UMBRA_CXX_FLAGS -Wall -Wextra -Werror -Werror=switch -fno-exceptions -fno-rt
 set(BASALT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/basalt EXCLUDE_FROM_ALL)
 
+# ------------------------------------------------------------- llama.cpp
+#
+# The embedding model, in process. A desktop user cannot be asked to install a
+# daemon before search works, so the model comes with the binary.
+#
+# Everything optional is off: no examples, no tools, no server, no tests, and
+# above all no LLAMA_CURL, which would put a network dependency into a build
+# that deliberately has none. Metal is off too -- CPU embedding measured 82
+# texts/s, matching the daemon it replaces, and a Metal shader library is
+# another file to find inside an app bundle.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt")
+  set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+  set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+  set(GGML_METAL OFF CACHE BOOL "" FORCE)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
+  set(UMBRA_HAVE_LLAMA ON)
+else()
+  set(UMBRA_HAVE_LLAMA OFF)
+endif()
+
 # ------------------------------------------------------------------ libsodium
 #
 # Included AFTER the sanitizer block for the same reason basalt and googletest
@@ -228,6 +254,39 @@ target_compile_options(umbra PRIVATE ${UMBRA_CXX_FLAGS})
 # implementation detail of this library. A consumer of <umbra/change_event.h>
 # gets a 32-byte digest and no libsodium headers.
 target_link_libraries(umbra PUBLIC basalt::basalt Threads::Threads)
+
+# ------------------------------------------------- the local embedder, apart
+#
+# A SEPARATE TARGET SO THE TEST BINARY DOES NOT CONTAIN GGML.
+#
+# The sanitizer lanes build and run `umbra_test` and nothing else, so anything
+# linked into it is instrumented. GGML trips UBSan on the first embed:
+#
+#   ggml/src/ggml.c:7419: applying non-zero offset 96 to null pointer
+#
+# which is `nullptr + 96`, a common C idiom for computing an offset from a null
+# base. It is benign in practice and genuine undefined behaviour by the
+# standard, and this build runs -fno-sanitize-recover=all, so it aborts.
+#
+# It is not suppressed. Suppressing a check weakens it everywhere, including
+# over our own code, to accommodate a dependency our tests never call: they use
+# the hashing embedder. Keeping llama.cpp out of the test binary costs no
+# coverage and saves a minute of build in every sanitizer lane.
+#
+# THE COVERAGE THIS GIVES UP, STATED PLAINLY: the embedding path is not
+# sanitizer-tested. ASan was run over it by hand and is clean; UBSan is not,
+# for the reason above. A lane below compiles this target on Linux so the
+# integration cannot rot, but does not instrument it.
+if(UMBRA_HAVE_LLAMA)
+  # EXCLUDE_FROM_ALL, so `cmake --build` with no target does not build
+  # llama.cpp. The library-only lane does exactly that and went from 25s to 110s
+  # without this; umbra_ai still pulls it in as a dependency, and the clean lane
+  # builds that explicitly, so the coverage is unchanged and paid for once.
+  add_library(umbra_local_embed STATIC EXCLUDE_FROM_ALL src/ai/embed_llama.cc)
+  target_link_libraries(umbra_local_embed PUBLIC umbra llama)
+  target_compile_definitions(umbra_local_embed PUBLIC UMBRA_HAVE_LLAMA=1)
+  target_compile_options(umbra_local_embed PRIVATE ${UMBRA_CXX_FLAGS})
+endif()
 target_link_libraries(umbra PRIVATE umbra::sodium)
 target_link_libraries(umbra PUBLIC umbra_wire)
 
@@ -365,6 +424,9 @@ target_compile_options(umbra_sync PRIVATE ${UMBRA_CXX_FLAGS})
 
 add_executable(umbra_ai cmd/ai_main.cc)
 target_link_libraries(umbra_ai PRIVATE umbra umbra::sodium umbra_cmd_state)
+if(UMBRA_HAVE_LLAMA)
+  target_link_libraries(umbra_ai PRIVATE umbra_local_embed)
+endif()
 target_include_directories(umbra_ai PRIVATE src src/watcher src/crdt src/crypto src/sync src/ai)
 target_compile_options(umbra_ai PRIVATE ${UMBRA_CXX_FLAGS})
 
