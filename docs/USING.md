@@ -279,6 +279,54 @@ for a score to stand out against. Lower it:
   --ask 'distributed systems'
 ```
 
+### Reading the first word
+
+Every answer starts with a status, and the difference between them is the whole
+point of the tool:
+
+| status | what it means |
+|---|---|
+| `answered` | the model read the passages, said they contain the answer, and cited them |
+| `no-passages` | nothing in the vault came close enough to show the model |
+| `no-answer-in-passages` | passages were found, and the model said they do not answer the question |
+| `ungrounded` | the model answered without citing anything. Marked loudly; treat it as the model talking |
+
+**An answer is the model's claim about the passages, not a verified fact.**
+The guard below catches a good share of the cases where that claim is wrong, and
+not all of them. Measured across two corpora and 45 questions with
+`llama3.2:3b`: 25 of 28 answerable questions answered, 13 of 17 unanswerable
+ones refused. The four that got through produced exactly what the guard exists
+to stop — *"a monotonic stack is related to convergence... it avoids backward
+interleaving"*, cited to a real passage at 0.6001. Read the passages. They are
+printed under every answer for this reason.
+
+`no-answer-in-passages` is the guard working, not a failure. Ask a vault of
+algorithm notes about a topic it has never covered and a small model will
+happily say "there is no passage about this — however, I can make an educated
+guess", invent a paragraph, and cite a real passage about something adjacent.
+Every citation resolves, so it used to come back as `answered` and render like
+any grounded answer. A citation proves the model looked at a passage; it does
+not prove the passage supports the claim. The model must now open its reply with
+`VERDICT: ANSWER` or `VERDICT: NO-ANSWER`, and the code believes the token
+rather than reading its prose for hedging.
+
+### Reading the scores
+
+Under the passages is a line like:
+
+```
+retrieval  top 0.710, 6 passages within 0.071  (barely told apart)
+```
+
+The spread matters more than the top score. A question the vault can answer
+usually has one passage standing clear of the rest; a question it cannot often
+returns several near-identical scores, because the ranking is of things that are
+all equally unrelated. The absolute number cannot tell those apart — 0.71 is a
+strong hit in one query and the top of an undifferentiated cluster in another —
+so the spread is printed rather than left to be inferred.
+
+### Prose answers
+
 To get prose rather than passages, name a chat model Ollama has. The answer is
 grounded in the retrieved passages and cites them:
 
@@ -355,6 +403,10 @@ separate `--index` directory per model.
   fix this. It is platform-specific and a real dependency, so it belongs behind
   the same `--state-dir` seam as another place to look rather than a rewrite of
   how identity works.
+- **A local model can still fabricate.** The verdict contract catches most of
+  it and is measured, not assumed; the numbers and the four prompt wordings
+  behind them are in `include/umbra/ai/answer.h`. Closing the gap needs a check
+  that does not ask the same model that wrote the answer — which is not built.
 - **There is no watcher wired into `umbra_ai`.** Re-run `--build` after you
   have written notes; unchanged notes cost a re-embed but do not duplicate
   anything.

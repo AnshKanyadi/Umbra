@@ -16,3 +16,13 @@ how many CI lanes are there	Twelve lanes
 what is the capital of France	NONE
 what did I have for breakfast	NONE
 how do I configure a kubernetes ingress	NONE
+# ADJACENT MISSES. The dangerous kind: plausible technical questions on topics
+# this vault has never heard of. "What is the capital of France" is far enough
+# away that any floor refuses it; these sit close enough to the corpus that the
+# top scores clear an absolute floor while ranking nothing but noise.
+how does raft elect a leader	NONE
+what is a monotonic stack	NONE
+how does a bloom filter avoid false negatives	NONE
+when should i use a skip list	NONE
+how does rate limiting work here	NONE
+what quorum does a write need	NONE

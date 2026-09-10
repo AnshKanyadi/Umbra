@@ -20,6 +20,36 @@
 //                  and the nearest misses are listed so the user can judge
 //   kUngrounded    passages were found and the model answered without citing
 //                  any of them. The text is returned, MARKED, never silently
+//   kNoAnswerInPassages
+//                  passages were found and the model said they do not answer
+//                  the question. The guard working, not an error
+//
+// WHAT THIS DOES NOT DO, MEASURED RATHER THAN HOPED.
+//
+// The verdict is a mitigation, not a guarantee. Across two corpora and 45
+// questions, with llama3.2:3b: 25 of 28 answerable questions were answered, and
+// 13 of 17 unanswerable ones were refused. The four that got through on the
+// design corpus produced exactly the failure this exists to stop -- "a
+// monotonic stack is related to convergence ... it avoids backward
+// interleaving", cited to a real CRDT passage at 0.6001.
+//
+// Four prompt wordings were measured. They trade the two errors against each
+// other and cannot remove both: the strictest refused 7 of 10 real answers, the
+// most permissive let the monotonic-stack case through on both corpora.
+// llama3.1:8b caught one more of the four than the 3B did. The wording here is
+// the precision-leaning one, because a refusal is visible and recoverable --
+// the passages are printed underneath it -- and a fabrication is neither.
+//
+// So an answer remains a MODEL'S CLAIM ABOUT PASSAGES, and the passages are
+// shown so the claim can be checked. Anything stronger needs a check that does
+// not consult the same model that wrote the answer.
+//
+// THE MODEL'S VERDICT IS READ FROM A TOKEN, NOT FROM ITS PROSE. The prompt has
+// always told the model to decline when the passages fall short, and a small
+// model says "there is no passage that explains this" and then guesses anyway.
+// So it must now open with VERDICT: ANSWER or VERDICT: NO-ANSWER, and the
+// verdict is what the code believes -- prose is not parsed for hedging, because
+// hedging is a style and this needs a fact. A missing verdict fails closed.
 //
 // kUngrounded is not treated as success. It is the case where a model wrote
 // something plausible from its own weights, and the caller is told.
@@ -94,6 +124,19 @@ enum class AnswerStatus : uint8_t {
   kAnswered,
   // Nothing cleared the relevance floor. No answer was produced.
   kNoPassages,
+  // Passages were found and the model reported that they do not answer the
+  // question. A SUCCESS OF THE GUARD, not a failure: the vault was searched,
+  // something came back, and the model declined to build an answer out of it.
+  //
+  // This case existed all along and had nowhere to go. Asked about a topic the
+  // vault has never heard of, a model would open with "there is no passage
+  // that explains X", then add "however, I can make an educated guess",
+  // fabricate a paragraph, and cite a real passage that says nothing of the
+  // kind. Because a citation resolved, that came back kAnswered -- rendered
+  // exactly like a grounded answer, with a real byte range under it. A citation
+  // proves the model referenced a passage. It does not prove the passage
+  // supports the claim, and the two were being treated as the same thing.
+  kNoAnswerInPassages,
   // Passages were found and the model's answer cited none of them. Returned
   // and marked; see the note at the top.
   kUngrounded,
@@ -155,6 +198,43 @@ struct AnswerOptions {
   uint32_t demote_link_ratio = 6000;
 };
 
+// THE SHAPE OF THE SCORES, NOT JUST THE TOP ONE.
+//
+// An absolute cosine score cannot tell a hit from a miss, and this was found
+// the way such things are found -- by using it. A vault holding a note on depth
+// first search answered "DFS" with that note at 0.79 and an 0.08 gap to the
+// next passage. The same vault, asked about monotonic stacks, which it has
+// never heard of, returned six unrelated notes inside a 0.024 band. Both
+// cleared a floor of 0.60. The absolute numbers say the second is nearly as
+// good as the first; the SHAPE says the second is a ranking of noise.
+//
+// So retrieval reports what its scores looked like, and the caller can see why
+// a query was answered or refused rather than only that it was.
+struct RetrievalShape {
+  // How many candidates the index returned, before any filtering.
+  uint32_t candidates = 0;
+  float best = 0.0f;
+  // The runner-up. Equal to `best` when there was only one candidate, so a gap
+  // of zero means "nothing to compare against" as well as "indistinguishable",
+  // which are the same thing for this purpose.
+  float second = 0.0f;
+  // Over the whole candidate pool, which is what makes this a statement about
+  // the query rather than about the two passages that happened to win.
+  float mean = 0.0f;
+  float stddev = 0.0f;
+
+  // How far the winner stands clear of the runner-up.
+  float Gap() const { return best - second; }
+  // How far the winner stands clear of the pool, in standard deviations. The
+  // discriminating measure: a query the vault can answer has a top score that
+  // is an outlier among its own candidates, and one it cannot has a top score
+  // that is merely the largest of a cluster.
+  float Standout() const {
+    if (stddev <= 0.0f) return 0.0f;
+    return (best - mean) / stddev;
+  }
+};
+
 struct AnswerResult {
   AnswerStatus status = AnswerStatus::kNoPassages;
 
@@ -179,6 +259,8 @@ struct AnswerResult {
   // Populated for kNoPassages: the nearest things that did not clear the floor,
   // so a user can see whether the vault has nothing or the query was wrong.
   std::vector<Passage> near_misses;
+  // What the scores looked like. Populated on every path, including refusals.
+  RetrievalShape shape;
 };
 
 // Retrieve only. Exposed because search without generation is useful on its own
@@ -186,7 +268,8 @@ struct AnswerResult {
 IndexStatus Retrieve(const Index& index, Embedder* embedder,
                      const DocumentSource& source, const std::string& query,
                      const AnswerOptions& options, std::vector<Passage>* out,
-                     std::vector<Passage>* near_misses);
+                     std::vector<Passage>* near_misses,
+                     RetrievalShape* shape = nullptr);
 
 // Retrieve, then answer. `generator` may be null, in which case the passages
 // are returned with kNoPassages or kAnswered and no text -- useful for a caller

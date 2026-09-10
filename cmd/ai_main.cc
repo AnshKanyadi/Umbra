@@ -437,7 +437,25 @@ int Ask(const Options& o) {
           "!! UNGROUNDED: the model cited none of the passages below.\n"
           "!! Treat this as the model talking, not the vault.\n\n");
     }
+    if (r.status == AnswerStatus::kNoAnswerInPassages) {
+      std::printf(
+          "!! NOT ANSWERED: the model read the passages below and said they "
+          "do not\n"
+          "!! answer this. Anything after this line is what it found, not an "
+          "answer.\n\n");
+    }
     std::printf("%s\n\n", r.text.c_str());
+  }
+  // THE SHAPE OF THE SCORES, PRINTED. An absolute score cannot be read on its
+  // own: 0.71 is a strong hit in one query and the top of an undifferentiated
+  // cluster in another. The spread is what tells them apart, so it is shown
+  // rather than left for a user to infer from six numbers.
+  if (r.passages.size() > 1) {
+    const float top = r.passages.front().score;
+    const float bottom = r.passages.back().score;
+    std::printf("retrieval  top %.3f, %zu passages within %.3f%s\n", top,
+                r.passages.size(), top - bottom,
+                (top - bottom) < 0.05f ? "  (barely told apart)" : "");
   }
   for (std::size_t i = 0; i < r.passages.size(); ++i) {
     const Passage& p = r.passages[i];
@@ -501,7 +519,8 @@ int Eval(const Options& o) {
   double seconds = 0;
 
   std::string line;
-  std::printf("%-4s %-52s %s\n", "rank", "question", "expected");
+  std::printf("%-4s %-44s %5s %5s %5s  %s\n", "rank", "question", "top", "gap",
+              "sd", "expected");
   while (std::getline(f, line)) {
     if (line.empty() || line[0] == '#') continue;
     const std::size_t tab = line.find('\t');
@@ -514,9 +533,10 @@ int Eval(const Options& o) {
     if (expect_none) ++expected_refusals;
 
     std::vector<Passage> passages;
+    RetrievalShape shape;
     const auto t0 = std::chrono::steady_clock::now();
-    if (Retrieve(*index, e.get(), source, question, opts, &passages, nullptr) !=
-        IndexStatus::kOk) {
+    if (Retrieve(*index, e.get(), source, question, opts, &passages, nullptr,
+                 &shape) != IndexStatus::kOk) {
       continue;
     }
     seconds += Since(t0);
@@ -525,13 +545,15 @@ int Eval(const Options& o) {
     if (passages.empty()) {
       ++refusals;
       if (expect_none) ++correct_refusals;
-      std::printf("%-4s %-52s %s\n", expect_none ? "ok" : "MISS",
-                  question.substr(0, 52).c_str(), want.c_str());
+      std::printf("%-4s %-44s %5.3f %5.3f %5.2f  %s\n",
+                  expect_none ? "ok" : "MISS", question.substr(0, 44).c_str(),
+                  shape.best, shape.Gap(), shape.Standout(), want.c_str());
       continue;
     }
     if (expect_none) {
-      std::printf("%-4s %-52s %s\n", "BAD", question.substr(0, 52).c_str(),
-                  "answered a question the vault cannot answer");
+      std::printf("%-4s %-44s %5.3f %5.3f %5.2f  %s\n", "BAD",
+                  question.substr(0, 44).c_str(), shape.best, shape.Gap(),
+                  shape.Standout(), "answered what it cannot answer");
       continue;
     }
     std::size_t rank = 0;
@@ -545,9 +567,10 @@ int Eval(const Options& o) {
     if (rank >= 1 && rank <= 3) ++hit_at_3;
     if (rank >= 1 && rank <= 5) ++hit_at_5;
     if (rank >= 1) mrr += 1.0 / static_cast<double>(rank);
-    std::printf("%-4s %-52s %s\n",
+    std::printf("%-4s %-44s %5.3f %5.3f %5.2f  %s\n",
                 rank == 0 ? "MISS" : std::to_string(rank).c_str(),
-                question.substr(0, 52).c_str(), want.substr(0, 40).c_str());
+                question.substr(0, 44).c_str(), shape.best, shape.Gap(),
+                shape.Standout(), want.substr(0, 30).c_str());
   }
 
   const std::size_t answerable = asked - expected_refusals;

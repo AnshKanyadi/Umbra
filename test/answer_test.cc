@@ -210,6 +210,7 @@ TEST(Answer, MarksAnAnswerThatCitesNothing) {
   o.relative_floor = -1.0f;
 
   std::unique_ptr<Generator> gen = NewScriptedGenerator(
+      "VERDICT: ANSWER\n"
       "Revocation works by rotating a key. I am confident about this and will "
       "not tell you where I got it.");
   const AnswerResult r = Answer(*f.index, f.embedder.get(), gen.get(),
@@ -229,6 +230,7 @@ TEST(Answer, AcceptsAnAnswerThatCitesAPassage) {
   o.min_score = -1.0f;  // cosine bottoms out at -1; 0 is not "no floor"
   o.relative_floor = -1.0f;
   std::unique_ptr<Generator> gen = NewScriptedGenerator(
+      "VERDICT: ANSWER\n"
       "Rotation seals a new epoch key to the remaining "
       "devices [1].");
   const AnswerResult r = Answer(*f.index, f.embedder.get(), gen.get(),
@@ -248,6 +250,7 @@ TEST(Answer, IgnoresCitationsToPassagesThatDoNotExist) {
   o.relative_floor = -1.0f;
   o.k = 2;
   std::unique_ptr<Generator> gen = NewScriptedGenerator(
+      "VERDICT: ANSWER\n"
       "This is supported by [7] and also by [99] and definitely [0].");
   const AnswerResult r = Answer(*f.index, f.embedder.get(), gen.get(),
                                 f.vault.Source(), "what does revocation do", o);
@@ -316,7 +319,8 @@ TEST(Answer, ThePromptSaysWhatTheRulesAre) {
   // described in a comment nobody checks.
   const std::string system = SystemPrompt();
   EXPECT_NE(system.find("ONLY"), std::string::npos);
-  EXPECT_NE(system.find("do not contain the answer"), std::string::npos);
+  EXPECT_NE(system.find("VERDICT: ANSWER"), std::string::npos);
+  EXPECT_NE(system.find("VERDICT: NO-ANSWER"), std::string::npos);
   EXPECT_NE(system.find("Do not invent passage numbers"), std::string::npos);
 
   Passage p;
@@ -372,5 +376,114 @@ TEST(Generator, AnswersThroughARealModelWhenOneIsRunning) {
   for (uint32_t c : r.cited) EXPECT_LT(c, r.passages.size());
 }
 
+// ------------------------------------------------------ the model's verdict
+
+// A CITATION PROVES THE MODEL LOOKED AT A PASSAGE, NOT THAT THE PASSAGE SAYS SO.
+//
+// The shape that made this necessary, observed on a real vault and reproduced
+// on a synthetic one: asked to explain a topic the vault has never covered, a
+// small model opens by admitting there is no such passage, then offers "an
+// educated guess", fabricates a paragraph, and cites a real passage about a
+// neighbouring subject. Every citation resolved, so it came back kAnswered and
+// was rendered exactly like a grounded answer. A grounded citation to an
+// irrelevant passage is worse than no answer, because it looks verified.
+//
+// So the verdict is a token the code reads, not prose it interprets.
+TEST(Answer, AGuessWearingACitationIsNotAnAnswer) {
+  Fixture f;
+  ASSERT_NO_FATAL_FAILURE(Build(&f, Docs()));
+  AnswerOptions o;
+  o.min_score = -1.0f;
+  o.relative_floor = -1.0f;
+  std::unique_ptr<Generator> gen = NewScriptedGenerator(
+      "VERDICT: NO-ANSWER\n"
+      "There is no passage about monotonic stacks. However, I can make an "
+      "educated guess from the discussion of recursion [1]: they track "
+      "function calls and return addresses.");
+  const AnswerResult r =
+      Answer(*f.index, f.embedder.get(), gen.get(), f.vault.Source(),
+             "explain monotonic stacks", o);
+  EXPECT_EQ(r.status, AnswerStatus::kNoAnswerInPassages)
+      << "a guess with a resolving citation was presented as an answer";
+  // The citation still resolves and is still reported: what the model looked at
+  // is the useful part of a refusal.
+  EXPECT_FALSE(r.cited.empty());
+}
+
+// FAILS CLOSED. A model that ignored the format ignored the instructions, which
+// is exactly when its output must not be dressed as an answer.
+TEST(Answer, AReplyWithNoVerdictIsNotAnAnswer) {
+  Fixture f;
+  ASSERT_NO_FATAL_FAILURE(Build(&f, Docs()));
+  AnswerOptions o;
+  o.min_score = -1.0f;
+  o.relative_floor = -1.0f;
+  std::unique_ptr<Generator> gen =
+      NewScriptedGenerator("Revocation rotates the epoch key [1].");
+  const AnswerResult r = Answer(*f.index, f.embedder.get(), gen.get(),
+                                f.vault.Source(), "what does revocation do", o);
+  EXPECT_EQ(r.status, AnswerStatus::kNoAnswerInPassages)
+      << "a reply that skipped the verdict was accepted as an answer";
+  EXPECT_NE(r.text.find("did not follow the answering format"),
+            std::string::npos)
+      << "the caller was not told why the reply is not being shown as one";
+}
+
+// The verdict is bookkeeping and must not survive into what a user reads.
+TEST(Answer, TheVerdictLineIsNotShownToTheUser) {
+  Fixture f;
+  ASSERT_NO_FATAL_FAILURE(Build(&f, Docs()));
+  AnswerOptions o;
+  o.min_score = -1.0f;
+  o.relative_floor = -1.0f;
+  std::unique_ptr<Generator> gen = NewScriptedGenerator(
+      "VERDICT: ANSWER\nRotation seals a new epoch key [1].");
+  const AnswerResult r = Answer(*f.index, f.embedder.get(), gen.get(),
+                                f.vault.Source(), "what does revocation do", o);
+  ASSERT_EQ(r.status, AnswerStatus::kAnswered);
+  EXPECT_EQ(r.text.find("VERDICT"), std::string::npos)
+      << "the verdict line was left in the answer";
+  EXPECT_NE(r.text.find("Rotation seals"), std::string::npos);
+}
+
+// "VERDICT: NO-ANSWER" contains the word ANSWER, so order of checking matters.
+TEST(Answer, NoAnswerIsNotReadAsAnswer) {
+  Fixture f;
+  ASSERT_NO_FATAL_FAILURE(Build(&f, Docs()));
+  AnswerOptions o;
+  o.min_score = -1.0f;
+  o.relative_floor = -1.0f;
+  for (const char* reply : {"VERDICT: NO-ANSWER\nnothing here [1].",
+                            "verdict: no-answer\nnothing here [1].",
+                            "**VERDICT: NO ANSWER**\nnothing here [1]."}) {
+    std::unique_ptr<Generator> gen = NewScriptedGenerator(reply);
+    const AnswerResult r = Answer(*f.index, f.embedder.get(), gen.get(),
+                                  f.vault.Source(), "a question", o);
+    EXPECT_EQ(r.status, AnswerStatus::kNoAnswerInPassages) << reply;
+  }
+}
+
+// THE SHAPE OF THE SCORES IS REPORTED, because an absolute score cannot be read
+// on its own: the same 0.71 is a strong hit in one query and the top of an
+// undifferentiated cluster in another.
+TEST(Answer, RetrievalReportsTheShapeOfItsScores) {
+  Fixture f;
+  ASSERT_NO_FATAL_FAILURE(Build(&f, Docs()));
+  AnswerOptions o;
+  o.min_score = -1.0f;
+  o.relative_floor = -1.0f;
+  std::vector<Passage> passages;
+  RetrievalShape shape;
+  ASSERT_EQ(Retrieve(*f.index, f.embedder.get(), f.vault.Source(),
+                     "what does revocation do", o, &passages, nullptr, &shape),
+            IndexStatus::kOk);
+  EXPECT_GT(shape.candidates, 0u);
+  EXPECT_GE(shape.best, shape.second);
+  EXPECT_GE(shape.best, shape.mean);
+  EXPECT_GE(shape.Gap(), 0.0f);
+  EXPECT_GE(shape.stddev, 0.0f);
+}
+
 }  // namespace ai
+
 }  // namespace umbra

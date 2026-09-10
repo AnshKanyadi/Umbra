@@ -7,6 +7,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstring>
 #include <set>
 
@@ -254,6 +256,8 @@ const char* AnswerStatusName(AnswerStatus s) {
       return "answered";
     case AnswerStatus::kNoPassages:
       return "no-passages";
+    case AnswerStatus::kNoAnswerInPassages:
+      return "no-answer-in-passages";
     case AnswerStatus::kUngrounded:
       return "ungrounded";
     case AnswerStatus::kRetrievalFailed:
@@ -280,15 +284,26 @@ const char* SystemPrompt() {
   // person can check them rather than buried in a string literal nobody prints.
   return "You answer questions about the user's own notes.\n"
          "\n"
+         "Your reply MUST begin with one of these two lines, alone:\n"
+         "  VERDICT: ANSWER\n"
+         "  VERDICT: NO-ANSWER\n"
+         "\n"
+         "Use ANSWER when the passages contain the answer, even partly or "
+         "in different words from the question. Most questions are of this "
+         "kind.\n"
+         "Use NO-ANSWER when they do not -- in particular when they are only "
+         "about a neighbouring topic, where answering would mean guessing.\n"
+         "\n"
          "Rules:\n"
          "1. Use ONLY the numbered passages provided. They are the whole of "
          "what "
          "you know here.\n"
          "2. Cite every claim with the passage number in square brackets, like "
          "[2]. A sentence with no citation is not acceptable.\n"
-         "3. If the passages do not contain the answer, say exactly that and "
-         "stop. "
-         "Do not fill the gap from general knowledge, and do not guess.\n"
+         "3. After VERDICT: NO-ANSWER, say in one sentence what the passages "
+         "do cover, and STOP. Do not fill the gap from general knowledge, do "
+         "not offer an educated guess, and do not reason from a related "
+         "passage to an answer.\n"
          "4. Do not invent passage numbers. Only the numbers shown exist.\n"
          "5. Be brief. The user can read the passages themselves.";
 }
@@ -339,9 +354,10 @@ std::vector<uint32_t> ParseCitations(const std::string& text,
 IndexStatus Retrieve(const Index& index, Embedder* embedder,
                      const DocumentSource& source, const std::string& query,
                      const AnswerOptions& options, std::vector<Passage>* out,
-                     std::vector<Passage>* near_misses) {
+                     std::vector<Passage>* near_misses, RetrievalShape* shape) {
   out->clear();
   if (near_misses != nullptr) near_misses->clear();
+  if (shape != nullptr) *shape = RetrievalShape();
   if (embedder == nullptr) return IndexStatus::kBadArgument;
 
   Vector q;
@@ -355,6 +371,26 @@ IndexStatus Retrieve(const Index& index, Embedder* embedder,
   const uint32_t wide = options.k * 3;
   const IndexStatus s = index.Search(q, wide, options.ef, &hits);
   if (s != IndexStatus::kOk) return s;
+
+  // MEASURED OVER THE WHOLE POOL, not over what survives the filters, because
+  // the question is whether this query discriminated at all and the filters are
+  // what a discriminating query is supposed to survive.
+  if (shape != nullptr && !hits.empty()) {
+    shape->candidates = static_cast<uint32_t>(hits.size());
+    shape->best = hits[0].score;
+    shape->second = hits.size() > 1 ? hits[1].score : hits[0].score;
+    double sum = 0.0;
+    for (const SearchHit& h : hits) sum += h.score;
+    const double mean = sum / static_cast<double>(hits.size());
+    double var = 0.0;
+    for (const SearchHit& h : hits) {
+      const double d = h.score - mean;
+      var += d * d;
+    }
+    shape->mean = static_cast<float>(mean);
+    shape->stddev =
+        static_cast<float>(std::sqrt(var / static_cast<double>(hits.size())));
+  }
 
   std::vector<Passage> kept;
   std::vector<Passage> misses;
@@ -412,6 +448,44 @@ IndexStatus Retrieve(const Index& index, Embedder* embedder,
   return IndexStatus::kOk;
 }
 
+// What the model said about whether it could answer at all.
+enum class ModelVerdict : uint8_t { kAnswer, kNoAnswer, kAbsent };
+
+// Reads the verdict line and removes it from the text, so a caller never has to
+// render bookkeeping. Tolerant about spacing and case because the requirement
+// is that the model committed to one of two words, not that it typed neatly.
+ModelVerdict ReadVerdict(std::string* text) {
+  const std::string& t = *text;
+  std::size_t i = 0;
+  while (i < t.size() && (t[i] == ' ' || t[i] == '\n' || t[i] == '\r' ||
+                          t[i] == '\t' || t[i] == '*' || t[i] == '#')) {
+    ++i;
+  }
+  std::size_t eol = t.find('\n', i);
+  if (eol == std::string::npos) eol = t.size();
+  std::string line = t.substr(i, eol - i);
+  std::string upper;
+  for (char c : line) {
+    upper.push_back(
+        static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+  }
+  ModelVerdict v = ModelVerdict::kAbsent;
+  // NO-ANSWER is checked first: "VERDICT: NO-ANSWER" contains "ANSWER".
+  if (upper.find("NO-ANSWER") != std::string::npos ||
+      upper.find("NO ANSWER") != std::string::npos) {
+    v = ModelVerdict::kNoAnswer;
+  } else if (upper.find("VERDICT") != std::string::npos &&
+             upper.find("ANSWER") != std::string::npos) {
+    v = ModelVerdict::kAnswer;
+  }
+  if (v != ModelVerdict::kAbsent) {
+    std::size_t rest = eol;
+    while (rest < t.size() && (t[rest] == '\n' || t[rest] == '\r')) ++rest;
+    *text = t.substr(rest);
+  }
+  return v;
+}
+
 AnswerResult Answer(const Index& index, Embedder* embedder,
                     Generator* generator, const DocumentSource& source,
                     const std::string& query, const AnswerOptions& options) {
@@ -460,8 +534,26 @@ AnswerResult Answer(const Index& index, Embedder* embedder,
     r.status = AnswerStatus::kGenerationFailed;
     return r;
   }
+  // THE VERDICT IS READ BEFORE ANYTHING ELSE, AND A MISSING ONE FAILS CLOSED.
+  //
+  // A model that ignored the format is a model that ignored the instructions,
+  // which is exactly when its output should not be presented as an answer.
+  const ModelVerdict verdict = ReadVerdict(&text);
   r.text = text;
   r.cited = ParseCitations(text, static_cast<uint32_t>(r.passages.size()));
+  if (verdict != ModelVerdict::kAnswer) {
+    // Citations are still resolved and still shown: when the model says the
+    // passages do not answer the question, what it looked at is the useful
+    // part of the reply.
+    r.status = AnswerStatus::kNoAnswerInPassages;
+    if (verdict == ModelVerdict::kAbsent) {
+      r.text =
+          "The model did not follow the answering format, so its reply is not "
+          "being shown as an answer. What it wrote:\n\n" +
+          r.text;
+    }
+    return r;
+  }
   // AN ANSWER THAT CITES NOTHING IS MARKED, NOT DISCARDED AND NOT ACCEPTED.
   // Discarding it hides that the model had something to say; accepting it
   // silently is the failure this whole file exists to prevent. The caller is
