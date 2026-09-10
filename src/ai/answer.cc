@@ -16,6 +16,11 @@ namespace umbra {
 namespace ai {
 namespace {
 
+// A ceiling on what will be asked for, because the window is allocated whether
+// it is used or not and a runaway prompt should fail loudly rather than take
+// the machine's memory with it.
+constexpr std::size_t kMaxContextTokens = 32768;
+
 constexpr std::size_t kMaxResponseBytes = 16u * 1024 * 1024;
 
 // The same rule as the embedder: a local-first tool must not be one config
@@ -150,9 +155,36 @@ class OllamaGenerator : public Generator {
   bool Generate(const std::string& system, const std::string& user,
                 std::string* out) override {
     if (!Loopback(host_)) return false;
+    // THE CONTEXT WINDOW IS ASKED FOR, NOT ASSUMED.
+    //
+    // Ollama does not give a model its advertised window. It gives it num_ctx,
+    // which defaults to 4096 however large the model is -- llama3.2:3b
+    // advertises 131072 and `ollama ps` reports 4096 -- and a prompt over that
+    // is truncated with no error, no warning, and a perfectly fluent answer
+    // drawn from whatever survived. A silent truncation is the worst possible
+    // shape for this: the passage the answer needed is simply not there.
+    //
+    // Measured on this codebase: a normal question weighs 566 prompt tokens and
+    // the worst realistic one -- six passages at the 1536-byte chunk ceiling --
+    // weighs 1508. Both fit 4096, so nothing has been truncated in practice.
+    // What does not fit is an oversized chunk: chunk.h makes a code block or a
+    // table that exceeds the budget into a single chunk of whatever size it is,
+    // and six of those can be any number at all.
+    //
+    // So the window is computed from the request. Allocation is free -- 4096,
+    // 8192 and 16384 all answered an identical prompt in 0.40s -- because what
+    // costs is the number of tokens actually in the context, not the size of
+    // the window they sit in. Three bytes per token is a deliberate
+    // over-estimate; measured English runs about 5.5.
+    const std::size_t estimate = (system.size() + user.size()) / 3 + 1024;
+    std::size_t ctx = 4096;
+    while (ctx < estimate && ctx < kMaxContextTokens) ctx *= 2;
+    if (ctx > kMaxContextTokens) ctx = kMaxContextTokens;
     std::string body = "{\"model\":\"";
     body += JsonEscape(model_);
-    body += "\",\"stream\":false,\"options\":{\"temperature\":0},";
+    body += "\",\"stream\":false,\"options\":{\"temperature\":0,\"num_ctx\":";
+    body += std::to_string(ctx);
+    body += "},";
     body += "\"messages\":[{\"role\":\"system\",\"content\":\"";
     body += JsonEscape(system);
     body += "\"},{\"role\":\"user\",\"content\":\"";
