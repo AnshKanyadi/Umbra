@@ -199,6 +199,7 @@ add_library(umbra STATIC
   src/ai/embed_ollama.cc
   src/ai/hnsw.cc
   src/ai/index.cc
+  src/ai/topics.cc
   src/ai/keyspace.cc
   src/ai/manifest.cc
   src/ai/segment.cc

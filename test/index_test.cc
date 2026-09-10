@@ -9,6 +9,7 @@
 // returned, that compaction reclaims what it says it reclaims, and that the
 // same vectors produce the same bytes.
 #include "umbra/ai/index.h"
+#include "umbra/ai/topics.h"
 
 #include <dirent.h>
 #include <ftw.h>
@@ -954,6 +955,208 @@ TEST(Index, SegmentsDoNotOpenUnderAnotherVaultsKeys) {
               IndexStatus::kOk);
     EXPECT_GT(idx->Stats().vectors, 0u);
   }
+}
+
+// ------------------------------------------------------------------ topics
+
+// EVERY LIVE VECTOR, WHICH IS WHAT A QUESTION ABOUT THE WHOLE NEEDS.
+//
+// Search answers "what is near this". A question about the vault needs "what is
+// in here at all", and until this existed there was no way to ask it -- which
+// is why summarizing a vault meant summarizing the six passages a search
+// happened to return.
+TEST(Index, EnumeratesEveryLiveVectorInAStableOrder) {
+  TempDir dir;
+  VaultKeys keys = MakeKeys();
+  std::unique_ptr<Embedder> e = NewHashingEmbedder(96);
+  ASSERT_NE(e, nullptr);
+  const Corpus c = BuildCorpus(e.get(), 12);
+  std::unique_ptr<Index> idx;
+  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(),
+                        kTestReplica, &idx),
+            IndexStatus::kOk);
+  for (std::size_t i = 0; i < c.objects.size(); ++i) {
+    ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
+              IndexStatus::kOk);
+  }
+
+  std::vector<std::string> first;
+  std::size_t seen = 0;
+  idx->ForEachLiveVector([&](const Index::LiveVector& v) {
+    ++seen;
+    EXPECT_EQ(v.dimension, e->dimension());
+    EXPECT_NE(v.vector, nullptr);
+    ASSERT_NE(v.entry, nullptr);
+    first.push_back(v.segment.Hex() + ":" + std::to_string(v.slot));
+  });
+  const IndexStats st = idx->Stats();
+  EXPECT_EQ(seen, st.vectors - st.tombstoned)
+      << "enumeration did not visit exactly the live vectors";
+
+  std::vector<std::string> again;
+  idx->ForEachLiveVector([&](const Index::LiveVector& v) {
+    again.push_back(v.segment.Hex() + ":" + std::to_string(v.slot));
+  });
+  EXPECT_EQ(first, again) << "two enumerations of one index disagreed";
+}
+
+// A TOPIC MAP COUNTS, AND THE COUNTS ARE EXACT.
+//
+// The label on a group is a model's guess. The membership is arithmetic, and
+// this is the difference the whole design rests on: someone reading a topic map
+// must be able to trust the numbers even when the names are wrong.
+TEST(Topics, TheCountsAccountForEveryChunk) {
+  TempDir dir;
+  VaultKeys keys = MakeKeys();
+  std::unique_ptr<Embedder> e = NewHashingEmbedder(96);
+  ASSERT_NE(e, nullptr);
+  const Corpus c = BuildCorpus(e.get(), 24);
+  std::unique_ptr<Index> idx;
+  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(),
+                        kTestReplica, &idx),
+            IndexStatus::kOk);
+  for (std::size_t i = 0; i < c.objects.size(); ++i) {
+    ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
+              IndexStatus::kOk);
+  }
+
+  TopicOptions o;
+  TopicMap map;
+  ASSERT_EQ(BuildTopicMap(*idx, o, &map), TopicStatus::kOk);
+  const IndexStats st = idx->Stats();
+  EXPECT_EQ(map.chunks, st.vectors - st.tombstoned);
+  EXPECT_EQ(map.notes, st.objects);
+
+  uint32_t summed = 0;
+  for (const Topic& t : map.topics) {
+    summed += t.chunks;
+    EXPECT_LE(t.notes, t.chunks) << "more notes than chunks in a group";
+    EXPECT_GE(t.cohesion, -1.0f);
+    EXPECT_LE(t.cohesion, 1.0001f);
+    for (const TopicExample& ex : t.examples) {
+      EXPECT_LT(ex.start, ex.end);
+    }
+  }
+  EXPECT_EQ(summed, map.chunks)
+      << "the groups do not add up to the vault; a chunk was lost or counted "
+         "twice";
+  // Largest first, so the first row is the biggest thing in the vault.
+  for (std::size_t i = 1; i < map.topics.size(); ++i) {
+    EXPECT_LE(map.topics[i].chunks, map.topics[i - 1].chunks);
+  }
+}
+
+// THE SAME INDEX GIVES THE SAME MAP. A topic map that reshuffled between two
+// identical runs would look like the vault had changed. The seeding is
+// furthest-first rather than sampled for exactly this reason.
+TEST(Topics, TheSameIndexGivesTheSameMap) {
+  TempDir dir;
+  VaultKeys keys = MakeKeys();
+  std::unique_ptr<Embedder> e = NewHashingEmbedder(96);
+  ASSERT_NE(e, nullptr);
+  const Corpus c = BuildCorpus(e.get(), 20);
+  std::unique_ptr<Index> idx;
+  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(),
+                        kTestReplica, &idx),
+            IndexStatus::kOk);
+  for (std::size_t i = 0; i < c.objects.size(); ++i) {
+    ASSERT_EQ(idx->PutObject(c.objects[i], c.chunks[i], c.vectors[i]),
+              IndexStatus::kOk);
+  }
+  TopicOptions o;
+  TopicMap a;
+  TopicMap b;
+  ASSERT_EQ(BuildTopicMap(*idx, o, &a), TopicStatus::kOk);
+  ASSERT_EQ(BuildTopicMap(*idx, o, &b), TopicStatus::kOk);
+  ASSERT_EQ(a.topics.size(), b.topics.size());
+  for (std::size_t i = 0; i < a.topics.size(); ++i) {
+    EXPECT_EQ(a.topics[i].chunks, b.topics[i].chunks);
+    EXPECT_EQ(a.topics[i].notes, b.topics[i].notes);
+    EXPECT_FLOAT_EQ(a.topics[i].cohesion, b.topics[i].cohesion);
+  }
+}
+
+// TWO SUBJECTS THAT SHARE NO WORDS END UP IN DIFFERENT GROUPS. Without this the
+// rest is bookkeeping over an arbitrary partition: the counts would add up and
+// mean nothing.
+TEST(Topics, ChunksAboutDifferentSubjectsSeparate) {
+  TempDir dir;
+  VaultKeys keys = MakeKeys();
+  std::unique_ptr<Embedder> e = NewHashingEmbedder(96);
+  ASSERT_NE(e, nullptr);
+  std::unique_ptr<Index> idx;
+  ASSERT_EQ(Index::Open(dir.path(), &keys, 0, e->id(), e->dimension(),
+                        kTestReplica, &idx),
+            IndexStatus::kOk);
+
+  // Disjoint vocabularies, and LONG ENOUGH TO MEAN ANYTHING.
+  //
+  // A first version used four-word notes and failed, and the clustering was not
+  // at fault: measured on those vectors, cross-subject pairs sat at 0.26 and
+  // same-subject pairs at 0.09. The hashing embedder needs enough tokens for a
+  // subject to dominate, and no grouping recovers structure the embeddings do
+  // not have. At this length the same pairs are 1.00 and -0.16.
+  std::string sea_words;
+  std::string baking_words;
+  for (int rep = 0; rep < 12; ++rep) {
+    sea_words +=
+        "harbour tide vessel anchor mooring quay shipping cargo berth ";
+    baking_words += "flour yeast dough oven proving loaf crumb bread bake ";
+  }
+  std::vector<ObjectId> sea;
+  std::vector<ObjectId> baking;
+  for (uint32_t i = 0; i < 4; ++i) {
+    for (int which = 0; which < 2; ++which) {
+      const ObjectId object = ObjectFromSeed(100 + i * 2 + which);
+      const std::string body = std::string("# Note\n\n") +
+                               (which == 0 ? sea_words : baking_words) +
+                               std::to_string(i) + "\n";
+      std::vector<Chunk> chunks;
+      ASSERT_EQ(ChunkMarkdown(object, body, &chunks), ChunkStatus::kOk);
+      std::vector<std::string> texts;
+      for (const Chunk& ch : chunks) texts.push_back(ch.text);
+      std::vector<Vector> vs;
+      ASSERT_EQ(e->EmbedDocuments(texts, &vs), EmbedStatus::kOk);
+      ASSERT_EQ(idx->PutObject(object, chunks, vs), IndexStatus::kOk);
+      (which == 0 ? sea : baking).push_back(object);
+    }
+  }
+
+  TopicOptions o;
+  o.k = 2;
+  o.examples_per_topic = 8;
+  TopicMap map;
+  ASSERT_EQ(BuildTopicMap(*idx, o, &map), TopicStatus::kOk);
+  ASSERT_EQ(map.topics.size(), 2u);
+
+  // Every example in a group comes from one vocabulary or the other, never a
+  // mixture.
+  for (const Topic& t : map.topics) {
+    std::size_t from_sea = 0;
+    std::size_t from_baking = 0;
+    for (const TopicExample& ex : t.examples) {
+      for (const ObjectId& id : sea) {
+        if (id.bytes == ex.object.bytes) ++from_sea;
+      }
+      for (const ObjectId& id : baking) {
+        if (id.bytes == ex.object.bytes) ++from_baking;
+      }
+    }
+    EXPECT_TRUE(from_sea == 0 || from_baking == 0)
+        << "a group mixed two subjects that share no words: " << from_sea
+        << " from one and " << from_baking << " from the other";
+  }
+}
+
+// k IS A PRESENTATION DECISION AND IS BOUNDED LIKE ONE. A map with sixty rows
+// is not an answer to "what is in my notes".
+TEST(Topics, TheDefaultCountStaysReadable) {
+  EXPECT_EQ(DefaultTopicCount(0), 0u);
+  EXPECT_EQ(DefaultTopicCount(2), 2u);
+  EXPECT_GE(DefaultTopicCount(100), 2u);
+  EXPECT_LE(DefaultTopicCount(100), 20u);
+  EXPECT_EQ(DefaultTopicCount(13838), 20u) << "the cap did not hold";
+  EXPECT_LE(DefaultTopicCount(1000000), 20u);
 }
 
 }  // namespace ai

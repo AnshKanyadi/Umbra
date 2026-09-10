@@ -39,6 +39,7 @@
 #define UMBRA_AI_INDEX_H_
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -199,6 +200,32 @@ class Index {
   // Every segment id the manifest names, in a stable order. Exists so a test
   // can assert byte-for-byte reproducibility of the files themselves.
   std::vector<SegmentId> SegmentIds() const;
+
+  // EVERY LIVE VECTOR, WITH THE PASSAGE IT CAME FROM.
+  //
+  // Search answers "what is near this query". This answers "what is in here at
+  // all", which is a different question and the only one that can serve a
+  // question about the vault as a whole. Retrieval cannot: it sees k passages
+  // and a summary of k passages is not a summary of a vault.
+  //
+  // Ordered by segment id then slot, so two runs over one index enumerate in
+  // the same order and anything built on top of it is reproducible.
+  //
+  // The pointer is the segment's own and is valid for the duration of the call
+  // only. Tombstoned slots are skipped; this is what the index HOLDS, which is
+  // what a survey of it must count.
+  struct LiveVector {
+    SegmentId segment;
+    uint32_t slot = 0;
+    // Carried because a caller has no other way to know how many floats the
+    // pointer addresses, and every segment in one index shares it: the model
+    // identity is part of the index identity (ADR 0007).
+    uint32_t dimension = 0;
+    const SegmentEntry* entry = nullptr;
+    const float* vector = nullptr;
+  };
+  void ForEachLiveVector(
+      const std::function<void(const LiveVector&)>& fn) const;
 
  private:
   Index();

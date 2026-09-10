@@ -310,6 +310,43 @@ not prove the passage supports the claim. The model must now open its reply with
 `VERDICT: ANSWER` or `VERDICT: NO-ANSWER`, and the code believes the token
 rather than reading its prose for hedging.
 
+### What is in my notes
+
+```sh
+./build/umbra_ai \
+  --vault ~/Desktop/umbra-test-vault \
+  --index ~/Desktop/umbra-index \
+  --model nomic-embed-text \
+  --pass-file ~/.umbra-pass \
+  --generator llama3.2:3b \
+  --topics
+```
+
+This groups **every** chunk in the index by its embedding and reports what it
+found: how many chunks and notes in each group, how tight the group is, and the
+notes nearest its middle.
+
+```
+13838 chunks from 3000 notes, grouped into 20 in 1.90s (25 iterations, mean cohesion 0.829)
+named with llama3.2:3b in 12.61s
+
+group                               chunks  notes  cohesion
+Meeting notes and decisions           3960   2298     0.864
+    0.933  reference/reading-2042.md:1419-2269  Reading note 2042
+```
+
+Add a number to choose how many groups: `--topics 8`. Without `--generator` the
+groups are counted but not named, which is faster and still complete.
+
+**The counts are facts and the names are guesses.** Membership, sizes and
+cohesion are arithmetic over the index and can be checked. A group's name is a
+model's description of three example passages, and on content it cannot read it
+will still produce a confident name. Cohesion below 0.45 is flagged; a loose
+group is whatever was left over after the tight ones formed.
+
+This is not a summary of your notes, and deliberately so — see the section
+below, and ADR 0009 for what a summary would have cost.
+
 ### Questions about the notes as a whole
 
 Umbra answers questions about **things in** your notes. It cannot answer
@@ -426,10 +463,13 @@ separate `--index` directory per model.
   fix this. It is platform-specific and a real dependency, so it belongs behind
   the same `--state-dir` seam as another place to look rather than a rewrite of
   how identity works.
-- **Questions about the whole vault are not served, only sampled.** Coverage
-  is reported on every answer so a sampled answer to a broad question is
-  visible, but the tool does not detect such questions or decline them, and
-  answering them properly would mean reading every note rather than the top few.
+- **`--ask` samples; `--topics` covers.** A broad question put to `--ask` is
+  answered from the top few passages and says so in its coverage line. Use
+  `--topics` for questions about the vault as a whole. The tool does not detect
+  which kind of question you asked, and does not try to: you name the mode.
+- **Narrative summarization of a whole vault is not available.** Grouping
+  answers "what is in here"; it does not write prose about it. ADR 0009 has the
+  measurements that decided this.
 - **A local model can still fabricate.** The verdict contract catches most of
   it and is measured, not assumed. A second entailment pass over the generated
   claims was built and measured too, and not shipped: it destroyed seven real

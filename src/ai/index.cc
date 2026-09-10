@@ -1226,6 +1226,26 @@ std::vector<SegmentId> Index::Missing() const {
       [&im](const SegmentId& id) { return im.Present(id); });
 }
 
+void Index::ForEachLiveVector(
+    const std::function<void(const LiveVector&)>& fn) const {
+  const Impl& im = *impl_;
+  // std::map iterates in key order, so this is by segment id then slot without
+  // sorting anything.
+  for (const std::pair<const SegmentId, Loaded>& kv : im.segments) {
+    const Loaded& l = kv.second;
+    for (uint32_t slot = 0; slot < l.segment->count(); ++slot) {
+      if (slot < l.dead.size() && l.dead[slot]) continue;
+      LiveVector v;
+      v.segment = kv.first;
+      v.slot = slot;
+      v.dimension = l.segment->dimension();
+      v.entry = &l.segment->entry(slot);
+      v.vector = l.segment->vector(slot);
+      fn(v);
+    }
+  }
+}
+
 std::vector<SegmentId> Index::MissingInFetchOrder() const {
   const Impl& im = *impl_;
   std::vector<SegmentId> first;

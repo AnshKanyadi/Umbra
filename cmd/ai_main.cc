@@ -32,6 +32,7 @@
 #include "umbra/ai/embed.h"
 #include "umbra/ai/index.h"
 #include "umbra/ai/manifest.h"
+#include "umbra/ai/topics.h"
 #include "umbra/crdt/op.h"
 #include "umbra/crdt/oplog.h"
 #include "umbra/crypto/keys.h"
@@ -175,6 +176,7 @@ void Usage() {
       "  --ask QUESTION       retrieve and answer\n"
       "  --eval FILE          run a question set and report\n"
       "  --stats              what the index holds\n"
+      "  --topics [K]         group every chunk and say what is in the vault\n"
       "  --compact            merge segments and drop tombstones\n"
       "  --push               publish this index to the relay\n"
       "  --pull               fetch the index from the relay\n"
@@ -207,6 +209,8 @@ struct Options {
   // Never a --pass flag: an argument vector is visible in `ps`.
   // Taken verbatim when given: the directory holding this machine's key.
   std::string state_dir;
+  bool topics = false;
+  uint32_t topic_k = 0;
   std::string pass_file;
 };
 
@@ -896,6 +900,111 @@ int Pull(const Options& o) {
   return 0;
 }
 
+// WHAT IS IN THE VAULT, ANSWERED FROM STRUCTURE.
+//
+// Not a summary. A summary of a vault has to be a summary of everything in it,
+// and the only way retrieval can produce one is to summarize the handful of
+// passages it happened to return -- which reads as authoritative and is a
+// summary of six chunks. See ADR 0009 for what was measured and rejected.
+//
+// This counts instead. Every live chunk is grouped by its embedding, which was
+// computed when the note was indexed and is sitting there already, and the
+// answer is groups with sizes and members. A label is a guess; a membership is
+// a fact, and the two are printed differently.
+int Topics(const Options& o) {
+  VaultKeys keys = VaultKeysFor(o);
+  std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
+  std::unique_ptr<Index> index;
+  {
+    const IndexStatus s =
+        Index::Open(o.index_dir, &keys, keys.current(), e->id(), e->dimension(),
+                    ReplicaFor(o), &index);
+    if (s != IndexStatus::kOk) {
+      std::fprintf(stderr, "cannot open the index: %s\n", IndexStatusName(s));
+      return 1;
+    }
+  }
+
+  TopicOptions to;
+  to.k = o.topic_k;
+  TopicMap map;
+  const auto t0 = std::chrono::steady_clock::now();
+  const TopicStatus st = BuildTopicMap(*index, to, &map);
+  const double grouped = Since(t0);
+  if (st != TopicStatus::kOk) {
+    std::fprintf(stderr, "cannot group this index: %s\n", TopicStatusName(st));
+    return 1;
+  }
+
+  // Labels, if there is a generator. k calls, one per group, each seeing only
+  // that group's nearest members -- so a label is a description of real text
+  // rather than of the question that was never asked.
+  std::vector<std::string> files;
+  ListMarkdown(o.vault, "", &files);
+  const DocumentSource source = VaultSource(o.vault, files);
+  double labelled = 0;
+  if (!o.generator.empty()) {
+    std::unique_ptr<Generator> gen =
+        NewOllamaGenerator(o.generator, "127.0.0.1", 11434);
+    const auto l0 = std::chrono::steady_clock::now();
+    for (Topic& t : map.topics) {
+      if (t.chunks == 0) continue;
+      std::string prompt;
+      for (const TopicExample& ex : t.examples) {
+        std::string doc;
+        if (source && source(ex.object, &doc) && ex.end <= doc.size() &&
+            ex.start < ex.end) {
+          prompt += doc.substr(ex.start, ex.end - ex.start);
+          prompt += "\n---\n";
+        }
+      }
+      if (prompt.empty()) continue;
+      std::string reply;
+      if (gen->Generate(
+              "Name the common subject of these excerpts in two to five words. "
+              "Reply with the name alone, no punctuation, no preamble.",
+              prompt, &reply)) {
+        // One line, trimmed. A model that wrote a paragraph gets its first line.
+        const std::size_t nl = reply.find('\n');
+        if (nl != std::string::npos) reply = reply.substr(0, nl);
+        const std::size_t b = reply.find_first_not_of(" \t\"*#");
+        const std::size_t en = reply.find_last_not_of(" \t\"*#.");
+        if (b != std::string::npos && en >= b)
+          t.label = reply.substr(b, en - b + 1);
+      }
+    }
+    labelled = Since(l0);
+  }
+
+  std::printf(
+      "%u chunks from %u notes, grouped into %u in %.2fs"
+      " (%u iterations, mean cohesion %.3f)\n",
+      map.chunks, map.notes, map.k, grouped, map.iterations, map.cohesion);
+  if (o.generator.empty()) {
+    std::printf("no --generator, so the groups are counted but not named\n");
+  } else {
+    std::printf("named with %s in %.2fs\n", o.generator.c_str(), labelled);
+  }
+  std::printf("\n%-34s %7s %6s %9s\n", "group", "chunks", "notes", "cohesion");
+  for (const Topic& t : map.topics) {
+    if (t.chunks == 0) continue;
+    std::printf(
+        "%-34s %7u %6u %9.3f%s\n",
+        (t.label.empty() ? "(unnamed)" : t.label).substr(0, 34).c_str(),
+        t.chunks, t.notes, t.cohesion,
+        // A LOOSE GROUP IS SAID TO BE LOOSE. Whatever was left over
+        // after the tight groups formed lands in one of these, and a
+        // name put on it means less than the name suggests.
+        t.cohesion < 0.45f ? "  loose, treat the name with suspicion" : "");
+    for (const TopicExample& ex : t.examples) {
+      std::printf("    %.3f  %s:%u-%u%s%s\n", ex.similarity,
+                  PathOf(o.vault, files, ex.object).c_str(), ex.start, ex.end,
+                  ex.heading_path.empty() ? "" : "  ", ex.heading_path.c_str());
+    }
+  }
+  return 0;
+}
+
 int Stats(const Options& o) {
   VaultKeys keys = VaultKeysFor(o);
   std::unique_ptr<Embedder> e = MakeEmbedder(o.model, 256);
@@ -957,7 +1066,15 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     const char* next = (i + 1 < argc) ? argv[i + 1] : nullptr;
-    if (a == "--state-dir" && next) {
+    if (a == "--topics") {
+      o.topics = true;
+      // An optional count may follow. Only consumed when it is a number, so
+      // "--topics --ask ..." is not misread as a count of zero.
+      if (next != nullptr && next[0] >= '1' && next[0] <= '9') {
+        o.topic_k = static_cast<uint32_t>(std::atoi(next));
+        ++i;
+      }
+    } else if (a == "--state-dir" && next) {
       o.state_dir = next;
       ++i;
     } else if (a == "--pass-file" && next) {
@@ -1021,6 +1138,7 @@ int main(int argc, char** argv) {
   if (o.pull) return Pull(o);
   if (!o.question.empty()) return Ask(o);
   if (!o.eval_file.empty()) return Eval(o);
+  if (o.topics) return Topics(o);
   if (o.stats) return Stats(o);
   if (o.compact) return CompactCommand(o);
   Usage();
