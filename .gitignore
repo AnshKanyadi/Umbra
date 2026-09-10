@@ -20,6 +20,21 @@ b-*/
 out/
 cmake-build-*/
 
+# ------------------------------------------------------ desktop app, by name
+# The same argument as above, for two toolchains that were not here before.
+# Cargo puts 773 MB in `target/` on a first build and npm puts a node_modules
+# beside it; neither is source and both are regenerable from a lockfile.
+#
+# `target/` is unanchored on purpose: cargo makes one wherever it is invoked,
+# and a rule pinned to app/src-tauri/target would fail open the first time a
+# second crate appears.
+target/
+node_modules/
+*.app/
+*.dmg
+# Tauri regenerates src-tauri/gen from tauri.conf.json on every build.
+gen/schemas/
+
 # ---------------------------------------------------------------- by artifact
 # Named wherever they appear, because the directory list above is a courtesy and
 # these are the things that must never be committed.

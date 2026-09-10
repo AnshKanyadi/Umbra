@@ -1,0 +1,12 @@
+{
+  "name": "umbra-app",
+  "private": true,
+  "version": "0.0.1",
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  },
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build"
+  }
+}

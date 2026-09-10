@@ -1,0 +1,21 @@
+[package]
+name = "umbra-app"
+version = "0.0.1"
+description = "Umbra"
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+
+# A desktop binary is shipped, not linked against. Optimising for size keeps the
+# download honest: the pitch is a small local tool.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
