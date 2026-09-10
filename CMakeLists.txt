@@ -278,7 +278,11 @@ target_link_libraries(umbra PUBLIC basalt::basalt Threads::Threads)
 # for the reason above. A lane below compiles this target on Linux so the
 # integration cannot rot, but does not instrument it.
 if(UMBRA_HAVE_LLAMA)
-  add_library(umbra_local_embed STATIC src/ai/embed_llama.cc)
+  # EXCLUDE_FROM_ALL, so `cmake --build` with no target does not build
+  # llama.cpp. The library-only lane does exactly that and went from 25s to 110s
+  # without this; umbra_ai still pulls it in as a dependency, and the clean lane
+  # builds that explicitly, so the coverage is unchanged and paid for once.
+  add_library(umbra_local_embed STATIC EXCLUDE_FROM_ALL src/ai/embed_llama.cc)
   target_link_libraries(umbra_local_embed PUBLIC umbra llama)
   target_compile_definitions(umbra_local_embed PUBLIC UMBRA_HAVE_LLAMA=1)
   target_compile_options(umbra_local_embed PRIVATE ${UMBRA_CXX_FLAGS})
