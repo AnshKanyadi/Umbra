@@ -75,7 +75,7 @@ const char* TopicStatusName(TopicStatus s) {
 uint32_t DefaultTopicCount(uint32_t chunks) {
   if (chunks < 4) return chunks < 2 ? 0 : 2;
   const double k = std::sqrt(static_cast<double>(chunks) / 2.0);
-  uint32_t rounded = static_cast<uint32_t>(k + 0.5);
+  uint32_t rounded = static_cast<uint32_t>(std::lround(k));
   if (rounded < 2) rounded = 2;
   if (rounded > 20) rounded = 20;
   return rounded;
@@ -114,7 +114,7 @@ TopicStatus BuildTopicMap(const Index& index, const TopicOptions& options,
 
   std::vector<std::vector<float>> centres;
   for (uint32_t idx : Seed(points, dim, k)) {
-    centres.push_back(std::vector<float>(points[idx], points[idx] + dim));
+    centres.emplace_back(points[idx], points[idx] + dim);
   }
   k = static_cast<uint32_t>(centres.size());
   if (k < 2) return TopicStatus::kNotEnoughChunks;

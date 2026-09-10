@@ -1114,6 +1114,7 @@ TEST(Topics, ChunksAboutDifferentSubjectsSeparate) {
       std::vector<Chunk> chunks;
       ASSERT_EQ(ChunkMarkdown(object, body, &chunks), ChunkStatus::kOk);
       std::vector<std::string> texts;
+      texts.reserve(chunks.size());
       for (const Chunk& ch : chunks) texts.push_back(ch.text);
       std::vector<Vector> vs;
       ASSERT_EQ(e->EmbedDocuments(texts, &vs), EmbedStatus::kOk);
