@@ -49,6 +49,41 @@ double Since(const std::chrono::steady_clock::time_point& t) {
       .count();
 }
 
+// Enough JSON to emit what the app needs, without a dependency. Only strings
+// need escaping here; every other field is a number or a bool.
+std::string J(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 2);
+  for (char c : in) {
+    switch (c) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+          out += buf;
+        } else {
+          out.push_back(c);
+        }
+    }
+  }
+  return out;
+}
+
 bool ReadWholeFile(const std::string& path, std::string* out) {
   std::ifstream f(path, std::ios::binary);
   if (!f) return false;
@@ -201,6 +236,7 @@ void Usage() {
       "  --eval FILE          run a question set and report\n"
       "  --stats              what the index holds\n"
       "  --topics [K]         group every chunk and say what is in the vault\n"
+      "  --json               machine-readable output, for the desktop app\n"
       "  --compact            merge segments and drop tombstones\n"
       "  --push               publish this index to the relay\n"
       "  --pull               fetch the index from the relay\n"
@@ -234,6 +270,14 @@ struct Options {
   // Never a --pass flag: an argument vector is visible in `ps`.
   // Taken verbatim when given: the directory holding this machine's key.
   std::string state_dir;
+  // MACHINE-READABLE OUTPUT, because the desktop app must not screen-scrape.
+  //
+  // Every human line here is written to be read by a person and has been
+  // reworded several times for that reason -- "drawn from 6 of 25 passages",
+  // "barely told apart". A GUI parsing those would break on the next rewording,
+  // silently, and the failure would look like a search bug. So the seam is a
+  // flag rather than a convention.
+  bool json = false;
   bool topics = false;
   uint32_t topic_k = 0;
   std::string pass_file;
@@ -292,9 +336,20 @@ int Build(const Options& o) {
     return 1;
   }
 
-  std::printf("model %s dim %u id %s\n", o.model.c_str(), e->dimension(),
-              e->id().Short().c_str());
-  std::printf("%zu files\n", files.size());
+  if (o.json) {
+    // A START EVENT RATHER THAN TWO LINES OF PROSE. In --json mode nothing but
+    // objects goes to stdout, so a reader can parse every line instead of
+    // skipping the ones that turn out to be for a person.
+    std::printf(
+        "{\"event\":\"start\",\"files\":%zu,\"dimension\":%u,"
+        "\"model\":\"%s\"}\n",
+        files.size(), e->dimension(), J(o.model).c_str());
+    std::fflush(stdout);
+  } else {
+    std::printf("model %s dim %u id %s\n", o.model.c_str(), e->dimension(),
+                e->id().Short().c_str());
+    std::printf("%zu files\n", files.size());
+  }
 
   const auto t0 = std::chrono::steady_clock::now();
   double chunk_seconds = 0;
@@ -341,8 +396,17 @@ int Build(const Options& o) {
     index_seconds += Since(i0);
 
     if ((i + 1) % 200 == 0) {
-      std::printf("  %zu/%zu files, %zu chunks, %.1fs\n", i + 1, files.size(),
-                  chunks_total, Since(t0));
+      if (o.json) {
+        // ONE OBJECT PER LINE, flushed, so the app can show progress as it
+        // happens rather than after several minutes of nothing.
+        std::printf(
+            "{\"event\":\"progress\",\"files\":%zu,\"of\":%zu,"
+            "\"chunks\":%zu,\"seconds\":%.1f}\n",
+            i + 1, files.size(), chunks_total, Since(t0));
+      } else {
+        std::printf("  %zu/%zu files, %zu chunks, %.1fs\n", i + 1, files.size(),
+                    chunks_total, Since(t0));
+      }
       std::fflush(stdout);
     }
   }
@@ -368,6 +432,17 @@ int Build(const Options& o) {
   const double total = Since(t0);
   const IndexStats st = index->Stats();
   const uint64_t disk = DirectoryBytes(o.index_dir);
+
+  if (o.json) {
+    std::printf(
+        "{\"event\":\"built\",\"files\":%zu,\"chunks\":%zu,"
+        "\"segments\":%u,\"vectors\":%u,\"objects\":%u,\"bytes\":%llu,"
+        "\"seconds\":%.2f}\n",
+        files.size(), chunks_total, st.segments, st.vectors, st.objects,
+        static_cast<unsigned long long>(disk), total);
+    std::fflush(stdout);
+    return 0;
+  }
 
   std::printf(
       "\n"
@@ -456,6 +531,34 @@ int Ask(const Options& o) {
   const AnswerResult r = Answer(*index, e.get(), gen.get(),
                                 VaultSource(o.vault, files), o.question, opts);
   const double seconds = Since(t0);
+
+  if (o.json) {
+    // THE STATUS IS A FIELD, NOT A PREFIX. Every distinction this project made
+    // -- no-passages against no-answer-in-passages against ungrounded -- has to
+    // survive into the interface, or the app renders a refusal as an answer and
+    // undoes the work.
+    std::printf(
+        "{\"event\":\"answer\",\"status\":\"%s\",\"seconds\":%.2f,"
+        "\"text\":\"%s\",\"complete\":%s,\"missing\":%u,"
+        "\"vault_passages\":%u,\"vault_notes\":%u,\"passages\":[",
+        AnswerStatusName(r.status), seconds, J(r.text).c_str(),
+        r.index_complete ? "true" : "false", r.segments_missing,
+        r.vault_passages, r.vault_notes);
+    for (std::size_t i = 0; i < r.passages.size(); ++i) {
+      const Passage& p = r.passages[i];
+      const bool cited = std::find(r.cited.begin(), r.cited.end(),
+                                   static_cast<uint32_t>(i)) != r.cited.end();
+      std::printf(
+          "%s{\"path\":\"%s\",\"start\":%u,\"end\":%u,\"score\":%.4f,"
+          "\"heading\":\"%s\",\"cited\":%s,\"text\":\"%s\"}",
+          i == 0 ? "" : ",", J(PathOf(o.vault, files, p.object)).c_str(),
+          p.start, p.end, p.score, J(p.heading_path).c_str(),
+          cited ? "true" : "false", J(p.text).c_str());
+    }
+    std::printf("]}\n");
+    std::fflush(stdout);
+    return 0;
+  }
 
   std::printf("%s in %.2fs\n\n", AnswerStatusName(r.status), seconds);
   if (!r.text.empty()) {
@@ -1091,7 +1194,9 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     const char* next = (i + 1 < argc) ? argv[i + 1] : nullptr;
-    if (a == "--topics") {
+    if (a == "--json") {
+      o.json = true;
+    } else if (a == "--topics") {
       o.topics = true;
       // An optional count may follow. Only consumed when it is a number, so
       // "--topics --ask ..." is not misread as a count of zero.

@@ -3,15 +3,39 @@
   "productName": "Umbra",
   "version": "0.0.1",
   "identifier": "dev.umbra.app",
-  "build": { "frontendDist": "../dist" },
+  "build": {
+    "frontendDist": "../dist"
+  },
   "app": {
-    "windows": [{ "title": "Umbra", "width": 720, "height": 480 }],
-    "security": { "csp": null }
+    "windows": [
+      {
+        "title": "Umbra",
+        "width": 900,
+        "height": 620,
+        "minWidth": 640,
+        "minHeight": 480
+      }
+    ],
+    "security": {
+      "csp": null
+    },
+    "withGlobalTauri": true
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
-    "icon": ["icons/icon.icns"],
-    "macOS": { "minimumSystemVersion": "10.15" }
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "icon": [
+      "icons/icon.icns"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "externalBin": [
+      "binaries/umbra_ai",
+      "binaries/umbra_sync"
+    ]
   }
 }

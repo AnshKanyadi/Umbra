@@ -22,3 +22,27 @@ APPLE_SIGNING_IDENTITY="Developer ID Application: NAME (TEAMID)" npm run build
 ```
 
 Notarization needs credentials that are not in the repository; see the ADR.
+
+## The sidecar binaries
+
+`src-tauri/binaries/` holds copies of the C++ binaries, named with the Rust
+target triple as Tauri requires. They are build output and are not tracked.
+Populate them from a cmake build before packaging:
+
+```sh
+cmake -S .. -B ../b-rel -DCMAKE_BUILD_TYPE=Release
+cmake --build ../b-rel --target umbra_ai umbra_sync -j
+TRIPLE=$(rustc -vV | awk '/host:/{print $2}')
+cp ../b-rel/umbra_ai   src-tauri/binaries/umbra_ai-$TRIPLE
+cp ../b-rel/umbra_sync src-tauri/binaries/umbra_sync-$TRIPLE
+```
+
+## The model
+
+The embedding weights are not in the repository and not in the bundle; see
+ADR 0010. Until the downloader exists, put the GGUF where the app looks:
+
+```sh
+mkdir -p ~/Library/Application\ Support/Umbra/models
+cp all-minilm.gguf ~/Library/Application\ Support/Umbra/models/all-minilm-797b70c4.gguf
+```

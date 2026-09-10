@@ -32,8 +32,15 @@ target/
 node_modules/
 *.app/
 *.dmg
-# Tauri regenerates src-tauri/gen from tauri.conf.json on every build.
-gen/schemas/
+# Tauri regenerates src-tauri/gen from tauri.conf.json on every build, and the
+# sidecar binaries under app/src-tauri/binaries are copies of cmake output.
+# Both are build products that happen to live inside a source tree.
+# ANCHORED PATTERNS FAIL OPEN, which is the warning at the top of this file
+# meeting a fresh example: `gen/schemas/` contains a slash, so git anchors it to
+# the repository root and it never matches app/src-tauri/gen/schemas. `**/` is
+# what makes it mean "wherever this appears".
+**/gen/schemas/
+binaries/
 
 # ---------------------------------------------------------------- by artifact
 # Named wherever they appear, because the directory list above is a courtesy and

@@ -1,0 +1,49 @@
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbfd; --fg: #16161a; --dim: #6d6d78;
+  --line: #e3e3e8; --accent: #3b5bdb; --card: #fff;
+  --warn: #b54708;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#131316; --fg:#ececf1; --dim:#9a9aa5; --line:#2a2a31; --card:#1b1b20; --warn:#f5a524; }
+}
+* { box-sizing: border-box }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 14px/1.55 -apple-system, system-ui, "SF Pro Text", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+main { max-width: 620px; margin: 0 auto; padding: 56px 28px 40px }
+h1 { font-size: 26px; letter-spacing: -.02em; margin: 0 0 6px }
+h2 { font-size: 17px; letter-spacing: -.01em; margin: 0 0 6px }
+p  { color: var(--dim); margin: 0 0 18px }
+p.tight { margin-bottom: 10px }
+button {
+  font: inherit; font-weight: 500; padding: 8px 16px; border-radius: 8px;
+  border: 1px solid transparent; background: var(--accent); color: #fff;
+  cursor: pointer;
+}
+button.secondary { background: transparent; color: var(--fg); border-color: var(--line) }
+button:disabled { opacity: .45; cursor: default }
+input[type=password], input[type=text] {
+  font: inherit; width: 100%; padding: 9px 11px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--card); color: var(--fg);
+}
+.row { display: flex; gap: 10px; align-items: center }
+.card {
+  border: 1px solid var(--line); border-radius: 12px; background: var(--card);
+  padding: 16px; margin: 0 0 14px;
+}
+.muted { color: var(--dim); font-size: 13px }
+.warn { color: var(--warn) }
+.bar { height: 6px; border-radius: 99px; background: var(--line); overflow: hidden; margin: 14px 0 8px }
+.bar > i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .3s }
+.hit { border-bottom: 1px solid var(--line); padding: 13px 0 }
+.hit:last-child { border-bottom: 0 }
+.hit .where { font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums }
+.hit .snip { margin-top: 5px; white-space: pre-wrap }
+.score { font-variant-numeric: tabular-nums }
+.searchbar { display: flex; gap: 8px; margin-bottom: 6px }
+.searchbar input { flex: 1 }
+.notice { border-left: 3px solid var(--warn); padding-left: 12px; margin-bottom: 16px }
+code { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace }
