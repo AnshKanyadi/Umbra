@@ -495,6 +495,11 @@ AnswerResult Answer(const Index& index, Embedder* embedder,
   // results without it is presenting a partial vault as the whole one.
   r.segments_missing = static_cast<uint32_t>(index.Missing().size());
   r.index_complete = r.segments_missing == 0;
+  {
+    const IndexStats st = index.Stats();
+    r.vault_passages = st.vectors - st.tombstoned;
+    r.vault_notes = st.objects;
+  }
   const IndexStatus s = Retrieve(index, embedder, source, query, options,
                                  &r.passages, &r.near_misses);
   if (s != IndexStatus::kOk) {

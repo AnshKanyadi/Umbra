@@ -310,6 +310,29 @@ not prove the passage supports the claim. The model must now open its reply with
 `VERDICT: ANSWER` or `VERDICT: NO-ANSWER`, and the code believes the token
 rather than reading its prose for hedging.
 
+### Questions about the notes as a whole
+
+Umbra answers questions about **things in** your notes. It cannot answer
+questions about your notes **as a whole**, because it never sees the whole — it
+sees the handful of passages that a search returned.
+
+Ask it to summarize your vault and it will summarize six chunks and sound
+authoritative doing it. Every guard passes, correctly: the citations resolve,
+the passages really do support each sentence, and the model honestly says the
+passages answer the question — because a summary of six chunks *is* a true
+summary of six chunks. It is right about the passages and wrong about the
+question.
+
+Nothing in the machinery catches that, so every answer states its coverage:
+
+```
+drawn from 6 of 25 passages, across 25 note(s) in the vault
+```
+
+For "what is the classic binary search bug" that line is unremarkable. For
+"summarize what is in these notes" it is the whole story. Read it before you
+trust a broad answer.
+
 ### Reading the scores
 
 Under the passages is a line like:
@@ -403,6 +426,10 @@ separate `--index` directory per model.
   fix this. It is platform-specific and a real dependency, so it belongs behind
   the same `--state-dir` seam as another place to look rather than a rewrite of
   how identity works.
+- **Questions about the whole vault are not served, only sampled.** Coverage
+  is reported on every answer so a sampled answer to a broad question is
+  visible, but the tool does not detect such questions or decline them, and
+  answering them properly would mean reading every note rather than the top few.
 - **A local model can still fabricate.** The verdict contract catches most of
   it and is measured, not assumed. A second entailment pass over the generated
   claims was built and measured too, and not shipped: it destroyed seven real

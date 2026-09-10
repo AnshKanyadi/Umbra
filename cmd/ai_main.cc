@@ -446,6 +446,19 @@ int Ask(const Options& o) {
     }
     std::printf("%s\n\n", r.text.c_str());
   }
+  // WHAT SHARE OF THE VAULT THIS ANSWER SAW, always, before the passages.
+  //
+  // "6 of 6 passages" reads as nothing at all when the question was about one
+  // thing, and reads as an indictment when it was "summarize these notes" --
+  // which is the case the guards cannot catch, because a summary of six chunks
+  // is a true summary of six chunks. The line does not decide anything. It
+  // takes the sentence the answer was silently making, that these passages
+  // stand for the vault, and puts the numbers next to it.
+  if (!r.passages.empty() && r.vault_passages > 0) {
+    std::printf(
+        "drawn from %zu of %u passages, across %u note(s) in the vault\n",
+        r.passages.size(), r.vault_passages, r.vault_notes);
+  }
   // THE SHAPE OF THE SCORES, PRINTED. An absolute score cannot be read on its
   // own: 0.71 is a strong hit in one query and the top of an undifferentiated
   // cluster in another. The spread is what tells them apart, so it is shown

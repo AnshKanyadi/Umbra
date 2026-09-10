@@ -289,6 +289,24 @@ struct AnswerResult {
   std::vector<Passage> near_misses;
   // What the scores looked like. Populated on every path, including refusals.
   RetrievalShape shape;
+
+  // HOW MUCH OF THE VAULT THIS ANSWER SAW.
+  //
+  // Retrieval answers questions about things IN the notes. It cannot answer
+  // questions about the notes AS A WHOLE, because it never sees the whole -- it
+  // sees k passages. Asked to "summarize what is in these notes", it returns
+  // six chunks and summarizes those, and every guard passes: the citations
+  // resolve, the passages really do support each claim, and the verdict is
+  // honestly ANSWER. The answer is correct about six chunks and wrong about the
+  // question, and nothing in the text says which.
+  //
+  // These two numbers are what make that visible. Six of six passages is
+  // unremarkable for "what is the classic binary search bug" and damning for
+  // "summarize my vault", and the reader can tell the difference even though
+  // the machinery cannot. They are counted from the index rather than inferred,
+  // so they are right even when the retrieval is not.
+  uint32_t vault_passages = 0;
+  uint32_t vault_notes = 0;
 };
 
 // Retrieve only. Exposed because search without generation is useful on its own

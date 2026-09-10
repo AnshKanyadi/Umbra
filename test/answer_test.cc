@@ -484,6 +484,39 @@ TEST(Answer, RetrievalReportsTheShapeOfItsScores) {
   EXPECT_GE(shape.stddev, 0.0f);
 }
 
+// AN ANSWER SAYS HOW MUCH OF THE VAULT IT SAW.
+//
+// The failure this exists for passes every other guard. Asked to summarize the
+// notes, retrieval returns k passages and the model summarizes those: the
+// citations resolve, the passages really do support each claim, and the verdict
+// is honestly ANSWER, because a summary of six chunks is a true summary of six
+// chunks. It is correct about the passages and wrong about the question, and no
+// property of the text distinguishes it.
+//
+// The counts come from the index, not from the retrieval, so they are right
+// even when the retrieval is not -- and "6 of 6" against "6 of 2000" is the
+// difference a reader needs.
+TEST(Answer, AnAnswerReportsHowMuchOfTheVaultItSaw) {
+  Fixture f;
+  ASSERT_NO_FATAL_FAILURE(Build(&f, Docs()));
+  AnswerOptions o;
+  o.min_score = -1.0f;
+  o.relative_floor = -1.0f;
+  o.k = 2;
+  std::vector<Passage> passages;
+  const AnswerResult r = Answer(*f.index, f.embedder.get(), nullptr,
+                                f.vault.Source(), "what does revocation do", o);
+  const IndexStats st = f.index->Stats();
+  EXPECT_EQ(r.vault_passages, st.vectors - st.tombstoned);
+  EXPECT_EQ(r.vault_notes, st.objects);
+  EXPECT_GT(r.vault_passages, 0u);
+  EXPECT_LE(r.passages.size(), r.vault_passages)
+      << "more passages were answered from than the vault holds";
+  // The point of the number: a caller can see that the answer is a sample.
+  EXPECT_LT(r.passages.size(), static_cast<std::size_t>(r.vault_passages))
+      << "this fixture is meant to hold more than k, so the share is visible";
+}
+
 }  // namespace ai
 
 }  // namespace umbra
