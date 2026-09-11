@@ -38,6 +38,27 @@ fn count_notes(folder: String) -> Result<usize, String> {
     Ok(n)
 }
 
+mod model;
+
+/// Downloads the model, verifies it, installs it. The work is in model.rs so
+/// that the same code path is exercised by src/bin/dlcheck.rs without a window.
+#[tauri::command]
+async fn download_model(app: tauri::AppHandle) -> Result<String, String> {
+    let handle = app.clone();
+    let path = model::fetch(move |seen, total| {
+        // Roughly every half megabyte, so the bar moves without the event
+        // stream becoming the expensive part of the download.
+        if seen % (512 * 1024) < 65536 || seen == total {
+            let _ = handle.emit(
+                "model-progress",
+                serde_json::json!({ "bytes": seen, "of": total }),
+            );
+        }
+    })
+    .await?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 /// Where the embedding model is expected, and whether it is there.
 ///
 /// Per ADR 0010 the weights are not in the repository and not in the app
@@ -47,12 +68,9 @@ fn count_notes(folder: String) -> Result<usize, String> {
 /// failing inside a subprocess.
 #[tauri::command]
 fn model_status() -> Result<(String, bool), String> {
-    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
-    let path = format!(
-        "{home}/Library/Application Support/Umbra/models/all-minilm-797b70c4.gguf"
-    );
-    let there = std::path::Path::new(&path).exists();
-    Ok((path, there))
+    let path = model::dir()?.join(model::MODEL_FILE);
+    let there = path.exists();
+    Ok((path.to_string_lossy().to_string(), there))
 }
 
 /// Index a vault, emitting progress as it goes.
@@ -165,6 +183,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             count_notes,
             model_status,
+            download_model,
             build_index,
             ask,
             create_vault

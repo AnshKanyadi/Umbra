@@ -21,6 +21,7 @@ const state = {
   model: "",
   built: null,
   progress: null,
+  download: null,
   error: null,
 };
 
@@ -199,13 +200,11 @@ function renderResults(r) {
 
 async function startIndex() {
   state.index = `${state.vault}/.umbra/index`;
-  const [path, there] = await invoke("model_status");
-  if (!there) {
-    state.error = `The search model is not installed yet. Expected it at ${path}`;
-    go("nomodel");
-    return;
+  if (!state.model) {
+    const [path, there] = await invoke("model_status");
+    if (!there) { go("nomodel"); return; }
+    state.model = path;
   }
-  state.model = path;
   try {
     const last = await invoke("build_index", {
       vault: state.vault, index: state.index,
@@ -219,6 +218,11 @@ async function startIndex() {
   }
 }
 
+listen("model-progress", (e) => {
+  state.download = e.payload;
+  if (state.screen === "nomodel") render();
+});
+
 listen("index-progress", (e) => {
   try {
     const ev = JSON.parse(e.payload);
@@ -226,18 +230,41 @@ listen("index-progress", (e) => {
   } catch { /* a line that is not an event is not this screen's business */ }
 });
 
-// A MISSING MODEL IS A SCREEN, NOT AN ERROR IN A SUBPROCESS. Until the
-// downloader exists this is where a fresh machine lands, and it should say what
-// is missing and where it goes rather than failing somewhere the user cannot
-// see.
+// A MISSING MODEL IS A SCREEN, NOT AN ERROR IN A SUBPROCESS. This is where a
+// fresh machine lands, and it is the only part of the install that needs the
+// network -- so it says what it is fetching and why before it starts.
 function nomodel() {
-  h(`<h1>One more thing to fetch</h1>
-     <p>Umbra searches with a small model that runs on this machine. It is
-        about 44 MB and is downloaded once.</p>
-     <div class="card"><p class="muted" style="margin:0">Not yet wired up. The
-        file is expected at:<br><code>${esc(state.error.split("at ").pop())}</code></p></div>
-     <button id="back" class="secondary">Back</button>`);
-  document.getElementById("back").onclick = () => go("folder");
+  const d = state.download;
+  const pct = d && d.of ? Math.round((d.bytes / d.of) * 100) : 0;
+  const mb = (n) => (n / 1048576).toFixed(1);
+  h(`<h1>One thing to download</h1>
+     <p>Umbra searches using a small model that runs on this machine. It is
+        about 44 MB, fetched once, and never used to send your notes anywhere.</p>
+     ${d
+       ? `<div class="bar"><i style="width:${pct}%"></i></div>
+          <p class="muted">${mb(d.bytes)} of ${mb(d.of)} MB</p>`
+       : `<div class="row"><button id="get">Download the model</button>
+          <button id="back" class="secondary">Back</button></div>`}
+     ${state.error ? `<p class="warn">${esc(state.error)}</p>` : ""}`);
+  const get = document.getElementById("get");
+  if (get) {
+    get.onclick = async () => {
+      state.error = null;
+      state.download = { bytes: 0, of: 1 };
+      render();
+      try {
+        state.model = await invoke("download_model");
+        state.download = null;
+        go("indexing");
+        startIndex();
+      } catch (e) {
+        state.download = null;
+        state.error = String(e);
+        render();
+      }
+    };
+    document.getElementById("back").onclick = () => go("folder");
+  }
 }
 
 function render() {

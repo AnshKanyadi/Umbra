@@ -14,6 +14,12 @@ tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# For the model download: streamed so progress is real, rustls so the build does
+# not depend on a system OpenSSL that differs between machines.
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "blocking"] }
+futures-util = "0.3"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "macros"] }
 
 # A desktop binary is shipped, not linked against. Optimising for size keeps the
 # download honest: the pitch is a small local tool.

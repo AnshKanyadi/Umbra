@@ -46,3 +46,20 @@ ADR 0010. Until the downloader exists, put the GGUF where the app looks:
 mkdir -p ~/Library/Application\ Support/Umbra/models
 cp all-minilm.gguf ~/Library/Application\ Support/Umbra/models/all-minilm-797b70c4.gguf
 ```
+
+## Testing the download path
+
+The model downloader is the only part of the install that needs the network, and
+the only part that cannot be exercised by opening the app on the machine that
+built it. `src/bin/dlcheck.rs` calls the same function the app calls:
+
+```sh
+cd /tmp && cp all-minilm.gguf . && python3 -m http.server 8731 &
+cp all-minilm.gguf bad.gguf && printf 'x' | dd of=bad.gguf bs=1 seek=1000 conv=notrunc
+
+UMBRA_MODEL_URL=http://127.0.0.1:8731/bad.gguf         cargo run --release --bin dlcheck
+UMBRA_MODEL_URL=http://127.0.0.1:8731/all-minilm.gguf  cargo run --release --bin dlcheck
+```
+
+The first must refuse and leave no `.part` file; the second must install; a
+third run must be a no-op.
