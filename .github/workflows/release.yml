@@ -1,0 +1,170 @@
+# Build, sign, notarize and publish the macOS app.
+#
+# TAG, NOT PUSH. Every other workflow here runs on every commit; this one
+# spends a signing certificate and publishes something people download, and
+# neither should happen because somebody pushed a typo fix. `git tag v0.1.0 &&
+# git push --tags` is the whole trigger, and it is deliberate in a way a branch
+# push is not.
+#
+# WHY THIS IS AUTOMATED AT ALL. Notarization measured 23 seconds end to end, so
+# the argument for doing it by hand was never cost -- it was that nobody had
+# done it once. Now that it is known to work, a manual step is only a step
+# someone forgets on the release where it matters. The failure mode of
+# forgetting is not a broken build: it is an app that opens on the machine that
+# made it and refuses to open on everyone else's.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build, for a dry run'
+        required: true
+
+permissions:
+  contents: write   # to create the release and attach the dmg
+
+jobs:
+  macos:
+    name: macOS arm64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ---------------------------------------------------------- the keychain
+      #
+      # A THROWAWAY KEYCHAIN, NOT THE LOGIN ONE. The runner's default keychain
+      # is shared with whatever else runs on it, and a certificate left behind
+      # in it outlives this job. This one is created, used, and deleted in the
+      # step below plus the always() cleanup at the end, and its password is
+      # random per run because it never needs to be known again.
+      - name: import the signing certificate
+        env:
+          CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/umbra-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          # Without this, codesign prompts for keychain access and the job hangs
+          # until it times out with nothing useful in the log.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      # ------------------------------------------------------- the C++ binaries
+      - name: build the binaries
+        run: |
+          set -euo pipefail
+          cmake -S . -B b-rel -DCMAKE_BUILD_TYPE=Release
+          cmake --build b-rel --target umbra_ai umbra_sync \
+            -j "$(getconf _NPROCESSORS_ONLN)"
+
+      # Tauri looks for sidecars named with the target triple. They are build
+      # output and are not in the repository; see app/README.md.
+      - name: stage the sidecars
+        run: |
+          set -euo pipefail
+          TRIPLE="$(rustc -vV | awk '/host:/{print $2}')"
+          mkdir -p app/src-tauri/binaries
+          cp b-rel/umbra_ai   "app/src-tauri/binaries/umbra_ai-$TRIPLE"
+          cp b-rel/umbra_sync "app/src-tauri/binaries/umbra_sync-$TRIPLE"
+
+      - name: build the app, signed
+        working-directory: app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          npm ci
+          npx tauri build --bundles app,dmg
+
+      # ------------------------------------------------------- notarize, staple
+      #
+      # THE API KEY RATHER THAN A KEYCHAIN PROFILE. `notarytool
+      # --keychain-profile` reads a credential a person stored on their own Mac;
+      # a runner has no such keychain and no person. An App Store Connect key is
+      # also scoped and revocable on its own, which an Apple ID password is not.
+      - name: notarize
+        env:
+          API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/AuthKey.p8"
+          echo "$API_KEY_P8_BASE64" | base64 --decode > "$KEY"
+
+          BUNDLE=app/src-tauri/target/release/bundle
+          APP="$BUNDLE/macos/Umbra.app"
+          DMG="$(ls "$BUNDLE"/dmg/*.dmg)"
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+
+          # --wait, so the job fails here rather than publishing something that
+          # was rejected. Measured at 23 seconds; the timeout is generous
+          # because Apple's queue is not ours to predict.
+          xcrun notarytool submit "$DMG" \
+            --key "$KEY" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" \
+            --wait --timeout 30m
+          rm -f "$KEY"
+
+          # STAPLE BOTH, AND THE APP FIRST.
+          #
+          # Stapling only the disk image leaves the bundle inside it without a
+          # ticket. It still passes Gatekeeper while the dmg is mounted, because
+          # the check can go online -- so the gap is invisible in testing and
+          # appears on someone else's machine, offline, after they have dragged
+          # the app to Applications.
+          xcrun stapler staple "$APP"
+          xcrun stapler staple "$DMG"
+
+      - name: verify what is about to be published
+        run: |
+          set -euo pipefail
+          BUNDLE=app/src-tauri/target/release/bundle
+          APP="$BUNDLE/macos/Umbra.app"
+
+          # Each of these exits non-zero on failure, so the job stops before the
+          # release is created. Publishing an unnotarized dmg is the one outcome
+          # this workflow exists to make impossible.
+          xcrun stapler validate "$APP"
+          xcrun stapler validate "$DMG"
+          spctl -a -t exec -vvv "$APP"
+          spctl -a -t open --context context:primary-signature -vvv "$DMG"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          # Named in the log so a release can be audited later without rebuilding.
+          codesign -dvv "$APP" 2>&1 | grep -E "Authority|TeamIdentifier|flags"
+
+      - name: publish
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release create "$TAG" "$DMG" \
+            --title "$TAG" \
+            --generate-notes \
+            --verify-tag
+
+      # Runs even when something above failed, because a certificate left in a
+      # keychain on a shared runner is the kind of thing that is nobody's job
+      # until it is everybody's problem.
+      - name: remove the keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN" || true

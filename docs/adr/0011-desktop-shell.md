@@ -95,10 +95,15 @@ accepted
 source=Notarized Developer ID
 ```
 
-**23 seconds.** That is fast enough that notarization belongs in CI on the
-release job rather than as a manual step someone forgets. It needs the App Store
-Connect API key form of the credential rather than a keychain profile, because a
-runner has no keychain to read.
+**23 seconds.** Fast enough that notarization belongs in CI rather than in
+someone's memory, and `.github/workflows/release.yml` now does it on a tag. It
+uses an App Store Connect API key rather than a keychain profile, because a
+runner has no keychain and no person to have stored one, and because a key is
+scoped and revocable on its own in a way an Apple ID password is not.
+
+The certificate is imported into a throwaway keychain with a random password and
+deleted in an `always()` step, so a signing identity is never left behind on a
+shared runner.
 
 **STAPLE THE APP, NOT ONLY THE DISK IMAGE.** Stapling the DMG leaves the bundle
 inside it without a ticket:
